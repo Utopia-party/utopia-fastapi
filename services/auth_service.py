@@ -192,7 +192,11 @@ async def issue_tokens_and_save(
         request=request,
     )
 
+<<<<<<< Updated upstream
     user.last_login_at = utc_now()
+=======
+    user.last_login_at = datetime.utcnow()  # ← 수정
+>>>>>>> Stashed changes
     await db.commit()
 
     set_access_token_cookie(response, access_token)
@@ -349,9 +353,13 @@ def get_current_user_id(
     user_id = payload.get("sub")
 
     if not user_id:
+<<<<<<< Updated upstream
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="토큰에 사용자 정보가 없습니다.",
         )
 
+=======
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="토큰에 사용자 정보가 없습니다.")
+>>>>>>> Stashed changes
     return user_id
