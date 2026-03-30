@@ -16,10 +16,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router)
-app.include_router(parties.router)
-app.include_router(notifications.router)
-app.include_router(chat.router)
+app.include_router(auth.router, prefix="/api")
+app.include_router(parties.router, prefix="/api")
+app.include_router(notifications.router, prefix="/api")
+app.include_router(chat.router, prefix="/api")
 app.include_router(captcha.router, prefix="/api/captcha", tags=["Captcha"])
 
 # 서버 실행 시 테이블 없을 경우 DB자동생성
