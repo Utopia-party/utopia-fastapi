@@ -28,8 +28,6 @@ class Settings(BaseSettings):
     # GPU
     GPU_SERVER_URL: str
 
-    
-
     # Email
     MAIL_USERNAME: str = ""
     MAIL_PASSWORD: str = ""

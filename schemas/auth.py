@@ -26,3 +26,11 @@ class UserOut(BaseModel):
     created_at: Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+class UserResponse(BaseModel):
+    id: uuid.UUID
+    email: str
+    nickname: str
+
+    model_config = {"from_attributes": True}

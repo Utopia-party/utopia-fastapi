@@ -15,6 +15,7 @@ class ServiceOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# 프론트 /categories 호환용
 class CategoryOut(BaseModel):
     category_id: uuid.UUID
     category_name: str

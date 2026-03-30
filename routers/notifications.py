@@ -5,7 +5,7 @@ from core.database import get_db
 from core.security import require_user
 from models.notification import Notification
 from models.user import User
-from schemas.notification import NotificationOut
+from schemas.schemas import NotificationOut
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 

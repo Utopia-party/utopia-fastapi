@@ -1,12 +1,10 @@
 import uuid
 import enum
-from datetime import datetime
-
 from sqlalchemy import Text, Boolean, DateTime, ForeignKey, Enum as SAEnum, func, text, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from core.database import Base
+from datetime import datetime
 
 
 class NotificationTypeEnum(str, enum.Enum):
@@ -32,9 +30,7 @@ class Notification(Base):
     message: Mapped[str | None] = mapped_column(Text)
     reference_type: Mapped[str | None] = mapped_column(String(30))
     reference_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-
     is_read: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
-   
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id")
     )
@@ -46,9 +42,3 @@ class Notification(Base):
         foreign_keys=[user_id],
         back_populates="notifications"
     )  # noqa
-
-    creator: Mapped["User"] = relationship(
-        "User",
-        foreign_keys=[created_by],
-        back_populates="created_notifications",
-    )
