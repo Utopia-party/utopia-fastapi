@@ -13,7 +13,7 @@ class PartyOut(BaseModel):
     leader_id: Optional[uuid.UUID]
     service_id: Optional[uuid.UUID]
     title: str
-    status: str
+    status: Optional[str]          # ← PartyStatusEnum 대신 str로 변경
     host_nickname: Optional[str] = None
     service_name: Optional[str] = None
     category_name: Optional[str] = None
