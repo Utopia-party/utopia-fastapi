@@ -173,7 +173,7 @@ async def signup(user: UserCreate, db: AsyncSession = Depends(get_db)):
 
 # ─── 일반 로그인 ─────────────────────────────────────────────────
 @router.post("/login")
-async def login(user_credentials: UserLogin, response: Response, db: AsyncSession = Depends(get_db)):
+async def login(request: Request,user_credentials: UserLogin, response: Response, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalar_one_or_none()
 
@@ -190,7 +190,6 @@ async def login(user_credentials: UserLogin, response: Response, db: AsyncSessio
         response=response,
         db=db,
         user=user,
-        request=request,
     )
 
     return {
