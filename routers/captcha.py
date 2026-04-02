@@ -4,6 +4,7 @@ import uuid
 import random
 import json
 import redis.asyncio as redis
+import traceback
 
 from core.config import settings
 
@@ -102,14 +103,22 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
         files = {"image": (image.filename, image_bytes, image.content_type)}
         try:
             response = await client.post(GPU_SERVER_URL, files=files, timeout=15.0)
+            print("[DEBUG] GPU status:", response.status_code)
+            print("[DEBUG] GPU content-type:", response.headers.get("content-type"))
+            print("[DEBUG] GPU raw text:", response.text[:1000])
+
             response.raise_for_status()
             gpu_result = response.json()
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"AI 서버 통신 오류: {str(e)}"
-            }
+            print("[DEBUG] GPU json:", gpu_result)
 
+        except Exception as e:
+            print("[ERROR] GPU request/parse failed")
+            traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"AI 서버 통신 오류: {str(e)}"
+        }
+    
     if not gpu_result.get("success"):
         session_data["attempts"] += 1
         await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
@@ -134,20 +143,29 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
     pose_confidence = gpu_result.get("pose_confidence")
     detected_text = gpu_result.get("detected_text")
     ocr_confidence = gpu_result.get("ocr_confidence")
+    ocr_low_confidence = gpu_result.get("ocr_low_confidence", False)
+
 
     pose_ok = detected_pose == expected_pose
     text_ok = detected_text == expected_text
 
     if not pose_ok or not text_ok:
         session_data["attempts"] += 1
-        await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
+    await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
 
-        reasons = []
-        if not pose_ok:
-            reasons.append(f"손 포즈 불일치 (요구: {expected_pose} / 인식: {detected_pose})")
-        if not text_ok:
+    reasons = []
+
+    if not pose_ok:
+        reasons.append(f"손 포즈 불일치 (요구: {expected_pose} / 인식: {detected_pose})")
+
+    if not text_ok:
+        if ocr_low_confidence:
+            reasons.append(
+                f"문자 인식 신뢰도가 낮습니다. "
+                f"(요구: {expected_text} / 인식: {detected_text}, OCR 신뢰도: {ocr_confidence:.2f})"
+            )
+        else:
             reasons.append(f"문자열 불일치 (요구: {expected_text} / 인식: {detected_text})")
-
         return {
             "success": False,
             "message": (
