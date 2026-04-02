@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, Response, Cookie, Request
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
-from pydantic import EmailStr
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -14,7 +14,7 @@ from core.database import get_db
 from core.redis_client import redis_client
 from models.user import User
 from models.refresh_token import RefreshToken
-from schemas import UserCreate, UserOut, UserLogin, UserResponse
+from schemas import UserCreate, UserOut, UserResponse
 from services.auth_service import (
     get_password_hash,
     verify_password,
@@ -37,7 +37,6 @@ from services.oauth_service import (
 
 router = APIRouter(tags=["auth"])
 
-# ✅ Fix: os.getenv → settings로 통일
 conf = ConnectionConfig(
     MAIL_USERNAME=settings.MAIL_USERNAME,
     MAIL_PASSWORD=settings.MAIL_PASSWORD,
@@ -50,11 +49,25 @@ conf = ConnectionConfig(
 )
 
 
+# ✅ Fix: social_login / social_signup body를 raw dict 대신 Pydantic 스키마로 교체
+class SocialLoginBody(BaseModel):
+    oauth: str
+    code: str
+    state: Optional[str] = None
+
+
+class SocialSignupBody(BaseModel):
+    oauth: str
+    oauth_id: str
+    email: Optional[str] = None
+    nickname: str
+
+
 def get_email_auth_key(email: str) -> str:
     return f"email_auth:{email}"
 
 
-# ─── Refresh token──────────────────────────────────────────────────
+# ─── Refresh token ─────────────────────────────────────────────
 @router.post("/refresh")
 async def refresh_token_api(
     request: Request,
@@ -108,7 +121,8 @@ async def refresh_token_api(
 
     return {"message": "access token과 refresh token이 재발급되었습니다."}
 
-# ─── 로그인 상태 확인 ─────────────────────────────────────────────
+
+# ─── 로그인 상태 확인 ────────────────────────────────────────
 @router.get("/me")
 async def me(
     access_token: str | None = Cookie(default=None, alias="access_token"),
@@ -142,12 +156,12 @@ async def me(
     }
 
 
-# ─── 이메일 인증번호 요청 ─────────────────────────────────────────
+# ─── 이메일 인증번호 요청 ────────────────────────────────────
 @router.post("/email-request")
 async def email_request(email: EmailStr, background_tasks: BackgroundTasks):
     auth_code = str(random.randint(100000, 999999))
-    # ✅ Fix: settings.EMAIL_AUTH_TTL_SECONDS 사용
-    redis_client.setex(get_email_auth_key(str(email)), settings.EMAIL_AUTH_TTL_SECONDS, auth_code)
+    # ✅ Fix: 동기 redis → await 추가
+    await redis_client.setex(get_email_auth_key(str(email)), settings.EMAIL_AUTH_TTL_SECONDS, auth_code)
 
     message = MessageSchema(
         subject="[Party-Up] 회원가입 인증번호입니다.",
@@ -160,34 +174,35 @@ async def email_request(email: EmailStr, background_tasks: BackgroundTasks):
     return {"message": "인증 메일이 발송되었습니다.", "expires_in": settings.EMAIL_AUTH_TTL_SECONDS}
 
 
-# ─── 이메일 인증번호 확인 ─────────────────────────────────────────
+# ─── 이메일 인증번호 확인 ────────────────────────────────────
 @router.post("/email-verify")
 async def email_verify(email: str, code: str):
     redis_key = get_email_auth_key(email)
-    saved_code = redis_client.get(redis_key)
+    # ✅ Fix: 동기 redis → await 추가
+    saved_code = await redis_client.get(redis_key)
     if not saved_code:
         raise HTTPException(status_code=400, detail="인증번호가 없거나 만료되었습니다.")
     if saved_code != code:
         raise HTTPException(status_code=400, detail="인증번호가 틀렸습니다.")
-    redis_client.delete(redis_key)
+    await redis_client.delete(redis_key)
     return {"success": True, "message": "이메일 인증에 성공했습니다."}
 
 
-# ─── 이메일 중복검사 ──────────────────────────────────────────────
+# ─── 이메일 중복검사 ─────────────────────────────────────────
 @router.get("/users/check-email")
 async def check_email(email: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == email))
     return {"exists": result.scalar_one_or_none() is not None}
 
 
-# ─── 닉네임 중복검사 ─────────────────────────────────────────────
+# ─── 닉네임 중복검사 ────────────────────────────────────────
 @router.get("/users/check-nickname")
 async def check_nickname(nickname: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.nickname == nickname))
     return {"exists": result.scalar_one_or_none() is not None}
 
 
-# ─── 회원가입 ────────────────────────────────────────────────────
+# ─── 회원가입 ───────────────────────────────────────────────
 @router.post("/users", response_model=UserResponse, status_code=201)
 async def signup(user: UserCreate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == user.email))
@@ -211,9 +226,14 @@ async def signup(user: UserCreate, db: AsyncSession = Depends(get_db)):
     return new_user
 
 
-# ─── 일반 로그인 ─────────────────────────────────────────────────
+# ─── 일반 로그인 ────────────────────────────────────────────
 @router.post("/login")
-async def login(request: Request,user_credentials: UserLogin, response: Response, db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    user_credentials: UserLogin,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalar_one_or_none()
 
@@ -240,11 +260,11 @@ async def login(request: Request,user_credentials: UserLogin, response: Response
             "email": user.email,
             "nickname": user.nickname,
             "role": user.role,
-    },
-}
+        },
+    }
 
 
-# ─── 로그아웃 ────────────────────────────────────────────────────
+# ─── 로그아웃 ───────────────────────────────────────────────
 @router.post("/logout")
 async def logout(
     request: Request,
@@ -270,7 +290,7 @@ async def logout(
     return {"message": "로그아웃 되었습니다."}
 
 
-# ─── OAuth 유저정보 조회 헬퍼 ────────────────────────────────────
+# ─── OAuth 유저정보 조회 헬퍼 ──────────────────────────────
 def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     oauth = oauth.lower().strip()
     if oauth == "google":
@@ -292,17 +312,14 @@ def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
         raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
 
 
-# ─── OAuth 로그인 ────────────────────────────────────────────────
+# ─── OAuth 로그인 ───────────────────────────────────────────
+# ✅ Fix: data: dict → SocialLoginBody Pydantic 스키마로 교체
 @router.post("/auth/login")
-async def social_login(data: dict, response: Response, db: AsyncSession = Depends(get_db)):
-    oauth = data.get("oauth")
-    code = data.get("code")
-    state = data.get("state")
+async def social_login(data: SocialLoginBody, response: Response, db: AsyncSession = Depends(get_db)):
+    oauth = data.oauth.lower().strip()
+    code = data.code
+    state = data.state
 
-    if not oauth or not code:
-        raise HTTPException(status_code=400, detail="oauth와 code는 필수입니다.")
-
-    oauth = str(oauth).lower().strip()
     oauth_id, email = get_oauth_user_info(oauth, code, state)
 
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
@@ -329,19 +346,14 @@ async def social_login(data: dict, response: Response, db: AsyncSession = Depend
     return {"status": "NEED_NICKNAME", "oauth": oauth, "oauth_id": oauth_id, "email": email}
 
 
-# ─── OAuth 회원가입 ───────────────────────────────────────────────
+# ─── OAuth 회원가입 ─────────────────────────────────────────
+# ✅ Fix: data: dict → SocialSignupBody Pydantic 스키마로 교체
 @router.post("/auth/social/signup")
-async def social_signup(data: dict, response: Response, db: AsyncSession = Depends(get_db)):
-    oauth = data.get("oauth")
-    oauth_id = data.get("oauth_id")
-    email = data.get("email")
-    nickname = data.get("nickname")
-
-    if not oauth or not oauth_id or not nickname:
-        raise HTTPException(status_code=400, detail="oauth, oauth_id, nickname은 필수입니다.")
-
-    oauth = str(oauth).lower().strip()
-    nickname = nickname.strip()
+async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSession = Depends(get_db)):
+    oauth = data.oauth.lower().strip()
+    oauth_id = data.oauth_id
+    email = data.email
+    nickname = data.nickname.strip()
 
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     existing = result.scalar_one_or_none()

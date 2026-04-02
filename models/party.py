@@ -28,8 +28,9 @@ class Party(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="recruiting")
     start_date: Mapped[date | None] = mapped_column(Date)
     end_date: Mapped[date | None] = mapped_column(Date)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # ✅ Fix: DateTime → DateTime(timezone=True) 로 통일 (user.py와 일관성 유지)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     host: Mapped["User"] = relationship("User", back_populates="hosted_parties", foreign_keys=[leader_id])  # noqa
     service: Mapped["Service"] = relationship("Service", back_populates="parties")
@@ -51,8 +52,9 @@ class PartyMember(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False, server_default="member")
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
-    joined_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    left_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # ✅ Fix: DateTime → DateTime(timezone=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     party: Mapped["Party"] = relationship("Party", back_populates="members")
     user: Mapped["User"] = relationship("User", back_populates="party_members")  # noqa
@@ -77,7 +79,8 @@ class PartyChat(Base):
     flag_confidence: Mapped[float | None] = mapped_column()
     moderation_status: Mapped[str | None] = mapped_column(String(20))
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # ✅ Fix: DateTime → DateTime(timezone=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     party: Mapped["Party"] = relationship("Party", back_populates="chats")
     sender: Mapped["User"] = relationship("User", foreign_keys=[sender_id])
@@ -96,7 +99,8 @@ class Service(Base):
     logo_image_key: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # ✅ Fix: DateTime → DateTime(timezone=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     parties: Mapped[list["Party"]] = relationship("Party", back_populates="service")

@@ -3,13 +3,12 @@ import asyncio
 import uuid
 import httpx
 from datetime import datetime
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
 from core.config import settings
-from core.database import get_db
+from core.database import get_db, AsyncSessionLocal
 from models.party import Party, PartyMember, PartyChat
 from models.user import User
 
@@ -96,43 +95,28 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+# ✅ Fix: db 파라미터 제거 → 내부에서 새 세션 생성
+# 이유: asyncio.create_task로 실행 시 WebSocket 요청의 DB 세션이 이미 닫혀있을 수 있음
 async def moderate_in_background(
-    party_id: str, user_id: str, content: str, ws: WebSocket, db: AsyncSession
+    party_id: str, user_id: str, content: str, ws: WebSocket
 ):
     moderation = await check_message(content)
 
-    if moderation["severe"]:
-        await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
-        await db.execute(
-            PartyChat.__table__.update()
-            .where(PartyChat.party_id == uuid.UUID(party_id))
-            .where(PartyChat.sender_id == uuid.UUID(user_id))
-            .where(PartyChat.is_flagged == False)  # noqa
-            .values(is_flagged=True, flag_reason=moderation["reason"], moderation_status="blocked")
-        )
-        await db.commit()
-        await manager.send_personal(ws, {
-            "type": "error",
-            "content": f"🚫 심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
-            "created_at": datetime.now().isoformat(),
-        })
-        await redis_client.rpop(redis_msg_key(party_id))
-        await manager.broadcast(party_id, {
-            "type": "system",
-            "content": "부적절한 메시지가 삭제되었습니다.",
-            "created_at": datetime.now().isoformat(),
-        })
-
-    elif moderation["violation"]:
-        key = warn_key(party_id, user_id)
-        warn_count = await redis_client.incr(key)
-        await redis_client.expire(key, REDIS_TTL)
-
-        if warn_count >= 3:
+    # ✅ Fix: 백그라운드 태스크 전용 새 DB 세션 사용
+    async with AsyncSessionLocal() as db:
+        if moderation["severe"]:
             await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
+            await db.execute(
+                PartyChat.__table__.update()
+                .where(PartyChat.party_id == uuid.UUID(party_id))
+                .where(PartyChat.sender_id == uuid.UUID(user_id))
+                .where(PartyChat.is_flagged == False)  # noqa
+                .values(is_flagged=True, flag_reason=moderation["reason"], moderation_status="blocked")
+            )
+            await db.commit()
             await manager.send_personal(ws, {
                 "type": "error",
-                "content": "🚫 경고 3회 누적으로 채팅이 차단되었습니다.",
+                "content": f"🚫 심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
                 "created_at": datetime.now().isoformat(),
             })
             await redis_client.rpop(redis_msg_key(party_id))
@@ -141,12 +125,31 @@ async def moderate_in_background(
                 "content": "부적절한 메시지가 삭제되었습니다.",
                 "created_at": datetime.now().isoformat(),
             })
-        else:
-            await manager.send_personal(ws, {
-                "type": "warning",
-                "content": f"⚠️ 경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다.",
-                "created_at": datetime.now().isoformat(),
-            })
+
+        elif moderation["violation"]:
+            key = warn_key(party_id, user_id)
+            warn_count = await redis_client.incr(key)
+            await redis_client.expire(key, REDIS_TTL)
+
+            if warn_count >= 3:
+                await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
+                await manager.send_personal(ws, {
+                    "type": "error",
+                    "content": "🚫 경고 3회 누적으로 채팅이 차단되었습니다.",
+                    "created_at": datetime.now().isoformat(),
+                })
+                await redis_client.rpop(redis_msg_key(party_id))
+                await manager.broadcast(party_id, {
+                    "type": "system",
+                    "content": "부적절한 메시지가 삭제되었습니다.",
+                    "created_at": datetime.now().isoformat(),
+                })
+            else:
+                await manager.send_personal(ws, {
+                    "type": "warning",
+                    "content": f"⚠️ 경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다.",
+                    "created_at": datetime.now().isoformat(),
+                })
 
 
 @router.get("/parties/{party_id}/messages")
@@ -201,8 +204,9 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 async def websocket_chat(
     party_id: str,
     ws: WebSocket,
-    nickname: str = "익명",
-    user_id: str = "guest",
+    # ✅ Fix: WebSocket Query 파라미터는 Query() 명시 필수
+    nickname: str = Query(default="익명"),
+    user_id: str = Query(default="guest"),
     db: AsyncSession = Depends(get_db),
 ):
     await manager.connect(party_id, ws)
@@ -253,8 +257,9 @@ async def websocket_chat(
 
             await manager.broadcast(party_id, message)
 
+            # ✅ Fix: db 세션 인자 제거 → moderate_in_background 내부에서 새 세션 생성
             asyncio.create_task(
-                moderate_in_background(party_id, user_id, data, ws, db)
+                moderate_in_background(party_id, user_id, data, ws)
             )
 
     except WebSocketDisconnect:

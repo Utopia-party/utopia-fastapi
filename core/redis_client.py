@@ -1,5 +1,5 @@
-import redis
+import redis.asyncio as aioredis
 from core.config import settings
 
-# ✅ Fix: 개별 os.getenv 대신 config.py의 REDIS_URL로 통일
-redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+# FastAPI async 환경에서 동기 redis는 event loop를 블로킹함
+redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)

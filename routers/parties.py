@@ -31,7 +31,6 @@ def _build_party_out(party: Party) -> PartyOut:
     )
 
 
-# 프론트 호환용 /categories - 카테고리 중복 제거해서 반환
 @router.get("/categories", response_model=list[CategoryOut], tags=["categories"])
 async def list_categories(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
@@ -49,7 +48,6 @@ async def list_categories(db: AsyncSession = Depends(get_db)):
     return categories
 
 
-# 서비스 목록 (카테고리 필터 지원)
 @router.get("/services", response_model=list[ServiceOut], tags=["services"])
 async def list_services(
     category: Optional[str] = Query(None),
@@ -83,7 +81,6 @@ async def list_parties(
     if service_id:
         q = q.where(Party.service_id == service_id)
     if category_id:
-        # category_id는 service.id를 넘기므로 해당 service의 category 문자열로 조인 필터
         svc_result = await db.execute(select(Service.category).where(Service.id == category_id))
         cat_name = svc_result.scalar_one_or_none()
         if cat_name:
@@ -126,7 +123,8 @@ async def create_party(
         leader_id=current_user.id,
         service_id=body.service_id,
         title=body.title,
-        status="RECRUITING",
+        # ✅ Fix: "RECRUITING" → "recruiting" (model server_default와 대소문자 통일)
+        status="recruiting",
     )
     db.add(party)
     await db.commit()
@@ -160,7 +158,6 @@ async def join_party(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 참여한 파티입니다.")
 
-    # max_members 초과 체크
     if party.service:
         svc_result = await db.execute(
             select(Service).where(Service.id == party.service_id)

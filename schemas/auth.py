@@ -28,9 +28,5 @@ class UserOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class UserResponse(BaseModel):
-    id: uuid.UUID
-    email: str
-    nickname: str
-
-    model_config = {"from_attributes": True}
+# ✅ Fix: UserResponse 중복 정의 제거 → schemas/user.py의 UserResponse 단일 사용
+#         auth.py에 있던 UserResponse 클래스 삭제
