@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     CAPTCHA_RATE_LIMIT_MAX_REQUESTS: int = 10
     CAPTCHA_MIN_SOLVE_SECONDS: float = 0.8
 
+    # MinIO
+    MINIO_ENDPOINT: str = "localhost:9001"
+    MINIO_ACCESS_KEY: str = "admin1234"
+    MINIO_SECRET_KEY: str = "partyup1234"
+    MINIO_SECURE: bool = False
+    MINIO_EMOJI_BUCKET: str = "captcha-emojis"
+    MINIO_PHOTO_BUCKET: str = "captcha-photos"
+
     # OAuth - Google
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""

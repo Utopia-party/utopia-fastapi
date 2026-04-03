@@ -4,12 +4,13 @@ import math
 import random
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import HTTPException, Request, status
 from jose import JWTError, jwt
+from minio import Minio
+from minio.error import S3Error
 
 from core.config import settings
 from core.redis_client import redis_client
@@ -60,8 +61,14 @@ CAPTCHA_JWT_TYPE = "captcha"
 # ─────────────────────────────────────────────
 
 #도상원
-ANIMAL_ASSET_DIR = Path(__file__).resolve().parents[2] / "animal"
-ANIMAL_ASSET_URL_PREFIX = "/animal-assets"
+# MinIO 클라이언트 초기화
+minio_client = Minio(
+    settings.MINIO_ENDPOINT,
+    access_key=settings.MINIO_ACCESS_KEY,
+    secret_key=settings.MINIO_SECRET_KEY,
+    secure=settings.MINIO_SECURE,
+)
+
 ANIMAL_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 ANIMAL_LABELS: dict[str, str] = {
     "bear": "곰",
@@ -72,35 +79,41 @@ ANIMAL_LABELS: dict[str, str] = {
 SUPPORTED_CHALLENGE_CATEGORIES = tuple(ANIMAL_LABELS.keys())
 
 
-def _load_animal_asset_library() -> dict[str, list[str]]:
+def _load_minio_asset_library(bucket: str) -> dict[str, list[str]]:
+    """MinIO 버킷에서 카테고리별 이미지 목록 로드"""
     library: dict[str, list[str]] = {}
+    try:
+        objects = minio_client.list_objects(bucket, recursive=True)
+        for obj in objects:
+            name = obj.object_name  # e.g. "bear/bear_001.png" or "real_animal_photos/bear/photo.jpg"
+            parts = name.split("/")
+            # captcha-photos: real_animal_photos/bear/photo.jpg → category = bear
+            # captcha-emojis: bear/bear_001.png → category = bear
+            if len(parts) >= 2:
+                if parts[0] == "real_animal_photos" and len(parts) >= 3:
+                    category = parts[1].lower()
+                else:
+                    category = parts[0].lower()
 
-    if not ANIMAL_ASSET_DIR.exists():
-        return library
-
-    for animal_dir in sorted(ANIMAL_ASSET_DIR.iterdir()):
-        if not animal_dir.is_dir():
-            continue
-
-        category = animal_dir.name.lower()
-        if category not in SUPPORTED_CHALLENGE_CATEGORIES:
-            continue
-
-        asset_paths = [
-            f"{animal_dir.name}/{asset_path.name}"
-            for asset_path in sorted(animal_dir.iterdir())
-            if asset_path.is_file()
-            and not asset_path.name.startswith(".")
-            and asset_path.suffix.lower() in ANIMAL_IMAGE_EXTENSIONS
-        ]
-
-        if asset_paths:
-            library[category] = asset_paths
-
+                if category in SUPPORTED_CHALLENGE_CATEGORIES:
+                    ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                    if ext in ANIMAL_IMAGE_EXTENSIONS:
+                        library.setdefault(category, []).append(name)
+    except S3Error as e:
+        print(f"[MinIO] 버킷 {bucket} 목록 조회 실패: {e}")
     return library
 
 
-ANIMAL_ASSET_LIBRARY = _load_animal_asset_library()
+def _load_all_assets() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """이모지(GAN 생성)와 실사 사진 각각 로드"""
+    emoji_lib = _load_minio_asset_library(settings.MINIO_EMOJI_BUCKET)
+    photo_lib = _load_minio_asset_library(settings.MINIO_PHOTO_BUCKET)
+    print(f"[MinIO] 이모지 로드: { {k: len(v) for k, v in emoji_lib.items()} }")
+    print(f"[MinIO] 실사 로드: { {k: len(v) for k, v in photo_lib.items()} }")
+    return emoji_lib, photo_lib
+
+
+EMOJI_ASSET_LIBRARY, PHOTO_ASSET_LIBRARY = _load_all_assets()
 #도상원
 
 
@@ -540,16 +553,17 @@ def _calculate_scores(payload: CaptchaInitRequest, request: Request) -> tuple[fl
 
 
 #도상원
-def _build_asset_url(request: Request, relative_path: str) -> str:
-    base_url = str(request.base_url).rstrip("/")
-    return f"{base_url}{ANIMAL_ASSET_URL_PREFIX}/{quote(relative_path, safe='/')}"
+def _build_minio_url(bucket: str, object_name: str) -> str:
+    """MinIO 오브젝트의 직접 접근 URL 생성"""
+    endpoint = settings.MINIO_ENDPOINT
+    protocol = "https" if settings.MINIO_SECURE else "http"
+    return f"{protocol}://{endpoint}/{bucket}/{quote(object_name, safe='/')}"
 
 
-def _pick_asset_path(category: str, used_paths: set[str]) -> str:
-    candidates = [path for path in ANIMAL_ASSET_LIBRARY[category] if path not in used_paths]
+def _pick_from_library(library: dict[str, list[str]], category: str, used_paths: set[str]) -> str:
+    candidates = [path for path in library[category] if path not in used_paths]
     if not candidates:
-        candidates = ANIMAL_ASSET_LIBRARY[category]
-
+        candidates = library[category]
     selected = random.choice(candidates)
     used_paths.add(selected)
     return selected
@@ -558,33 +572,42 @@ def _pick_asset_path(category: str, used_paths: set[str]) -> str:
 def _build_new_challenge_payload(
     request: Request,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[int]]:
+    # 이모지가 없는 카테고리는 실사로 대체 (GAN 생성 전 임시)
+    emoji_lib = EMOJI_ASSET_LIBRARY if EMOJI_ASSET_LIBRARY else PHOTO_ASSET_LIBRARY
+    photo_lib = PHOTO_ASSET_LIBRARY
+
     available_categories = [
         category
         for category in SUPPORTED_CHALLENGE_CATEGORIES
-        if ANIMAL_ASSET_LIBRARY.get(category)
+        if photo_lib.get(category) and emoji_lib.get(category)
     ]
 
-    if len(available_categories) < 4:
+    if len(available_categories) < 3:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
-                "animal 폴더에 캡챠용 동물 이미지가 부족합니다. "
-                "bear/dog/fox/penguin 카테고리 이미지를 확인해 주세요."
+                f"MinIO에 캡챠용 동물 이미지가 부족합니다. "
+                f"사용 가능: {available_categories} / 필요: 최소 3개 카테고리"
             ),
         )
 
     categories = random.sample(available_categories, 3)
     wrong_categories = [category for category in available_categories if category not in categories]
+    if not wrong_categories:
+        wrong_categories = [c for c in available_categories if c != categories[0]]
     answer_positions = sorted(random.sample(list(range(9)), 3))
-    used_paths: set[str] = set()
+    used_emoji_paths: set[str] = set()
+    used_photo_paths: set[str] = set()
+
+    emoji_bucket = settings.MINIO_EMOJI_BUCKET if EMOJI_ASSET_LIBRARY else settings.MINIO_PHOTO_BUCKET
 
     emojis: list[dict[str, Any]] = []
     for index, category in enumerate(categories):
-        asset_path = _pick_asset_path(category, used_paths)
+        asset_path = _pick_from_library(emoji_lib, category, used_emoji_paths)
         emojis.append(
             {
                 "id": f"emoji-{category}-{index}",
-                "url": _build_asset_url(request, asset_path),
+                "url": _build_minio_url(emoji_bucket, asset_path),
                 "category": category,
             }
         )
@@ -598,11 +621,11 @@ def _build_new_challenge_payload(
         else:
             category = random.choice(wrong_categories)
 
-        asset_path = _pick_asset_path(category, used_paths)
+        asset_path = _pick_from_library(photo_lib, category, used_photo_paths)
         photos.append(
             {
                 "id": f"photo-{category}-{position}",
-                "url": _build_asset_url(request, asset_path),
+                "url": _build_minio_url(settings.MINIO_PHOTO_BUCKET, asset_path),
                 "index": position,
             }
         )
