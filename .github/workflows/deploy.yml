@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup SSH
@@ -35,8 +35,10 @@ jobs:
           EOF
 
       - name: Write env file
+        env:
+          ENV_CONTENT: ${{ secrets.ENV_FILE }}
         run: |
-          echo "${{ secrets.ENV_FILE }}" > /tmp/env_file
+          printf '%s' "$ENV_CONTENT" > /tmp/env_file
 
       - name: Clone repo if not exists
         run: |
@@ -61,7 +63,6 @@ jobs:
             cd /home/ubuntu/fastapi/utopia-fastapi-main
             git pull origin main
 
-            # venv 없으면 생성
             if [ ! -d venv ]; then
               python3 -m venv venv
             fi
