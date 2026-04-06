@@ -61,6 +61,11 @@ jobs:
             cd /home/ubuntu/fastapi/utopia-fastapi-main
             git pull origin main
 
+            # venv 없으면 생성
+            if [ ! -d venv ]; then
+              python3 -m venv venv
+            fi
+
             source venv/bin/activate
             pip install -r requirements.txt
 
