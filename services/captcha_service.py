@@ -554,10 +554,10 @@ def _calculate_scores(payload: CaptchaInitRequest, request: Request) -> tuple[fl
 
 #도상원
 def _build_minio_url(bucket: str, object_name: str) -> str:
-    """MinIO 오브젝트의 직접 접근 URL 생성"""
-    endpoint = settings.MINIO_ENDPOINT
+    """MinIO 오브젝트의 직접 접근 URL 생성 (브라우저에서 접근 가능한 공개 URL)"""
+    public_endpoint = getattr(settings, "MINIO_PUBLIC_ENDPOINT", None) or settings.MINIO_ENDPOINT
     protocol = "https" if settings.MINIO_SECURE else "http"
-    return f"{protocol}://{endpoint}/{bucket}/{quote(object_name, safe='/')}"
+    return f"{protocol}://{public_endpoint}/{bucket}/{quote(object_name, safe='/')}"
 
 
 def _pick_from_library(library: dict[str, list[str]], category: str, used_paths: set[str]) -> str:
