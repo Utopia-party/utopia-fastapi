@@ -112,7 +112,7 @@ def safe_float(value: Any):
         return None
 
 
-@router.post("/api/captcha/handocr/start")
+@router.post("/captcha/handocr/start")
 async def start_captcha():
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     random_text = "".join(random.choice(chars) for _ in range(5))
@@ -134,7 +134,7 @@ async def start_captcha():
     }
 
 
-@router.post("/api/captcha/handocr/verify")
+@router.post("/captcha/handocr/verify")
 async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(...)):
     session_str = await redis_client.get(f"captcha:{sessionId}")
     if not session_str:

@@ -38,7 +38,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(parties.router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
-app.include_router(captcha.router, prefix="/api/captcha", tags=["Captcha"])
+app.include_router(captcha.router, prefix="/api", tags=["Captcha"])
 
 #도상원
 ANIMAL_ASSET_DIR = Path(__file__).resolve().parent.parent / "animal"
