@@ -16,22 +16,20 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.BASTION_SSH_KEY }}" > ~/.ssh/bastion_key
-          echo "${{ secrets.FASTAPI_SSH_KEY }}" > ~/.ssh/fastapi_key
-          chmod 600 ~/.ssh/bastion_key
-          chmod 600 ~/.ssh/fastapi_key
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
 
           cat >> ~/.ssh/config << EOF
           Host bastion
             HostName 210.109.15.10
             User ubuntu
-            IdentityFile ~/.ssh/bastion_key
+            IdentityFile ~/.ssh/id_rsa
             StrictHostKeyChecking no
 
           Host fastapi
             HostName <FastAPI VM 내부 IP>
             User ubuntu
-            IdentityFile ~/.ssh/fastapi_key
+            IdentityFile ~/.ssh/id_rsa
             ProxyJump bastion
             StrictHostKeyChecking no
           EOF
@@ -40,29 +38,24 @@ jobs:
         run: |
           ssh fastapi << 'ENDSSH'
             set -e
-            cd ~/utopia-fastapi  # 실제 경로로 수정
+            cd ~/fastapi/utopia-fastapi-main
 
-            # 코드 최신화
             git pull origin main
 
-            # .env 파일 생성
             cat > .env << 'EOF'
           ${{ secrets.ENV_FILE }}
           EOF
 
-            # 의존성 설치
             source venv/bin/activate
             pip install -r requirements.txt
 
-            # 기존 프로세스 종료
             pkill -f "uvicorn main:app" || true
             sleep 2
 
-            # 재시작
             nohup uvicorn main:app \
               --host 0.0.0.0 \
               --port 8000 \
-              >> ~/utopia-fastapi/server.log 2>&1 &
+              >> ~/fastapi/utopia-fastapi-main/server.log 2>&1 &
 
             echo "✅ 배포 완료 $(date)"
           ENDSSH
