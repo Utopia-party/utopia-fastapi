@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     MINIO_SECURE: bool = False
     MINIO_EMOJI_BUCKET: str = "captcha-emojis"
     MINIO_PHOTO_BUCKET: str = "captcha-photos"
+    MINIO_PUBLIC_ENDPOINT: str = "" 
 
     # OAuth - Google
     GOOGLE_CLIENT_ID: str = ""
