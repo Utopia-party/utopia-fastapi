@@ -38,6 +38,15 @@ jobs:
         run: |
           echo "${{ secrets.ENV_FILE }}" > /tmp/env_file
 
+      - name: Clone repo if not exists
+        run: |
+          ssh fastapi << 'ENDSSH'
+            if [ ! -d ~/fastapi/utopia-fastapi-main/.git ]; then
+              mkdir -p ~/fastapi
+              git clone https://github.com/Utopia-party/utopia-fastapi.git ~/fastapi/utopia-fastapi-main
+            fi
+          ENDSSH
+
       - name: Copy env file to server
         run: |
           scp -o ProxyJump=bastion /tmp/env_file fastapi:~/fastapi/utopia-fastapi-main/.env
@@ -46,12 +55,6 @@ jobs:
         run: |
           ssh fastapi << 'ENDSSH'
             set -e
-
-            if [ ! -d ~/fastapi/utopia-fastapi-main/.git ]; then
-              mkdir -p ~/fastapi
-              git clone https://github.com/Utopia-party/utopia-fastapi.git ~/fastapi/utopia-fastapi-main
-            fi
-
             cd ~/fastapi/utopia-fastapi-main
             git pull origin main
 
