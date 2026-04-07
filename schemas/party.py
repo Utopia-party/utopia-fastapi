@@ -1,12 +1,17 @@
 import uuid
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
+# ✅ 추가된 카테고리 응답 스키마
+class CategoryOut(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
 
 class PartyCreate(BaseModel):
     service_id: uuid.UUID
     title: str = Field(..., min_length=2, max_length=200)
-
 
 class PartyOut(BaseModel):
     id: uuid.UUID
@@ -27,9 +32,8 @@ class PartyOut(BaseModel):
 
     model_config = {"from_attributes": True}
 
-
 class PartyListOut(BaseModel):
-    parties: list[PartyOut]
+    parties: List[PartyOut]
     total: int
     page: int
     size: int
