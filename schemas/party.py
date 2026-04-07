@@ -2,9 +2,9 @@ import uuid
 from pydantic import BaseModel, Field
 from typing import Optional, List
 
-# ✅ 추가된 카테고리 응답 스키마
+# ✅ 수정됨: DB의 카테고리 ID가 UUID이므로 타입을 uuid.UUID로 변경
 class CategoryOut(BaseModel):
-    id: int
+    id: uuid.UUID
     name: str
 
     model_config = {"from_attributes": True}
