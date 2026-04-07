@@ -761,8 +761,9 @@ async def _build_new_challenge_payload(
             "id": f"p-{position}",
             "url": _build_proxy_url(token),
             "index": position,
+            "category": category,
         }
-        for (position, _, _), token in zip(photo_specs, photo_tokens)
+        for (position, category, _), token in zip(photo_specs, photo_tokens)
     ]
 
     return emojis, photos, answer_positions, None
