@@ -71,13 +71,6 @@ app.include_router(captcha.router, prefix="/api", tags=["Captcha"])
 # 상원: 회원가입 뒤 관심사 저장 화면과 마이페이지가 같은 관심사 API를 사용할 수 있게 연결합니다.
 app.include_router(user_interests.router, prefix="/api")  # 상원
 
-ANIMAL_ASSET_DIR = Path(__file__).resolve().parent.parent / "animal"
-if ANIMAL_ASSET_DIR.exists():
-    app.mount(
-        "/animal-assets",
-        StaticFiles(directory=str(ANIMAL_ASSET_DIR)),
-        name="animal-assets",
-    )
 
 
 @app.get("/api/health")
