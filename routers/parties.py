@@ -1,19 +1,33 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
-from sqlalchemy.orm import selectinload
+import logging
 from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 from core.database import get_db
-from core.security import get_current_user, require_user
+from core.security import require_user
 from models.party import Party, PartyMember, Service
 from models.user import User
-from schemas import PartyCreate, PartyOut, PartyListOut, MessageOut, ServiceOut, CategoryOut
+from schemas import (
+    CategoryOut,
+    MessageOut,
+    PartyCreate,
+    PartyListOut,
+    PartyOut,
+    ServiceOut,
+)
 
 router = APIRouter(prefix="/parties", tags=["parties"])
-
+logger = logging.getLogger(__name__)
 
 def _build_party_out(party: Party) -> PartyOut:
+    """
+    Party 객체를 PartyOut 스키마로 변환합니다.
+    주의: 호출 전에 service, host, members가 selectinload 되어 있어야 합니다.
+    """
     svc = party.service
     return PartyOut(
         id=party.id,
@@ -27,7 +41,7 @@ def _build_party_out(party: Party) -> PartyOut:
         max_members=svc.max_members if svc else None,
         monthly_price=svc.monthly_price if svc else None,
         logo_image_key=svc.logo_image_key if svc else None,
-        member_count=len(party.members),
+        member_count=len(party.members) if party.members is not None else 0,
     )
 
 
@@ -93,7 +107,12 @@ async def list_parties(
     result = await db.execute(q)
     parties = result.scalars().all()
 
-    return PartyListOut(parties=[_build_party_out(p) for p in parties], total=total, page=page, size=size)
+    return PartyListOut(
+        parties=[_build_party_out(p) for p in parties],
+        total=total,
+        page=page,
+        size=size
+    )
 
 
 @router.get("/{party_id}", response_model=PartyOut)
@@ -119,19 +138,27 @@ async def create_party(
     current_user: User = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # 파티 생성
     party = Party(
         leader_id=current_user.id,
         service_id=body.service_id,
         title=body.title,
-        # ✅ Fix: "RECRUITING" → "recruiting" (model server_default와 대소문자 통일)
         status="recruiting",
     )
     db.add(party)
+    
+    # 방장도 멤버로 자동 추가하고 싶다면 여기에 PartyMember 추가 로직을 넣을 수 있습니다.
+    
     await db.commit()
-    await db.refresh(party)
+    
+    # 생성된 파티 정보를 관계 모델과 함께 다시 조회
     result = await db.execute(
         select(Party)
-        .options(selectinload(Party.host), selectinload(Party.members), selectinload(Party.service))
+        .options(
+            selectinload(Party.host),
+            selectinload(Party.members),
+            selectinload(Party.service)
+        )
         .where(Party.id == party.id)
     )
     return _build_party_out(result.scalar_one())
@@ -143,34 +170,50 @@ async def join_party(
     current_user: User = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    party = await db.get(Party, party_id)
+    # 1. 파티 존재 여부와 서비스 정보를 한 번에 조회 (Lazy Loading 방지)
+    result = await db.execute(
+        select(Party)
+        .options(selectinload(Party.service))
+        .where(Party.id == party_id)
+    )
+    party = result.scalar_one_or_none()
+
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+    
     if party.leader_id == current_user.id:
         raise HTTPException(status_code=400, detail="자신이 개설한 파티입니다.")
 
-    existing = await db.execute(
+    # 2. 이미 참여 중인지 확인
+    existing_check = await db.execute(
         select(PartyMember).where(
             PartyMember.party_id == party_id,
             PartyMember.user_id == current_user.id,
         )
     )
-    if existing.scalar_one_or_none():
+    if existing_check.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 참여한 파티입니다.")
 
+    # 3. 정원 초과 여부 확인
     if party.service:
-        svc_result = await db.execute(
-            select(Service).where(Service.id == party.service_id)
+        count_result = await db.execute(
+            select(func.count()).select_from(PartyMember).where(PartyMember.party_id == party_id)
         )
-        svc = svc_result.scalar_one_or_none()
-        if svc:
-            count_result = await db.execute(
-                select(func.count()).select_from(PartyMember).where(PartyMember.party_id == party_id)
-            )
-            current_count = count_result.scalar() or 0
-            if current_count >= svc.max_members:
-                raise HTTPException(status_code=400, detail="파티 인원이 가득 찼습니다.")
+        current_count = count_result.scalar() or 0
+        if current_count >= party.service.max_members:
+            raise HTTPException(status_code=400, detail="파티 인원이 가득 찼습니다.")
 
-    db.add(PartyMember(party_id=party_id, user_id=current_user.id))
-    await db.commit()
+    # 4. 멤버 추가
+    try:
+        new_member = PartyMember(party_id=party_id, user_id=current_user.id)
+        db.add(new_member)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error joining party: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="파티 가입 처리 중 서버 오류가 발생했습니다."
+        )
+
     return MessageOut(message="파티 참여가 완료되었습니다.")
