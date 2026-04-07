@@ -21,6 +21,9 @@ class PartyOut(BaseModel):
     monthly_price: Optional[int] = None
     logo_image_key: Optional[str] = None
     member_count: int = 0
+    
+    # ✅ 추가된 필드: 현재 로그인한 사용자가 해당 파티원인지 여부
+    is_joined: bool = False 
 
     model_config = {"from_attributes": True}
 
