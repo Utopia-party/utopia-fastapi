@@ -11,14 +11,14 @@ from core.database import get_db
 from core.security import require_user, get_current_user_optional
 from models.party import Party, PartyMember, Service
 from models.user import User
-from schemas import (
+from schemas.party import (
     CategoryOut,
-    MessageOut,
     PartyCreate,
     PartyListOut,
     PartyOut,
-    ServiceOut,
 )
+# MessageOut 등의 위치가 schemas/party.py가 아니라면 아래 경로를 확인해주세요.
+from schemas.user import MessageOut 
 
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
@@ -32,7 +32,8 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
     # 참여 여부 판별: 방장이거나 멤버 목록에 포함되어 있는지 확인
     is_joined = False
     if current_user_id:
-        is_leader = party.leader_id == current_user_id
+        is_leader = (party.leader_id == current_user_id)
+        # members가 로드되어 있는지 확인 후 체크
         is_member = any(m.user_id == current_user_id for m in party.members) if party.members else False
         is_joined = is_leader or is_member
 
@@ -49,8 +50,21 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         monthly_price=svc.monthly_price if svc else None,
         logo_image_key=svc.logo_image_key if svc else None,
         member_count=len(party.members) if party.members is not None else 0,
-        is_joined=is_joined # ✅ 프론트에서 버튼 분기 처리에 사용
+        is_joined=is_joined
     )
+
+# 422 에러 방지를 위해 추가된 카테고리 목록 엔드포인트
+@router.get("/categories", response_model=list[CategoryOut])
+async def list_categories(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    등록된 서비스들의 카테고리 목록을 중복 없이 가져옵니다.
+    """
+    result = await db.execute(select(Service.category).distinct())
+    categories = result.scalars().all()
+    # 프론트엔드 기대 형식에 맞춰 반환
+    return [{"id": uuid.uuid4(), "name": cat} for cat in categories if cat]
 
 @router.get("", response_model=PartyListOut)
 async def list_parties(
@@ -74,6 +88,7 @@ async def list_parties(
     if service_id:
         q = q.where(Party.service_id == service_id)
     if category_id:
+        # 카테고리 ID로 해당 카테고리 이름을 찾아서 필터링
         svc_result = await db.execute(select(Service.category).where(Service.id == category_id))
         cat_name = svc_result.scalar_one_or_none()
         if cat_name:
@@ -83,6 +98,7 @@ async def list_parties(
 
     total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
     q = q.offset((page - 1) * size).limit(size).order_by(Party.id.desc())
+    
     result = await db.execute(q)
     parties = result.scalars().all()
 
