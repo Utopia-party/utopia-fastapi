@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from core.database import get_db
-from core.security import require_user, get_current_user_optional
+from core.security import require_user, get_current_user
 from models.party import Party, PartyMember, Service
 from models.user import User
 from schemas import (
@@ -60,7 +60,7 @@ async def list_parties(
     page: int = Query(1, ge=1),
     size: int = Query(12, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional)
+    current_user: Optional[User] = Depends(get_current_user)
 ):
     q = (
         select(Party)
@@ -99,7 +99,7 @@ async def list_parties(
 async def get_party(
     party_id: uuid.UUID, 
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional)
+    current_user: Optional[User] = Depends(get_current_user)
 ):
     result = await db.execute(
         select(Party)
