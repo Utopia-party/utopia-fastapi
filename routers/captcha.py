@@ -24,7 +24,8 @@ from services.captcha_service import (
     verify_challenge,
 )
 
-router = APIRouter()
+# 상원: 1차 캡챠 API를 /api/captcha/* 아래로 고정해서 프론트 호출 경로와 맞춥니다.
+router = APIRouter(prefix="/captcha")  # 상원
 logger = logging.getLogger("handocr-api")
 
 
@@ -33,23 +34,31 @@ logger = logging.getLogger("handocr-api")
 # ─────────────────────────────────────────────
 
 
-@router.post("/init", response_model=CaptchaInitResponse)
+@router.post("/init", response_model=CaptchaInitResponse)  # 상원
 async def captcha_init(payload: CaptchaInitRequest, request: Request):
+    # 상원: 행동 데이터 기반 1차 판정을 시작하는 진입점입니다.
+    # 상원: 실제 점수 계산과 세션 생성은 서비스 계층 함수 initiate_captcha에 위임합니다.
     return await initiate_captcha(payload, request)
 
 
-@router.get("/challenge", response_model=CaptchaChallengeResponse)
+@router.get("/challenge", response_model=CaptchaChallengeResponse)  # 상원
 async def captcha_challenge(session_id: str, request: Request):
+    # 상원: challenge 상태 세션의 3x3 이미지 문제를 내려줍니다.
+    # 상원: 세션 검증과 문제 생성은 서비스 계층 함수 get_challenge가 처리합니다.
     return await get_challenge(session_id, request)
 
 
-@router.post("/verify", response_model=CaptchaVerifyResponse)
+@router.post("/verify", response_model=CaptchaVerifyResponse)  # 상원
 async def captcha_verify(payload: CaptchaVerifyRequest, request: Request):
+    # 상원: 사용자가 선택한 3칸이 이모지 순서와 맞는지 검증하고 통과 토큰을 발급합니다.
+    # 상원: 실제 정답 판정과 토큰 발급은 서비스 계층 함수 verify_challenge가 처리합니다.
     return await verify_challenge(payload, request)
 
 
-@router.get("/status", response_model=CaptchaStatusResponse)
+@router.get("/status", response_model=CaptchaStatusResponse)  # 상원
 async def captcha_status(request: Request):
+    # 상원: WAIT, LOCKED, BANNED와 active_session_id를 조회해 프론트 재진입 흐름을 맞춥니다.
+    # 상원: 상태 계산은 서비스 계층 함수 get_captcha_status에 위임합니다.
     return await get_captcha_status(request)
 
 
@@ -112,8 +121,9 @@ def safe_float(value: Any):
         return None
 
 
-@router.post("/api/captcha/handocr/start")
+@router.post("/handocr/start")  # 상원
 async def start_captcha():
+    # 상원: 2차 handOCR 캡챠 시작 시 문제 문자열과 손 포즈를 세션으로 발급합니다.
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     random_text = "".join(random.choice(chars) for _ in range(5))
     random_pose = random.choice(ALL_POSES)
@@ -134,8 +144,9 @@ async def start_captcha():
     }
 
 
-@router.post("/api/captcha/handocr/verify")
+@router.post("/handocr/verify")  # 상원
 async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(...)):
+    # 상원: 업로드 이미지를 GPU 서버에 보내 손 포즈와 OCR 결과를 검증합니다.
     session_str = await redis_client.get(f"captcha:{sessionId}")
     if not session_str:
         return {

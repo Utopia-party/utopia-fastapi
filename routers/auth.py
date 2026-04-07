@@ -204,7 +204,16 @@ async def check_nickname(nickname: str, db: AsyncSession = Depends(get_db)):
 
 # ─── 회원가입 ───────────────────────────────────────────────
 @router.post("/users", response_model=UserResponse, status_code=201)
-async def signup(user: UserCreate, db: AsyncSession = Depends(get_db)):
+async def signup(
+    # 상원: 회원가입 직후 자동 로그인 쿠키를 발급하려고 Request 객체를 함께 받습니다.
+    request: Request,  # 상원
+    # 상원: issue_tokens_and_save가 쿠키를 심을 수 있도록 Response 객체를 함께 받습니다.
+    response: Response,  # 상원
+    # 상원: 프론트가 보낸 회원가입 바디를 UserCreate 스키마로 검증해 받습니다.
+    user: UserCreate,  # 상원
+    # 상원: 중복 검사, 사용자 생성, 토큰 저장에 쓸 DB 세션을 주입받습니다.
+    db: AsyncSession = Depends(get_db),  # 상원
+):
     result = await db.execute(select(User).where(User.email == user.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
@@ -223,6 +232,19 @@ async def signup(user: UserCreate, db: AsyncSession = Depends(get_db)):
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
+    # 상원: 회원가입 직후 바로 관심사 저장 API를 사용할 수 있도록 자동 로그인 쿠키를 발급합니다.
+    await issue_tokens_and_save(  # 상원
+        # 상원: 발급된 액세스/리프레시 토큰 쿠키를 심을 대상 Response입니다.
+        response=response,  # 상원
+        # 상원: refresh token 저장과 사용자 조회에 사용할 DB 세션입니다.
+        db=db,  # 상원
+        # 상원: 방금 생성한 사용자를 토큰 발급 대상 계정으로 넘깁니다.
+        user=new_user,  # 상원
+        # 상원: 세션 기록에 남길 user-agent를 현재 요청 헤더에서 읽어 넘깁니다.
+        user_agent=request.headers.get("user-agent"),  # 상원
+        # 상원: 세션 기록에 남길 클라이언트 IP를 현재 요청에서 읽어 넘깁니다.
+        ip_address=request.client.host if request.client else None,  # 상원
+    )  # 상원
     return new_user
 
 
