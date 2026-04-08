@@ -578,7 +578,7 @@ async def _calculate_scores(
     """md 스펙 비간섭 검증 5겹 점수 계산.
 
     Returns:
-        (rule_score, vector_score, environment_score, header_score, final_score, immediate_block)
+        (rule_score, vector_score, environment_score, header_score, fingerprint_score, final_score, immediate_block)
 
     - 레이어3(룰): 마우스35 + 클릭25 + 타이밍20 + 핑거프린트20
     - 레이어4(벡터 KNN): pgvector 코사인 Top-5 → human_ratio 기반 점수
@@ -632,6 +632,7 @@ async def _calculate_scores(
         vector_score,
         environment_score,
         header_score,
+        fingerprint_score,
         final_score,
         env_block or header_block,
     )
@@ -995,6 +996,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         vector_score,
         environment_score,
         header_score,
+        fingerprint_score,
         final_score,
         immediate_block,
     ) = await _calculate_scores(payload, request, behavior_vector)
@@ -1002,12 +1004,18 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
     if immediate_block:
         # DB: block 기록 (fire-and-forget, FK 순서 보장)
         block_session_id = str(uuid.uuid4())
+        block_label, block_reason = _decide_label(
+            outcome="init_block",
+            rule_score=rule_score,
+            fingerprint_score=fingerprint_score,
+        )
+        logger.info(f"[label.init_block] session={block_session_id} → {block_label} ({block_reason})")
         _bg(_save_session_then_embedding(
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="block",
-            behavior_vector=behavior_vector, behavior_label="bot",
+            behavior_vector=behavior_vector, behavior_label=block_label,
         ))
         _bg(_save_bot_signature(
             client_ip, fp_hash, user_agent,
@@ -1022,25 +1030,37 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         # PK 충돌 방지: 항상 새 UUID 생성 (다른 분기와 동일하게 통일)
         pass_session_id = str(uuid.uuid4())
         token = await _issue_captcha_token(client_ip, final_score, pass_session_id)
+        pass_label, pass_reason = _decide_label(
+            outcome="init_pass",
+            rule_score=rule_score,
+            fingerprint_score=fingerprint_score,
+        )
+        logger.info(f"[label.init_pass] session={pass_session_id} → {pass_label} ({pass_reason})")
         # DB: pass 기록 (fire-and-forget, FK 순서 보장)
         _bg(_save_session_then_embedding(
             session_id=pass_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="pass",
-            behavior_vector=behavior_vector, behavior_label="human",
+            behavior_vector=behavior_vector, behavior_label=pass_label,
         ))
         return CaptchaInitResponse(status="pass", token=token)
 
     if final_score <= CAPTCHA_CHALLENGE_THRESHOLD:
         # DB: block (low score) 기록 (fire-and-forget, FK 순서 보장)
         block_session_id = str(uuid.uuid4())
+        low_label, low_reason = _decide_label(
+            outcome="init_block",
+            rule_score=rule_score,
+            fingerprint_score=fingerprint_score,
+        )
+        logger.info(f"[label.low_score_block] session={block_session_id} → {low_label} ({low_reason})")
         _bg(_save_session_then_embedding(
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="block",
-            behavior_vector=behavior_vector, behavior_label="bot",
+            behavior_vector=behavior_vector, behavior_label=low_label,
         ))
         _bg(_save_bot_signature(
             client_ip, fp_hash, user_agent,
@@ -1063,6 +1083,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         "vector_score": round(vector_score, 4),
         "environment_score": round(environment_score, 4),
         "header_score": round(header_score, 4),
+        "fingerprint_score": round(fingerprint_score, 4),  # 라벨링 정책 평가에 필요
         "final_score": round(final_score, 4),
         "attempts": 0,
         "status": "challenge",
@@ -1221,8 +1242,17 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
         except Exception as e:
             logger.error(f"[DB] verify 성공 업데이트 실패: {e}")
 
-        # behavior_embeddings.label: unknown → human
-        _bg(_update_embedding_label(payload.session_id, "human"))
+        # behavior_embeddings.label 갱신 (까다로운 조건 통과 시에만 'human')
+        verify_label, verify_reason = _decide_label(
+            outcome="challenge_pass",
+            rule_score=float(session.get("behavior_score", 0)),
+            fingerprint_score=float(session.get("fingerprint_score", 0)),
+            solve_time_ms=solve_time_ms,
+        )
+        logger.info(
+            f"[label.challenge_pass] session={payload.session_id} → {verify_label} ({verify_reason})"
+        )
+        _bg(_update_embedding_label(payload.session_id, verify_label))
 
         return CaptchaVerifyResponse(success=True, token=token)
 
@@ -1255,8 +1285,19 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
         except Exception as e:
             logger.error(f"[DB] verify 실패초과 업데이트 실패: {e}")
 
-        # behavior_embeddings.label: unknown → bot
-        _bg(_update_embedding_label(payload.session_id, "bot"))
+        # behavior_embeddings.label 갱신 (까다로운 조건 통과 시에만 'bot')
+        # 5회 모두 틀릴 때 평균 풀이 시간을 사용 (한 번이라도 정상 속도면 사람일 가능성)
+        avg_solve_ms = solve_time_ms  # 마지막 시도 기준 (보수적 추정)
+        fail_label, fail_reason = _decide_label(
+            outcome="challenge_fail",
+            rule_score=float(session.get("behavior_score", 0)),
+            fingerprint_score=float(session.get("fingerprint_score", 0)),
+            solve_time_ms=avg_solve_ms,
+        )
+        logger.info(
+            f"[label.challenge_fail] session={payload.session_id} → {fail_label} ({fail_reason})"
+        )
+        _bg(_update_embedding_label(payload.session_id, fail_label))
 
         _bg(_save_bot_signature(
             client_ip,
@@ -1392,19 +1433,106 @@ def _bg(coro) -> None:
         pass
 
 
-async def _update_embedding_label(session_id: str, label: str) -> None:
-    """challenge verify 결과에 따라 behavior_embeddings.label 업데이트.
-    init 시점엔 'unknown'으로 박혀 있다가, verify 성공 시 'human',
-    실패 초과 시 'bot'으로 갱신된다.
+# ─────────────────────────────────────────────
+# 라벨링 정책 (label noise 방지)
+# ─────────────────────────────────────────────
+# 배경: 캡챠 결과를 그대로 KNN 학습 라벨로 쓰면, 사람의 우연한 5회 실패나
+# 봇의 우연한 통과로 학습 풀이 오염되어 시간이 지날수록 정확도가 떨어지는
+# self-amplifying feedback loop 가 발생한다 (label noise).
+#
+# 해결책 (Day 1~2 Conservative Labeling Policy):
+#  1) 옵션 A: 까다로운 조건을 모두 만족할 때만 human/bot 라벨 부여.
+#             그 외는 'unknown' 으로 남겨 KNN 다수결에서 자연 배제.
+#  2) 옵션 B (append-only): 한 번 부여된 비-unknown 라벨은 절대 덮어쓰지 않음.
+#             잘못된 라벨이 후속 시도로 뒤집히는 일을 차단.
+
+# human 라벨 조건 (전부 만족해야 함)
+LABEL_HUMAN_RULE_MIN = 0.6        # 룰 점수 충분히 사람다움
+LABEL_HUMAN_FP_MIN = 0.9          # 정상 브라우저 환경
+LABEL_HUMAN_SOLVE_MIN_MS = 1500   # 최소 1.5초 (너무 빠르면 봇 의심)
+LABEL_HUMAN_SOLVE_MAX_MS = 30000  # 최대 30초 (너무 느리면 라벨링 보류)
+
+# bot 라벨 조건 (전부 만족해야 함)
+LABEL_BOT_RULE_MAX = 0.4          # 룰 점수 충분히 봇다움
+LABEL_BOT_FP_MAX = 0.7            # 환경도 의심
+LABEL_BOT_SOLVE_MAX_MS = 1500     # 너무 빨리 풀었음
+
+# init_block 전용 (즉시 차단된 환경 — 더 약한 조건으로 bot 부여 가능)
+LABEL_INIT_BLOCK_RULE_MAX = 0.3
+LABEL_INIT_BLOCK_FP_MAX = 0.7
+
+
+def _decide_label(
+    *,
+    outcome: str,
+    rule_score: float,
+    fingerprint_score: float,
+    solve_time_ms: int | None = None,
+) -> tuple[str, str]:
+    """outcome 별로 까다로운 조건을 만족할 때만 human/bot 라벨 부여.
+
+    Args:
+        outcome: 'init_pass' | 'init_block' | 'challenge_pass' | 'challenge_fail'
+        rule_score: 레이어3 룰 기반 점수 (0.0 ~ 1.0)
+        fingerprint_score: 핑거프린트 점수 (0.0 ~ 1.0)
+        solve_time_ms: 그리드 풀이 시간 (init 분기는 None)
+
+    Returns:
+        (label, reason) — label 은 'human'/'bot'/'unknown', reason 은 결정 근거 로그용
     """
+    if outcome in ("init_pass", "challenge_pass"):
+        if rule_score < LABEL_HUMAN_RULE_MIN:
+            return "unknown", f"rule={rule_score:.2f}<{LABEL_HUMAN_RULE_MIN}"
+        if fingerprint_score < LABEL_HUMAN_FP_MIN:
+            return "unknown", f"fp={fingerprint_score:.2f}<{LABEL_HUMAN_FP_MIN}"
+        if outcome == "challenge_pass":
+            if solve_time_ms is None:
+                return "unknown", "solve_ms=None"
+            if not (LABEL_HUMAN_SOLVE_MIN_MS <= solve_time_ms <= LABEL_HUMAN_SOLVE_MAX_MS):
+                return "unknown", f"solve_ms={solve_time_ms} out of [{LABEL_HUMAN_SOLVE_MIN_MS},{LABEL_HUMAN_SOLVE_MAX_MS}]"
+        return "human", "all conditions met"
+
+    if outcome == "challenge_fail":
+        if rule_score >= LABEL_BOT_RULE_MAX:
+            return "unknown", f"rule={rule_score:.2f}>={LABEL_BOT_RULE_MAX}"
+        if fingerprint_score >= LABEL_BOT_FP_MAX:
+            return "unknown", f"fp={fingerprint_score:.2f}>={LABEL_BOT_FP_MAX}"
+        if solve_time_ms is None or solve_time_ms >= LABEL_BOT_SOLVE_MAX_MS:
+            return "unknown", f"solve_ms={solve_time_ms}>={LABEL_BOT_SOLVE_MAX_MS}"
+        return "bot", "all conditions met"
+
+    if outcome == "init_block":
+        if rule_score < LABEL_INIT_BLOCK_RULE_MAX and fingerprint_score < LABEL_INIT_BLOCK_FP_MAX:
+            return "bot", "init_block strong signal"
+        return "unknown", f"init_block rule={rule_score:.2f} fp={fingerprint_score:.2f}"
+
+    return "unknown", f"unhandled outcome={outcome}"
+
+
+async def _update_embedding_label(session_id: str, label: str) -> None:
+    """verify 결과에 따라 behavior_embeddings.label 갱신 (append-only).
+
+    중요: 기존 라벨이 'unknown' 인 경우에만 UPDATE 한다.
+    한 번 'human' 또는 'bot' 으로 확정된 라벨은 후속 호출로 절대 덮어쓰지 않는다.
+    이는 잘못된 라벨이 향후 시도에 의해 뒤집히면서 학습 풀을 오염시키는 것을
+    방지하기 위한 옵션 B (append-only) 정책의 일부.
+    """
+    if label == "unknown":
+        # unknown 으로 되돌리는 일은 없음
+        logger.info(f"[label.skip] session={session_id} → unknown 유지")
+        return
     try:
         async with AsyncSessionLocal() as db:
-            await db.execute(text("""
+            result = await db.execute(text("""
                 UPDATE behavior_embeddings
                 SET label = :label
-                WHERE session_id = :sid
+                WHERE session_id = :sid AND label = 'unknown'
             """), {"label": label, "sid": session_id})
             await db.commit()
+            if result.rowcount and result.rowcount > 0:
+                logger.info(f"[label.assign] session={session_id} → {label}")
+            else:
+                logger.info(f"[label.skip] session={session_id} → 이미 라벨 확정됨, {label} 적용 안 함")
     except Exception as e:
         logger.error(f"[DB] behavior_embedding label 업데이트 실패: {e}")
 
