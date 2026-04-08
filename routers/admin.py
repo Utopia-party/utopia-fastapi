@@ -19,7 +19,7 @@ from models.admin import (
     Settlement,
     SystemLog,
 )
-from models.notification import Notification, NotificationTypeEnum
+from models.notification import Notification
 from models.party import Party, PartyMember, Service
 from models.user import User
 from schemas.admin import (
@@ -638,7 +638,7 @@ async def update_admin_user_status(
     db.add(
         Notification(
             user_id=target_user.id,
-            type=NotificationTypeEnum.SYSTEM,
+            type="SYSTEM",
             title="계정 상태 변경",
             message=f"관리자에 의해 계정 상태가 '{payload.status}'로 변경되었습니다.",
             created_by=admin.user.id,
@@ -762,7 +762,7 @@ async def force_end_admin_party(
         db.add(
             Notification(
                 user_id=member.user_id,
-                type=NotificationTypeEnum.PARTY,
+                type="PARTY",
                 title="파티 종료 안내",
                 message=f"관리자에 의해 파티가 종료되었습니다. 사유: {payload.reason or '운영 정책 위반'}",
                 reference_type="party",
