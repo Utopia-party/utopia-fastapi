@@ -1,22 +1,20 @@
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import Response
 import httpx
 import uuid
 import random
 import json
-import logging
-import redis.asyncio as redis
 import traceback
 import logging
-from typing import Any
+from typing import Any, Optional
+
+import redis.asyncio as redis
+import asyncpg
 
 from core.config import settings
 from schemas.captcha import (
     CaptchaChallengeResponse,
-    CaptchaEnvInfo,
     CaptchaInitRequest,
     CaptchaInitResponse,
-    CaptchaScreenInfo,
     CaptchaStatusResponse,
     CaptchaVerifyRequest,
     CaptchaVerifyResponse,
@@ -24,13 +22,11 @@ from schemas.captcha import (
 from services.captcha_service import (
     get_captcha_status,
     get_challenge,
-    get_proxied_image,
     initiate_captcha,
     verify_challenge,
 )
 
-# 상원: 1차 캡챠 API를 /api/captcha/* 아래로 고정해서 프론트 호출 경로와 맞춥니다.
-router = APIRouter(prefix="/captcha")  # 상원
+router = APIRouter()
 logger = logging.getLogger("handocr-api")
 
 
@@ -38,73 +34,29 @@ logger = logging.getLogger("handocr-api")
 # 1차 캡챠 API
 # ─────────────────────────────────────────────
 
-
-@router.post("/init", response_model=CaptchaInitResponse)  # 상원
+@router.post("/init", response_model=CaptchaInitResponse)
 async def captcha_init(payload: CaptchaInitRequest, request: Request):
-    # 상원: 행동 데이터 기반 1차 판정을 시작하는 진입점입니다.
-    # 상원: 실제 점수 계산과 세션 생성은 서비스 계층 함수 initiate_captcha에 위임합니다.
     return await initiate_captcha(payload, request)
 
 
-@router.get("/challenge", response_model=CaptchaChallengeResponse)  # 상원
+@router.get("/challenge", response_model=CaptchaChallengeResponse)
 async def captcha_challenge(session_id: str, request: Request):
-    # 상원: challenge 상태 세션의 3x3 이미지 문제를 내려줍니다.
-    # 상원: 세션 검증과 문제 생성은 서비스 계층 함수 get_challenge가 처리합니다.
     return await get_challenge(session_id, request)
 
 
-@router.post("/verify", response_model=CaptchaVerifyResponse)  # 상원
+@router.post("/verify", response_model=CaptchaVerifyResponse)
 async def captcha_verify(payload: CaptchaVerifyRequest, request: Request):
-    # 상원: 사용자가 선택한 3칸이 이모지 순서와 맞는지 검증하고 통과 토큰을 발급합니다.
-    # 상원: 실제 정답 판정과 토큰 발급은 서비스 계층 함수 verify_challenge가 처리합니다.
     return await verify_challenge(payload, request)
 
 
-@router.get("/status", response_model=CaptchaStatusResponse)  # 상원
+@router.get("/status", response_model=CaptchaStatusResponse)
 async def captcha_status(request: Request):
-    # 상원: WAIT, LOCKED, BANNED와 active_session_id를 조회해 프론트 재진입 흐름을 맞춥니다.
-    # 상원: 상태 계산은 서비스 계층 함수 get_captcha_status에 위임합니다.
     return await get_captcha_status(request)
 
 
-@router.get("/image/{token}")
-async def captcha_image_proxy(token: str):
-    """이미지 프록시 — URL에서 동물 카테고리명 노출 방지"""
-    image_bytes, content_type = await get_proxied_image(token)
-    return Response(
-        content=image_bytes,
-        media_type=content_type,
-        headers={"Cache-Control": "no-store"},
-    )
-
-
 # ─────────────────────────────────────────────
-# 발표 시연용 테스트 엔드포인트
+# HandOCR 캡챠 설정
 # ─────────────────────────────────────────────
-
-
-@router.post("/test/simulate-bot", response_model=CaptchaInitResponse)
-async def simulate_bot(request: Request):
-    """발표용: Selenium 봇 시뮬레이션 → block"""
-    fake_payload = CaptchaInitRequest(
-        mouse_moves=[],
-        clicks=[],
-        key_intervals=[],
-        scrolled=False,
-        env=CaptchaEnvInfo(
-            webdriver=True,
-            plugins_count=0,
-            canvas_hash="",
-            webgl_renderer="",
-            screen=CaptchaScreenInfo(width=0, height=0),
-            timezone="",
-            languages=[],
-        ),
-        page_load_to_checkbox=50,
-        trigger_type="new_ip_login",
-    )
-    return await initiate_captcha(fake_payload, request)
-
 
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 GPU_SERVER_URL = settings.GPU_SERVER_URL
@@ -117,6 +69,26 @@ ALL_POSES = [
 ]
 
 MAX_ATTEMPTS = 5
+
+
+# PostgreSQL 연결 정보
+# 예:
+# settings.POSTGRES_DSN = "postgresql://user:password@10.10.0.12:5432/appdb"
+POSTGRES_DSN = settings.POSTGRES_DSN
+
+_db_pool: Optional[asyncpg.Pool] = None
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = await asyncpg.create_pool(
+            dsn=POSTGRES_DSN,
+            min_size=1,
+            max_size=5,
+            command_timeout=10,
+        )
+    return _db_pool
 
 
 def build_ai_failure_message(gpu_result: dict, remaining_attempts: int) -> str:
@@ -165,9 +137,142 @@ def safe_float(value: Any):
         return None
 
 
-@router.post("/handocr/start")  # 상원
+def safe_int(value: Any):
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+async def save_hand_pose_sample(
+    *,
+    session_id: str,
+    expected_pose: str,
+    expected_text: str,
+    verify_success: bool,
+    pose_match: Optional[bool],
+    text_match: Optional[bool],
+    gpu_result: Optional[dict],
+):
+    """
+    손 포즈 재학습용 샘플 저장.
+    성공/실패 모두 저장하되, 나중에 재학습할 때는 verify_success=True 또는 pose_match=True 기준으로 추출하면 됨.
+    """
+    pool = await get_db_pool()
+
+    request_id = None
+    detected_pose = None
+    predicted_label = None
+    pose_confidence = None
+    hand_area_ratio = None
+    hand_bbox = None
+    pose_features = None
+    detected_text = None
+    ocr_confidence = None
+    ocr_low_confidence = None
+    ocr_best_attempt = None
+    ocr_text_candidates = None
+    ocr_debug_top = None
+    inspection = None
+    ai_success = None
+    ai_error_code = None
+    ai_message = None
+    ai_detail = None
+    ai_guide = None
+
+    if isinstance(gpu_result, dict):
+        request_id = gpu_result.get("request_id")
+        detected_pose = gpu_result.get("detected_pose")
+        predicted_label = safe_int(gpu_result.get("predicted_label"))
+        pose_confidence = safe_float(gpu_result.get("pose_confidence"))
+        hand_area_ratio = safe_float(gpu_result.get("hand_area_ratio"))
+        hand_bbox = gpu_result.get("hand_bbox")
+        pose_features = gpu_result.get("pose_features")
+        detected_text = gpu_result.get("detected_text")
+        ocr_confidence = safe_float(gpu_result.get("ocr_confidence"))
+        ocr_low_confidence = gpu_result.get("ocr_low_confidence")
+        ocr_best_attempt = gpu_result.get("ocr_best_attempt")
+        ocr_text_candidates = gpu_result.get("ocr_text_candidates")
+        ocr_debug_top = gpu_result.get("ocr_debug_top")
+        inspection = gpu_result.get("inspection")
+        ai_success = gpu_result.get("success")
+        ai_error_code = gpu_result.get("error_code")
+        ai_message = gpu_result.get("message")
+        ai_detail = gpu_result.get("detail")
+        ai_guide = gpu_result.get("guide")
+
+    insert_sql = """
+    INSERT INTO hand_pose_samples (
+        session_id,
+        request_id,
+        expected_pose,
+        expected_text,
+        detected_pose,
+        predicted_label,
+        pose_confidence,
+        hand_area_ratio,
+        hand_bbox,
+        feature_vector,
+        detected_text,
+        ocr_confidence,
+        ocr_low_confidence,
+        ocr_best_attempt,
+        ocr_text_candidates,
+        ocr_debug_top,
+        inspection,
+        ai_success,
+        ai_error_code,
+        ai_message,
+        ai_detail,
+        ai_guide,
+        verify_success,
+        pose_match,
+        text_match,
+        created_at
+    )
+    VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8,
+        $9::jsonb, $10::jsonb, $11, $12, $13, $14,
+        $15::jsonb, $16::jsonb, $17::jsonb,
+        $18, $19, $20, $21, $22, $23, $24, $25, NOW()
+    )
+    """
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            insert_sql,
+            session_id,
+            request_id,
+            expected_pose,
+            expected_text,
+            detected_pose,
+            predicted_label,
+            pose_confidence,
+            hand_area_ratio,
+            json.dumps(hand_bbox, ensure_ascii=False) if hand_bbox is not None else None,
+            json.dumps(pose_features, ensure_ascii=False) if pose_features is not None else None,
+            detected_text,
+            ocr_confidence,
+            ocr_low_confidence,
+            ocr_best_attempt,
+            json.dumps(ocr_text_candidates, ensure_ascii=False) if ocr_text_candidates is not None else None,
+            json.dumps(ocr_debug_top, ensure_ascii=False) if ocr_debug_top is not None else None,
+            json.dumps(inspection, ensure_ascii=False) if inspection is not None else None,
+            ai_success,
+            ai_error_code,
+            ai_message,
+            ai_detail,
+            ai_guide,
+            verify_success,
+            pose_match,
+            text_match,
+        )
+
+
+@router.post("/captcha/handocr/start")
 async def start_captcha():
-    # 상원: 2차 handOCR 캡챠 시작 시 문제 문자열과 손 포즈를 세션으로 발급합니다.
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     random_text = "".join(random.choice(chars) for _ in range(5))
     random_pose = random.choice(ALL_POSES)
@@ -188,9 +293,8 @@ async def start_captcha():
     }
 
 
-@router.post("/handocr/verify")  # 상원
+@router.post("/captcha/handocr/verify")
 async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(...)):
-    # 상원: 업로드 이미지를 GPU 서버에 보내 손 포즈와 OCR 결과를 검증합니다.
     session_str = await redis_client.get(f"captcha:{sessionId}")
     if not session_str:
         return {
@@ -262,6 +366,22 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
                 logger.exception("GPU json parse failed")
                 session_data["attempts"] += 1
                 await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
+
+                await save_hand_pose_sample(
+                    session_id=sessionId,
+                    expected_pose=expected_pose,
+                    expected_text=expected_text,
+                    verify_success=False,
+                    pose_match=None,
+                    text_match=None,
+                    gpu_result={
+                        "success": False,
+                        "error_code": "GPU_JSON_PARSE_FAILED",
+                        "message": "AI 서버 응답을 해석하지 못했습니다.",
+                        "detail": repr(json_error),
+                    },
+                )
+
                 return {
                     "success": False,
                     "message": (
@@ -447,6 +567,20 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
         await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
         remaining_attempts = MAX_ATTEMPTS - session_data["attempts"]
 
+        # 실패 샘플도 저장
+        try:
+            await save_hand_pose_sample(
+                session_id=sessionId,
+                expected_pose=expected_pose,
+                expected_text=expected_text,
+                verify_success=False,
+                pose_match=None,
+                text_match=None,
+                gpu_result=gpu_result,
+            )
+        except Exception:
+            logger.exception("failed to save failed hand pose sample")
+
         return {
             "success": False,
             "message": build_ai_failure_message(gpu_result, remaining_attempts),
@@ -472,6 +606,20 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
 
     pose_ok = detected_pose == expected_pose
     text_ok = detected_text == expected_text
+
+    # 성공/실패와 상관없이, 여기까지 온 정상 응답 샘플은 저장
+    try:
+        await save_hand_pose_sample(
+            session_id=sessionId,
+            expected_pose=expected_pose,
+            expected_text=expected_text,
+            verify_success=(pose_ok and text_ok),
+            pose_match=pose_ok,
+            text_match=text_ok,
+            gpu_result=gpu_result,
+        )
+    except Exception:
+        logger.exception("failed to save hand pose sample")
 
     if not pose_ok or not text_ok:
         session_data["attempts"] += 1
