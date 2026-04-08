@@ -714,7 +714,8 @@ async def _build_new_challenge_payload(
     all_photo_categories = list(photo_lib.keys())
     wrong_categories = [c for c in all_photo_categories if c not in categories]
     if not wrong_categories:
-        wrong_categories = [c for c in available_categories if c not in categories]
+        # 상원: 로컬처럼 사진 카테고리가 3종뿐인 경우에도 문제를 만들 수 있게 전체 사용 가능 카테고리에서 다시 고릅니다.
+        wrong_categories = list(available_categories)
     answer_positions = sorted(random.sample(list(range(9)), 3))
     used_emoji_paths: set[str] = set()
     used_photo_paths: set[str] = set()
