@@ -1,17 +1,9 @@
 import uuid
-import enum
-from sqlalchemy import Text, Boolean, DateTime, ForeignKey, Enum as SAEnum, func, text, String
+from sqlalchemy import Text, Boolean, DateTime, ForeignKey, func, text, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database import Base
 from datetime import datetime
-
-
-class NotificationTypeEnum(str, enum.Enum):
-    SECURITY = "SECURITY"
-    PAYMENT = "PAYMENT"
-    PARTY = "PARTY"
-    SYSTEM = "SYSTEM"
 
 
 class Notification(Base):
@@ -23,9 +15,7 @@ class Notification(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id")
     )
-    type: Mapped[NotificationTypeEnum | None] = mapped_column(
-        SAEnum(NotificationTypeEnum, name="notification_type_enum", create_type=False)
-    )
+    type: Mapped[str | None] = mapped_column(String(30))
     title: Mapped[str | None] = mapped_column(String(200))
     message: Mapped[str | None] = mapped_column(Text)
     reference_type: Mapped[str | None] = mapped_column(String(30))

@@ -1,9 +1,9 @@
 import uuid
-from sqlalchemy import String, Integer, Boolean, Date, DateTime, Text, ForeignKey, func, text
+from sqlalchemy import String, Integer, Boolean, DateTime, Text, ForeignKey, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database import Base
-from datetime import datetime, date
+from datetime import datetime
 
 
 class Party(Base):
@@ -19,16 +19,7 @@ class Party(Base):
         UUID(as_uuid=True), ForeignKey("services.id"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(100), nullable=False)
-    description: Mapped[str | None] = mapped_column(Text)
-    max_members: Mapped[int] = mapped_column(Integer, nullable=False)
-    current_members: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
-    monthly_per_person: Mapped[int] = mapped_column(Integer, nullable=False)
-    account_id: Mapped[str | None] = mapped_column(String(255))
-    account_password: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="recruiting")
-    start_date: Mapped[date | None] = mapped_column(Date)
-    end_date: Mapped[date | None] = mapped_column(Date)
-    # ✅ Fix: DateTime → DateTime(timezone=True) 로 통일 (user.py와 일관성 유지)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
