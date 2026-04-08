@@ -137,30 +137,39 @@ def _party_status_label(party: Party, report_count: int) -> str:
 
 def _report_status_label(value: str) -> str:
     return {
-        "PENDING": "접수",
-        "PROCESSED": "처리",
-        "REJECTED": "기각",
-        "APPEALED": "이의제기",
-        "AUTO_PROCESSED": "AI처리",
-    }.get(value.upper(), value)
+        "pending": "접수",
+        "processed": "처리",
+        "rejected": "기각",
+        "appealed": "이의제기",
+        "auto_processed": "AI처리",
+    }.get(value.lower(), value)
 
 
 def _report_status_code(value: str) -> str:
     return {
-        "접수": "PENDING",
-        "처리": "PROCESSED",
-        "기각": "REJECTED",
-        "이의제기": "APPEALED",
-        "AI처리": "AUTO_PROCESSED",
-    }.get(value, value.upper())
+        "접수": "pending",
+        "처리": "processed",
+        "기각": "rejected",
+        "이의제기": "appealed",
+        "AI처리": "auto_processed",
+    }.get(value, value.lower())
 
 
 def _report_type_label(value: str) -> str:
     return {
-        "USER": "사용자",
-        "PARTY": "파티",
-        "CHAT": "채팅",
-    }.get(value.upper(), value)
+        "user": "사용자",
+        "party": "파티",
+        "chat": "채팅",
+    }.get(value.lower(), value)
+
+
+def _report_target_counts_subquery(target_type: str, label: str):
+    return (
+        select(Report.target_id.label(label), func.count(Report.id).label("count"))
+        .where(func.lower(Report.target_type) == target_type)
+        .group_by(Report.target_id)
+        .subquery()
+    )
 
 
 def _receipt_status_label(value: str) -> str:
@@ -426,7 +435,7 @@ async def get_admin_dashboard(
         select(func.count()).select_from(User).where(User.created_at >= today_start)
     ) or 0
     pending_reports = await db.scalar(
-        select(func.count()).select_from(Report).where(Report.status == "PENDING")
+        select(func.count()).select_from(Report).where(func.lower(Report.status) == "pending")
     ) or 0
     pending_settlements = await db.scalar(
         select(func.count()).select_from(Settlement).where(Settlement.status == "PENDING")
@@ -589,12 +598,7 @@ async def get_admin_users(
     keyword: str = Query(default=""),
     status_filter: str = Query(default="", alias="status"),
 ):
-    report_counts = (
-        select(Report.target_user_id.label("user_id"), func.count(Report.id).label("count"))
-        .where(Report.target_user_id.is_not(None))
-        .group_by(Report.target_user_id)
-        .subquery()
-    )
+    report_counts = _report_target_counts_subquery("user", "user_id")
     party_counts = (
         select(PartyMember.user_id.label("user_id"), func.count(PartyMember.id).label("count"))
         .group_by(PartyMember.user_id)
@@ -660,7 +664,9 @@ async def get_admin_user_detail(
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
     report_count = await db.scalar(
-        select(func.count()).select_from(Report).where(Report.target_user_id == user.id)
+        select(func.count())
+        .select_from(Report)
+        .where(func.lower(Report.target_type) == "user", Report.target_id == user.id)
     ) or 0
     party_count = await db.scalar(
         select(func.count()).select_from(PartyMember).where(PartyMember.user_id == user.id)
@@ -812,7 +818,9 @@ async def update_admin_user_status(
     await db.refresh(target_user)
 
     report_count = await db.scalar(
-        select(func.count()).select_from(Report).where(Report.target_user_id == target_user.id)
+        select(func.count())
+        .select_from(Report)
+        .where(func.lower(Report.target_type) == "user", Report.target_id == target_user.id)
     ) or 0
     party_count = await db.scalar(
         select(func.count()).select_from(PartyMember).where(PartyMember.user_id == target_user.id)
@@ -836,12 +844,7 @@ async def get_admin_parties(
     keyword: str = Query(default=""),
     status_filter: str = Query(default="", alias="status"),
 ):
-    report_counts = (
-        select(Report.target_party_id.label("party_id"), func.count(Report.id).label("count"))
-        .where(Report.target_party_id.is_not(None))
-        .group_by(Report.target_party_id)
-        .subquery()
-    )
+    report_counts = _report_target_counts_subquery("party", "party_id")
 
     stmt = (
         select(Party, Service, User, func.coalesce(report_counts.c.count, 0))
@@ -938,7 +941,9 @@ async def force_end_admin_party(
     await db.commit()
 
     report_count = await db.scalar(
-        select(func.count()).select_from(Report).where(Report.target_party_id == party.id)
+        select(func.count())
+        .select_from(Report)
+        .where(func.lower(Report.target_type) == "party", Report.target_id == party.id)
     ) or 0
     service = await db.get(Service, party.service_id)
     host = await db.get(User, party.leader_id)
@@ -963,23 +968,14 @@ async def get_admin_reports(
     rows = (await db.execute(select(Report).order_by(Report.created_at.desc()))).scalars().all()
     items: list[ReportRecordOut] = []
     for report in rows:
-        if report.target_user_id:
-            target = str(report.target_user_id)
-        elif report.target_party_id:
-            target = str(report.target_party_id)
-        elif report.target_chat_id:
-            target = str(report.target_chat_id)
-        else:
-            target = "-"
-
         items.append(
             ReportRecordOut(
                 id=str(report.id),
-                type=_report_type_label(report.type),
-                target=target,
-                reason=report.reason,
+                type=_report_type_label(report.target_type),
+                target=str(report.target_id),
+                reason=report.category,
                 status=_report_status_label(report.status),
-                content=report.content or "",
+                content=report.description or "",
                 createdAt=_format_datetime(report.created_at),
             )
         )
@@ -998,8 +994,9 @@ async def update_admin_report_status(
         raise HTTPException(status_code=404, detail="신고를 찾을 수 없습니다.")
 
     report.status = _report_status_code(payload.status)
-    report.processed_by = admin.user.id
-    report.processed_at = datetime.now(timezone.utc)
+    report.resolved_by = admin.user.id
+    report.resolved_at = datetime.now(timezone.utc)
+    report.resolution = payload.status
 
     await _append_activity_log(
         db,
@@ -1010,14 +1007,13 @@ async def update_admin_report_status(
     )
     await db.commit()
 
-    target = str(report.target_user_id or report.target_party_id or report.target_chat_id or "-")
     return ReportRecordOut(
         id=str(report.id),
-        type=_report_type_label(report.type),
-        target=target,
-        reason=report.reason,
+        type=_report_type_label(report.target_type),
+        target=str(report.target_id),
+        reason=report.category,
         status=_report_status_label(report.status),
-        content=report.content or "",
+        content=report.description or "",
         createdAt=_format_datetime(report.created_at),
     )
 
