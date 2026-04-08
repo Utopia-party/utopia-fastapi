@@ -1,26 +1,35 @@
 import uuid
-from pydantic import BaseModel
+from datetime import datetime
 from typing import Optional
 
-# ✅ 추가된 공통 메시지 응답 스키마
+from pydantic import BaseModel
+
+
+# 파티 채팅
 class MessageOut(BaseModel):
     message: str
 
     model_config = {"from_attributes": True}
 
-class UserResponse(BaseModel):
+
+class UserOut(BaseModel):
     id: uuid.UUID
     email: str
+    name: Optional[str] = None
     nickname: str
+    role: str
+    trust_score: float
+    is_active: bool
+    created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 
 
-# 마이페이지 - 프로필
 class MyPageProfileResponse(BaseModel):
     email: str
+    name: Optional[str] = None
     nickname: str
-    # ✅ Fix: User 모델에서 phone은 Optional[str] → None일 수 있으므로 Optional로 변경
     phone: Optional[str] = None
+    referrer: Optional[str] = None
 
     model_config = {"from_attributes": True}

@@ -14,7 +14,17 @@ from core.database import get_db
 from core.redis_client import redis_client
 from models.user import User
 from models.refresh_token import RefreshToken
-from schemas import UserCreate, UserOut, UserResponse, UserLogin
+from schemas.auth import (
+    UserCreate,
+    UserResponse,
+    UserLogin,
+    FindIdRequest,
+    FindIdResponse,
+    FindPasswordRequest,
+    FindPasswordResponse,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
+)
 from services.auth_service import (
     get_password_hash,
     verify_password,
@@ -49,7 +59,6 @@ conf = ConnectionConfig(
 )
 
 
-# ✅ Fix: social_login / social_signup body를 raw dict 대신 Pydantic 스키마로 교체
 class SocialLoginBody(BaseModel):
     oauth: str
     code: str
@@ -67,7 +76,6 @@ def get_email_auth_key(email: str) -> str:
     return f"email_auth:{email}"
 
 
-# ─── Refresh token ─────────────────────────────────────────────
 @router.post("/refresh")
 async def refresh_token_api(
     request: Request,
@@ -122,7 +130,6 @@ async def refresh_token_api(
     return {"message": "access token과 refresh token이 재발급되었습니다."}
 
 
-# ─── 로그인 상태 확인 ────────────────────────────────────────
 @router.get("/me")
 async def me(
     access_token: str | None = Cookie(default=None, alias="access_token"),
@@ -156,63 +163,148 @@ async def me(
     }
 
 
-# ─── 이메일 인증번호 요청 ────────────────────────────────────
-@router.post("/email-request")
-async def email_request(email: EmailStr, background_tasks: BackgroundTasks):
-    auth_code = str(random.randint(100000, 999999))
-    # ✅ Fix: 동기 redis → await 추가
-    await redis_client.setex(get_email_auth_key(str(email)), settings.EMAIL_AUTH_TTL_SECONDS, auth_code)
-
-    message = MessageSchema(
-        subject="[Party-Up] 회원가입 인증번호입니다.",
-        recipients=[email],
-        body=f"안녕하세요! Party-Up 서비스 가입을 위한 인증번호는 [{auth_code}] 입니다.",
-        subtype="plain",
-    )
-    fm = FastMail(conf)
-    background_tasks.add_task(fm.send_message, message)
-    return {"message": "인증 메일이 발송되었습니다.", "expires_in": settings.EMAIL_AUTH_TTL_SECONDS}
 
 
-# ─── 이메일 인증번호 확인 ────────────────────────────────────
-@router.post("/email-verify")
-async def email_verify(email: str, code: str):
-    redis_key = get_email_auth_key(email)
-    # ✅ Fix: 동기 redis → await 추가
-    saved_code = await redis_client.get(redis_key)
-    if not saved_code:
-        raise HTTPException(status_code=400, detail="인증번호가 없거나 만료되었습니다.")
-    if saved_code != code:
-        raise HTTPException(status_code=400, detail="인증번호가 틀렸습니다.")
-    await redis_client.delete(redis_key)
-    return {"success": True, "message": "이메일 인증에 성공했습니다."}
+@router.post("/logout")
+async def logout(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    refresh_token = request.cookies.get("refresh_token")
+
+    if refresh_token:
+        token_hash = hash_refresh_token(refresh_token)
+        result = await db.execute(
+            select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        )
+        token_row = result.scalar_one_or_none()
+
+        if token_row and token_row.revoked_at is None:
+            token_row.revoked_at = datetime.now(timezone.utc)
+            token_row.revoke_reason = "logout"
+            await db.commit()
+
+    clear_access_token_cookie(response)
+    clear_refresh_token_cookie(response)
+    return {"message": "로그아웃 되었습니다."}
 
 
-# ─── 이메일 중복검사 ─────────────────────────────────────────
-@router.get("/users/check-email")
-async def check_email(email: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.email == email))
-    return {"exists": result.scalar_one_or_none() is not None}
+def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
+    oauth = oauth.lower().strip()
+    if oauth == "google":
+        token = get_google_access_token(code)
+        info = get_google_user_info(token)
+        return str(info.get("sub")), info.get("email")
+    elif oauth == "kakao":
+        token = get_kakao_access_token(code)
+        info = get_kakao_user_info(token)
+        account = info.get("kakao_account", {}) or {}
+        return str(info.get("id")), account.get("email")
+    elif oauth == "naver":
+        if not state:
+            raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
+        token = get_naver_access_token(code, state)
+        info = get_naver_user_info(token)
+        return str(info.get("id")), info.get("email")
+    else:
+        raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
 
 
-# ─── 닉네임 중복검사 ────────────────────────────────────────
-@router.get("/users/check-nickname")
-async def check_nickname(nickname: str, db: AsyncSession = Depends(get_db)):
+@router.post("/auth/login")
+async def social_login(data: SocialLoginBody, response: Response, db: AsyncSession = Depends(get_db)):
+    oauth = data.oauth.lower().strip()
+    code = data.code
+    state = data.state
+
+    oauth_id, email = get_oauth_user_info(oauth, code, state)
+
+    result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
+    user = result.scalar_one_or_none()
+    if user:
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
+        await issue_tokens_and_save(response, db, user)
+        return {
+            "status": "LOGIN_SUCCESS",
+            "message": "소셜 로그인에 성공했습니다.",
+            "user": {"email": user.email, "nickname": user.nickname},
+        }
+
+    if email:
+        result = await db.execute(select(User).where(User.email == email))
+        email_user = result.scalar_one_or_none()
+        if email_user:
+            if email_user.provider not in ("local", oauth) and email_user.provider_id:
+                raise HTTPException(status_code=400, detail="이미 다른 소셜 계정에 연결된 이메일입니다.")
+            email_user.provider = oauth
+            email_user.provider_id = oauth_id
+            await db.commit()
+            await db.refresh(email_user)
+            await issue_tokens_and_save(response, db, email_user)
+            return {
+                "status": "LOGIN_SUCCESS",
+                "message": "기존 계정과 소셜 로그인이 연동되었습니다.",
+                "user": {"email": email_user.email, "nickname": email_user.nickname},
+            }
+
+    return {"status": "NEED_NICKNAME", "oauth": oauth, "oauth_id": oauth_id, "email": email}
+
+
+@router.post("/auth/social/signup")
+async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSession = Depends(get_db)):
+    oauth = data.oauth.lower().strip()
+    oauth_id = data.oauth_id
+    email = data.email
+    nickname = data.nickname.strip()
+
+    result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
+    existing = result.scalar_one_or_none()
+    if existing:
+        await issue_tokens_and_save(response, db, existing)
+        return {
+            "status": "LOGIN_SUCCESS",
+            "message": "이미 가입된 소셜 계정입니다.",
+            "user": {"email": existing.email, "nickname": existing.nickname},
+        }
+
     result = await db.execute(select(User).where(User.nickname == nickname))
-    return {"exists": result.scalar_one_or_none() is not None}
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
+
+    if not email:
+        email = f"{oauth}_{oauth_id}@social.local"
+
+    result = await db.execute(select(User).where(User.email == email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="이미 같은 이메일로 가입된 계정이 있습니다.")
+
+    user = User(
+        email=email,
+        nickname=nickname,
+        provider=oauth,
+        provider_id=oauth_id,
+        password_hash=None,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    await issue_tokens_and_save(response, db, user)
+
+    return {
+        "status": "SIGNUP_SUCCESS",
+        "message": "소셜 회원가입 및 로그인에 성공했습니다.",
+        "user": {"email": user.email, "nickname": user.nickname},
+    }
 
 
-# ─── 회원가입 ───────────────────────────────────────────────
+# 회원가입
 @router.post("/users", response_model=UserResponse, status_code=201)
 async def signup(
-    # 상원: 회원가입 직후 자동 로그인 쿠키를 발급하려고 Request 객체를 함께 받습니다.
-    request: Request,  # 상원
-    # 상원: issue_tokens_and_save가 쿠키를 심을 수 있도록 Response 객체를 함께 받습니다.
-    response: Response,  # 상원
-    # 상원: 프론트가 보낸 회원가입 바디를 UserCreate 스키마로 검증해 받습니다.
-    user: UserCreate,  # 상원
-    # 상원: 중복 검사, 사용자 생성, 토큰 저장에 쓸 DB 세션을 주입받습니다.
-    db: AsyncSession = Depends(get_db),  # 상원
+    request: Request,
+    response: Response,
+    user: UserCreate,
+    db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(User).where(User.email == user.email))
     if result.scalar_one_or_none():
@@ -222,40 +314,203 @@ async def signup(
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
 
+    referrer_id = None
+
+    if user.referrer:
+        result = await db.execute(
+            select(User).where(User.nickname == user.referrer)
+        )
+        ref_user = result.scalar_one_or_none()
+
+        if not ref_user:
+            raise HTTPException(status_code=400, detail="존재하지 않는 추천인입니다.")
+
+        referrer_id = ref_user.id
+
     new_user = User(
         email=user.email,
+        name=user.name,
         nickname=user.nickname,
         password_hash=get_password_hash(user.password),
         phone=user.phone,
+        referrer_id=referrer_id,
         provider="local",
     )
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
-    # 상원: 회원가입 직후 바로 관심사 저장 API를 사용할 수 있도록 자동 로그인 쿠키를 발급합니다.
-    await issue_tokens_and_save(  # 상원
-        # 상원: 발급된 액세스/리프레시 토큰 쿠키를 심을 대상 Response입니다.
-        response=response,  # 상원
-        # 상원: refresh token 저장과 사용자 조회에 사용할 DB 세션입니다.
-        db=db,  # 상원
-        # 상원: 방금 생성한 사용자를 토큰 발급 대상 계정으로 넘깁니다.
-        user=new_user,  # 상원
-        # 상원: 세션 기록에 남길 user-agent를 현재 요청 헤더에서 읽어 넘깁니다.
-        user_agent=request.headers.get("user-agent"),  # 상원
-        # 상원: 세션 기록에 남길 클라이언트 IP를 현재 요청에서 읽어 넘깁니다.
-        ip_address=request.client.host if request.client else None,  # 상원
-    )  # 상원
+
+    await issue_tokens_and_save(
+        response=response,
+        db=db,
+        user=new_user,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=request.client.host if request.client else None,
+    )
+
     return new_user
 
+@router.get("/users/check-email")
+async def check_email(email: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == email))
+    return {"exists": result.scalar_one_or_none() is not None}
 
-# ─── 일반 로그인 ────────────────────────────────────────────
-@router.post("/login")
-async def login(
-    request: Request,
-    user_credentials: UserLogin,
-    response: Response,
+@router.post("/email-request")
+async def email_request(
+    email: EmailStr,
+    background_tasks: BackgroundTasks,
+    type: str = "signup",
     db: AsyncSession = Depends(get_db),
 ):
+    if type == "reset-password":
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+
+        if not user or user.provider != "local" or not user.is_active:
+            raise HTTPException(
+                status_code=404,
+                detail="가입된 계정을 찾을 수 없습니다."
+            )
+
+    auth_code = str(random.randint(100000, 999999))
+
+    await redis_client.setex(
+        get_email_auth_key(str(email)),
+        settings.EMAIL_AUTH_TTL_SECONDS,
+        auth_code,
+    )
+
+    if type == "reset-password":
+        subject = "[Party-Up] 비밀번호 재설정 인증번호입니다."
+        body = f"안녕하세요!\n\n비밀번호 재설정을 위한 인증번호는 [{auth_code}] 입니다."
+    else:
+        subject = "[Party-Up] 회원가입 인증번호입니다."
+        body = f"안녕하세요!\n\n회원가입 인증번호는 [{auth_code}] 입니다."
+
+    message = MessageSchema(
+        subject=subject,
+        recipients=[email],
+        body=body,
+        subtype="plain",
+    )
+
+    fm = FastMail(conf)
+    background_tasks.add_task(fm.send_message, message)
+
+    return {
+        "message": "인증 메일이 발송되었습니다.",
+        "expires_in": settings.EMAIL_AUTH_TTL_SECONDS,
+    }
+
+@router.post("/email-verify")
+async def email_verify(email: str, code: str):
+    redis_key = get_email_auth_key(email)
+    saved_code = await redis_client.get(redis_key)
+    if not saved_code:
+        raise HTTPException(status_code=400, detail="인증번호가 없거나 만료되었습니다.")
+    if saved_code != code:
+        raise HTTPException(status_code=400, detail="인증번호가 틀렸습니다.")
+    await redis_client.delete(redis_key)
+    return {"success": True, "message": "이메일 인증에 성공했습니다."}
+
+@router.get("/users/check-nickname")
+async def check_nickname(nickname: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.nickname == nickname))
+    return {"exists": result.scalar_one_or_none() is not None}
+
+# 이메일 찾기
+@router.post("/users/find-id", response_model=FindIdResponse)
+async def find_id(
+    payload: FindIdRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(User).where(
+            User.name == payload.name,
+            User.phone == payload.phone,
+        )
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        return FindIdResponse(message="일치하는 계정을 찾지 못했습니다.")
+
+    return FindIdResponse(email=user.email)
+
+# 비밀번호 찾기
+@router.post("/users/find-password", response_model=FindPasswordResponse)
+async def find_password(
+    payload: FindPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(User).where(User.email == payload.email)
+    )
+    user = result.scalar_one_or_none()
+
+    # # 로컬 활성 계정이면 비밀번호 재설정 허용 플래그를 Redis에 10분간 저장
+    # if user and user.provider == "local" and user.is_active:
+    #     await redis_client.setex(
+    #         f"password_reset_verified:{payload.email}",
+    #         600,  # 10분
+    #         "true",
+    #     )
+
+    # 보안을 위해 항상 같은 응답 반환
+    return FindPasswordResponse(
+        message="입력하신 이메일로 비밀번호 재설정 안내를 진행할 수 있습니다."
+    )
+
+@router.post("/users/reset-password", response_model=ResetPasswordResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    verified_key = f"password_reset_verified:{payload.email}"
+    verified = await redis_client.get(verified_key)
+
+    if not verified:
+        raise HTTPException(
+            status_code=400,
+            detail="비밀번호 재설정 인증이 완료되지 않았거나 만료되었습니다.",
+        )
+
+    result = await db.execute(
+        select(User).where(User.email == payload.email)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="가입된 계정을 찾을 수 없습니다.",
+        )
+
+    if user.provider != "local" or user.password_hash is None:
+        raise HTTPException(
+            status_code=400,
+            detail="일반 로그인 계정만 비밀번호를 재설정할 수 있습니다.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="비활성화된 계정입니다.",
+        )
+
+    user.password_hash = get_password_hash(payload.new_password)
+    await db.commit()
+
+    await redis_client.delete(verified_key)
+
+    return ResetPasswordResponse(
+        message="비밀번호가 성공적으로 변경되었습니다."
+    )
+
+
+# 일반로그인
+@router.post("/login")
+async def login(request: Request, user_credentials: UserLogin, response: Response, db: AsyncSession = Depends(get_db),):
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalar_one_or_none()
 
@@ -284,120 +539,3 @@ async def login(
             "role": user.role,
         },
     }
-
-
-# ─── 로그아웃 ───────────────────────────────────────────────
-@router.post("/logout")
-async def logout(
-    request: Request,
-    response: Response,
-    db: AsyncSession = Depends(get_db),
-):
-    refresh_token = request.cookies.get("refresh_token")
-
-    if refresh_token:
-        token_hash = hash_refresh_token(refresh_token)
-        result = await db.execute(
-            select(RefreshToken).where(RefreshToken.token_hash == token_hash)
-        )
-        token_row = result.scalar_one_or_none()
-
-        if token_row and token_row.revoked_at is None:
-            token_row.revoked_at = datetime.now(timezone.utc)
-            token_row.revoke_reason = "logout"
-            await db.commit()
-
-    clear_access_token_cookie(response)
-    clear_refresh_token_cookie(response)
-    return {"message": "로그아웃 되었습니다."}
-
-
-# ─── OAuth 유저정보 조회 헬퍼 ──────────────────────────────
-def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
-    oauth = oauth.lower().strip()
-    if oauth == "google":
-        token = get_google_access_token(code)
-        info = get_google_user_info(token)
-        return str(info.get("sub")), info.get("email")
-    elif oauth == "kakao":
-        token = get_kakao_access_token(code)
-        info = get_kakao_user_info(token)
-        account = info.get("kakao_account", {}) or {}
-        return str(info.get("id")), account.get("email")
-    elif oauth == "naver":
-        if not state:
-            raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
-        token = get_naver_access_token(code, state)
-        info = get_naver_user_info(token)
-        return str(info.get("id")), info.get("email")
-    else:
-        raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
-
-
-# ─── OAuth 로그인 ───────────────────────────────────────────
-# ✅ Fix: data: dict → SocialLoginBody Pydantic 스키마로 교체
-@router.post("/auth/login")
-async def social_login(data: SocialLoginBody, response: Response, db: AsyncSession = Depends(get_db)):
-    oauth = data.oauth.lower().strip()
-    code = data.code
-    state = data.state
-
-    oauth_id, email = get_oauth_user_info(oauth, code, state)
-
-    result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
-    user = result.scalar_one_or_none()
-    if user:
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
-        await issue_tokens_and_save(response, db, user)
-        return {"status": "LOGIN_SUCCESS", "message": "소셜 로그인에 성공했습니다.", "user": {"email": user.email, "nickname": user.nickname}}
-
-    if email:
-        result = await db.execute(select(User).where(User.email == email))
-        email_user = result.scalar_one_or_none()
-        if email_user:
-            if email_user.provider not in ("local", oauth) and email_user.provider_id:
-                raise HTTPException(status_code=400, detail="이미 다른 소셜 계정에 연결된 이메일입니다.")
-            email_user.provider = oauth
-            email_user.provider_id = oauth_id
-            await db.commit()
-            await db.refresh(email_user)
-            await issue_tokens_and_save(response, db, email_user)
-            return {"status": "LOGIN_SUCCESS", "message": "기존 계정과 소셜 로그인이 연동되었습니다.", "user": {"email": email_user.email, "nickname": email_user.nickname}}
-
-    return {"status": "NEED_NICKNAME", "oauth": oauth, "oauth_id": oauth_id, "email": email}
-
-
-# ─── OAuth 회원가입 ─────────────────────────────────────────
-# ✅ Fix: data: dict → SocialSignupBody Pydantic 스키마로 교체
-@router.post("/auth/social/signup")
-async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSession = Depends(get_db)):
-    oauth = data.oauth.lower().strip()
-    oauth_id = data.oauth_id
-    email = data.email
-    nickname = data.nickname.strip()
-
-    result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
-    existing = result.scalar_one_or_none()
-    if existing:
-        await issue_tokens_and_save(response, db, existing)
-        return {"status": "LOGIN_SUCCESS", "message": "이미 가입된 소셜 계정입니다.", "user": {"email": existing.email, "nickname": existing.nickname}}
-
-    result = await db.execute(select(User).where(User.nickname == nickname))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="이미 사용 중인 닉네임입니다.")
-
-    if not email:
-        email = f"{oauth}_{oauth_id}@social.local"
-
-    result = await db.execute(select(User).where(User.email == email))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="이미 같은 이메일로 가입된 계정이 있습니다.")
-
-    user = User(email=email, nickname=nickname, provider=oauth, provider_id=oauth_id, password_hash=None)
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    await issue_tokens_and_save(response, db, user)
-
-    return {"status": "SIGNUP_SUCCESS", "message": "소셜 회원가입 및 로그인에 성공했습니다.", "user": {"email": user.email, "nickname": user.nickname}}
