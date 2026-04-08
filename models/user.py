@@ -17,14 +17,14 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(50), nullable=True)
     nickname: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
     profile_image_key: Mapped[str | None] = mapped_column(String(255))
-    phone: Mapped[str | None] = mapped_column(String(50))
+    phone: Mapped[str] = mapped_column(String(50), nullable=False)
     provider: Mapped[str] = mapped_column(String(30), nullable=False, server_default="local")
     provider_id: Mapped[str | None] = mapped_column(String(255))
 
     role: Mapped[str] = mapped_column(String(20), nullable=False, server_default="USER")
     trust_score: Mapped[float] = mapped_column(Numeric, nullable=False, server_default="36.5")
 
-    referred_by: Mapped[uuid.UUID | None] = mapped_column(
+    referrer_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")

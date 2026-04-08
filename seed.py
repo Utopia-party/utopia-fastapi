@@ -53,7 +53,7 @@ async def seed():
         #     db.add(Platform(**p))
         # await db.flush()
 
-        user = User(email="test@partyup.kr", name="테스터", nickname="테스터닉", password_hash=hash_password("password123"), role="ADMIN")
+        user = User(email="test@partyup.kr", name="테스터", nickname="테스터닉", password_hash=hash_password("password123"), role="ADMIN", phone="010-0000-0000")
         db.add(user)
         await db.flush()
 

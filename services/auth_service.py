@@ -33,7 +33,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-# 비밀번호 검증
+# 로그인 시 비밀번호 검증
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -126,6 +126,7 @@ async def issue_tokens_and_save(
     user.last_login_at = datetime.now(timezone.utc)
     await db.commit()
 
+    # 쿠키에 access/refresh token 넣음
     set_access_token_cookie(response, access_token)
     set_refresh_token_cookie(response, refresh_token)
 
