@@ -25,7 +25,7 @@ class User(Base):
     trust_score: Mapped[float] = mapped_column(Numeric, nullable=False, server_default="36.5")
 
     referrer_id: Mapped[uuid.UUID | None] = mapped_column(
-        "referred_by",
+        "referrer_id",
         UUID(as_uuid=True),
         ForeignKey("users.id"),
         nullable=True,
