@@ -10,6 +10,7 @@ class ServiceOut(BaseModel):
     max_members: int
     monthly_price: int
     logo_image_key: Optional[str]
+    logo_image_url: Optional[str] = None
     is_active: bool
 
     model_config = {"from_attributes": True}

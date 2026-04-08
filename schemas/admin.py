@@ -65,6 +65,7 @@ class AdminServiceRecordOut(BaseModel):
     maxMembers: int
     monthlyPrice: int
     logoImageKey: str | None = None
+    logoImageUrl: str | None = None
     isActive: bool
     createdBy: str
     createdAt: str

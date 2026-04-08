@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from core.database import get_db
+from core.minio_assets import build_minio_asset_url
 from core.security import require_user
 from models.admin import (
     ActivityLog,
@@ -281,6 +282,7 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
         maxMembers=service.max_members,
         monthlyPrice=service.monthly_price,
         logoImageKey=service.logo_image_key,
+        logoImageUrl=build_minio_asset_url(service.logo_image_key),
         isActive=service.is_active,
         createdBy=(created_by.nickname or created_by.email) if created_by else "-",
         createdAt=_format_datetime(service.created_at),

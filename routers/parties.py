@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from core.database import get_db
+from core.minio_assets import build_minio_asset_url
 from core.security import require_user, get_current_user_optional
 from models.party import Party, PartyMember, Service
 from models.user import User
@@ -49,6 +50,7 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         max_members=svc.max_members if svc else None,
         monthly_price=svc.monthly_price if svc else None,
         logo_image_key=svc.logo_image_key if svc else None,
+        logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         member_count=len(party.members) if party.members is not None else 0,
         is_joined=is_joined
     )
