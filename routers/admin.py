@@ -83,8 +83,33 @@ def _admin_scope_for_role(role: str) -> str:
     return "전체 운영 권한"
 
 
-def _admin_role_code(is_root: bool) -> str:
-    return "ROOT" if is_root else "ADMIN"
+def _admin_permissions_for_role(role: str) -> dict[str, Any]:
+    role = role.upper()
+    if role == "ROOT":
+        return {
+            "can_manage_users": True,
+            "can_manage_parties": True,
+            "can_manage_reports": True,
+            "can_manage_moderation": True,
+            "can_approve_receipts": True,
+            "can_approve_settlements": True,
+            "can_view_logs": True,
+            "can_manage_admins": True,
+        }
+    return {
+        "can_manage_users": True,
+        "can_manage_parties": True,
+        "can_manage_reports": True,
+        "can_manage_moderation": True,
+        "can_approve_receipts": True,
+        "can_approve_settlements": True,
+        "can_view_logs": True,
+        "can_manage_admins": False,
+    }
+
+
+def _admin_role_code(role: AdminRole) -> str:
+    return "ROOT" if role.can_manage_admins else "ADMIN"
 
 
 def _manual_status_label(action_type: str | None) -> str | None:
@@ -236,7 +261,7 @@ def _latest_user_status_actions_subquery():
 async def _count_root_admins(db: AsyncSession) -> int:
     return int(
         await db.scalar(
-            select(func.count()).select_from(AdminRole).where(AdminRole.is_root.is_(True))
+            select(func.count()).select_from(AdminRole).where(AdminRole.can_manage_admins.is_(True))
         )
         or 0
     )
@@ -253,10 +278,11 @@ async def _ensure_admin_role(db: AsyncSession, user: User) -> AdminRole:
         return role
 
     existing_count = await db.scalar(select(func.count()).select_from(AdminRole)) or 0
+    defaults = _admin_permissions_for_role("ROOT" if existing_count == 0 else "ADMIN")
     role = AdminRole(
         user_id=user.id,
-        is_root=bool(existing_count == 0),
         created_by=user.id,
+        **defaults,
     )
     db.add(role)
     await db.commit()
@@ -374,8 +400,8 @@ async def get_admin_roles(
             id=str(role.id),
             userId=str(user.id),
             adminId=user.nickname or user.email,
-            role=_admin_role_code(role.is_root),
-            scope=_admin_scope_for_role(_admin_role_code(role.is_root)),
+            role=_admin_role_code(role),
+            scope=_admin_scope_for_role(_admin_role_code(role)),
             lastUpdated=_format_datetime(role.updated_at),
             updatedBy=(created_by.nickname or created_by.email) if created_by else "system",
         )
@@ -390,7 +416,7 @@ async def update_admin_role(
     admin: AdminContext = Depends(require_admin_context),
     db: AsyncSession = Depends(get_db),
 ):
-    if not admin.role.is_root:
+    if not admin.role.can_manage_admins:
         raise HTTPException(status_code=403, detail="ROOT 관리자만 권한을 변경할 수 있습니다.")
 
     target_user = await db.get(User, user_id)
@@ -403,7 +429,8 @@ async def update_admin_role(
 
     result = await db.execute(select(AdminRole).where(AdminRole.user_id == target_user.id))
     role_row = result.scalar_one_or_none()
-    current_role_code = _admin_role_code(role_row.is_root) if role_row else "ADMIN"
+    current_role_code = _admin_role_code(role_row) if role_row else "ADMIN"
+    defaults = _admin_permissions_for_role(role_code)
 
     if target_user.id == admin.user.id and role_code != current_role_code:
         raise HTTPException(
@@ -422,12 +449,13 @@ async def update_admin_role(
     if role_row is None:
         role_row = AdminRole(
             user_id=target_user.id,
-            is_root=(role_code == "ROOT"),
             created_by=admin.user.id,
+            **defaults,
         )
         db.add(role_row)
     else:
-        role_row.is_root = role_code == "ROOT"
+        for key, value in defaults.items():
+            setattr(role_row, key, value)
         if role_row.created_by is None:
             role_row.created_by = admin.user.id
 
@@ -452,8 +480,8 @@ async def update_admin_role(
         id=str(role_row.id),
         userId=str(target_user.id),
         adminId=target_user.nickname or target_user.email,
-        role=_admin_role_code(role_row.is_root),
-        scope=_admin_scope_for_role(_admin_role_code(role_row.is_root)),
+        role=_admin_role_code(role_row),
+        scope=_admin_scope_for_role(_admin_role_code(role_row)),
         lastUpdated=_format_datetime(role_row.updated_at),
         updatedBy=admin.user.nickname or admin.user.email,
     )
@@ -587,7 +615,7 @@ async def update_admin_user_status(
 
     if payload.status == "정지":
         target_role = await db.scalar(select(AdminRole).where(AdminRole.user_id == target_user.id))
-        if target_role and target_role.is_root:
+        if target_role and target_role.can_manage_admins:
             if await _count_root_admins(db) <= 1:
                 raise HTTPException(
                     status_code=400,
