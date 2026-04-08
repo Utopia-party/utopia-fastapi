@@ -29,47 +29,32 @@ from services.captcha_service import (
     verify_challenge,
 )
 
-# 상원: 1차 캡챠 API를 /api/captcha/* 아래로 고정해서 프론트 호출 경로와 맞춥니다.
-router = APIRouter(prefix="/captcha")  # 상원
+router = APIRouter(prefix="/captcha")
 logger = logging.getLogger("handocr-api")
 
 
-# ─────────────────────────────────────────────
-# 1차 캡챠 API
-# ─────────────────────────────────────────────
-
-
-@router.post("/init", response_model=CaptchaInitResponse)  # 상원
+@router.post("/init", response_model=CaptchaInitResponse)
 async def captcha_init(payload: CaptchaInitRequest, request: Request):
-    # 상원: 행동 데이터 기반 1차 판정을 시작하는 진입점입니다.
-    # 상원: 실제 점수 계산과 세션 생성은 서비스 계층 함수 initiate_captcha에 위임합니다.
     return await initiate_captcha(payload, request)
 
 
-@router.get("/challenge", response_model=CaptchaChallengeResponse)  # 상원
+@router.get("/challenge", response_model=CaptchaChallengeResponse)
 async def captcha_challenge(session_id: str, request: Request):
-    # 상원: challenge 상태 세션의 3x3 이미지 문제를 내려줍니다.
-    # 상원: 세션 검증과 문제 생성은 서비스 계층 함수 get_challenge가 처리합니다.
     return await get_challenge(session_id, request)
 
 
-@router.post("/verify", response_model=CaptchaVerifyResponse)  # 상원
+@router.post("/verify", response_model=CaptchaVerifyResponse)
 async def captcha_verify(payload: CaptchaVerifyRequest, request: Request):
-    # 상원: 사용자가 선택한 3칸이 이모지 순서와 맞는지 검증하고 통과 토큰을 발급합니다.
-    # 상원: 실제 정답 판정과 토큰 발급은 서비스 계층 함수 verify_challenge가 처리합니다.
     return await verify_challenge(payload, request)
 
 
-@router.get("/status", response_model=CaptchaStatusResponse)  # 상원
+@router.get("/status", response_model=CaptchaStatusResponse)
 async def captcha_status(request: Request):
-    # 상원: WAIT, LOCKED, BANNED와 active_session_id를 조회해 프론트 재진입 흐름을 맞춥니다.
-    # 상원: 상태 계산은 서비스 계층 함수 get_captcha_status에 위임합니다.
     return await get_captcha_status(request)
 
 
 @router.get("/image/{token}")
 async def captcha_image_proxy(token: str):
-    """이미지 프록시 — URL에서 동물 카테고리명 노출 방지"""
     image_bytes, content_type = await get_proxied_image(token)
     return Response(
         content=image_bytes,
@@ -78,14 +63,8 @@ async def captcha_image_proxy(token: str):
     )
 
 
-# ─────────────────────────────────────────────
-# 발표 시연용 테스트 엔드포인트
-# ─────────────────────────────────────────────
-
-
 @router.post("/test/simulate-bot", response_model=CaptchaInitResponse)
 async def simulate_bot(request: Request):
-    """발표용: Selenium 봇 시뮬레이션 → block"""
     fake_payload = CaptchaInitRequest(
         mouse_moves=[],
         clicks=[],
@@ -165,9 +144,8 @@ def safe_float(value: Any):
         return None
 
 
-@router.post("/handocr/start")  # 상원
+@router.post("/handocr/start")
 async def start_captcha():
-    # 상원: 2차 handOCR 캡챠 시작 시 문제 문자열과 손 포즈를 세션으로 발급합니다.
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     random_text = "".join(random.choice(chars) for _ in range(5))
     random_pose = random.choice(ALL_POSES)
@@ -188,9 +166,8 @@ async def start_captcha():
     }
 
 
-@router.post("/handocr/verify")  # 상원
+@router.post("/handocr/verify")
 async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(...)):
-    # 상원: 업로드 이미지를 GPU 서버에 보내 손 포즈와 OCR 결과를 검증합니다.
     session_str = await redis_client.get(f"captcha:{sessionId}")
     if not session_str:
         return {
@@ -266,183 +243,60 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
                     "success": False,
                     "message": (
                         "AI 서버 응답을 해석하지 못했습니다.\n"
-                        "AI 서버가 JSON이 아닌 응답을 반환했습니다.\n"
-                        f"상세: {repr(json_error)}\n"
+                        "잠시 후 다시 시도해주세요.\n"
                         f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
                     ),
                     "failureReason": {
                         "type": "GPU_JSON_PARSE_FAILED",
                         "expectedPose": expected_pose,
                         "expectedText": expected_text,
-                        "statusCode": gpu_status_code,
-                        "rawText": gpu_raw_text,
                         "detail": repr(json_error),
-                        "gpuServerUrl": GPU_SERVER_URL,
                     }
                 }
 
-            logger.info("GPU json=%s", gpu_result)
-
-        except httpx.ConnectTimeout as e:
-            logger.exception("GPU connect timeout")
-            session_data["attempts"] += 1
-            await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-            return {
-                "success": False,
-                "message": (
-                    "AI 서버 연결 시간이 초과되었습니다.\n"
-                    "GPU 서버가 응답 가능한 상태인지 확인해주세요.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-                ),
-                "failureReason": {
-                    "type": "GPU_CONNECT_TIMEOUT",
-                    "expectedPose": expected_pose,
-                    "expectedText": expected_text,
-                    "detail": repr(e),
-                    "gpuServerUrl": GPU_SERVER_URL,
-                }
-            }
-
-        except httpx.ConnectError as e:
-            logger.exception("GPU connect error")
-            session_data["attempts"] += 1
-            await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-            return {
-                "success": False,
-                "message": (
-                    "AI 서버 연결에 실패했습니다.\n"
-                    "GPU 서버가 꺼져 있거나, 주소/포트가 잘못되었거나, 네트워크에 문제가 있을 수 있습니다.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-                ),
-                "failureReason": {
-                    "type": "GPU_CONNECT_ERROR",
-                    "expectedPose": expected_pose,
-                    "expectedText": expected_text,
-                    "detail": repr(e),
-                    "gpuServerUrl": GPU_SERVER_URL,
-                }
-            }
-
-        except httpx.ReadTimeout as e:
-            logger.exception("GPU read timeout")
-            session_data["attempts"] += 1
-            await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-            return {
-                "success": False,
-                "message": (
-                    "AI 서버가 사진을 분석하는 데 시간이 너무 오래 걸리고 있습니다.\n"
-                    "서버는 살아 있지만 응답이 지연되고 있을 수 있습니다.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-                ),
-                "failureReason": {
-                    "type": "GPU_READ_TIMEOUT",
-                    "expectedPose": expected_pose,
-                    "expectedText": expected_text,
-                    "detail": repr(e),
-                    "gpuServerUrl": GPU_SERVER_URL,
-                }
-            }
-
         except httpx.HTTPStatusError as e:
-            logger.exception("GPU HTTP status error")
+            logger.exception("GPU http status error")
             session_data["attempts"] += 1
             await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-
-            response_text = ""
-            try:
-                response_text = e.response.text[:2000]
-            except Exception:
-                response_text = ""
-
-            status_code = e.response.status_code if e.response else None
-
-            message = "AI 서버가 오류 응답을 반환했습니다."
-            if status_code == 504:
-                message = "AI 서버 응답이 지연되어 게이트웨이 타임아웃이 발생했습니다."
-            elif status_code == 503:
-                message = "AI 서버가 현재 요청을 처리할 수 없는 상태입니다."
-            elif status_code == 502:
-                message = "프록시 서버가 AI 서버와 정상 통신하지 못했습니다."
-            elif status_code == 500:
-                message = "AI 서버 내부 오류가 발생했습니다."
-
             return {
                 "success": False,
                 "message": (
-                    f"{message}\n"
-                    f"HTTP 상태 코드: {status_code}\n"
+                    f"AI 서버가 오류를 반환했습니다. (status={e.response.status_code})\n"
+                    "잠시 후 다시 시도해주세요.\n"
                     f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
                 ),
                 "failureReason": {
                     "type": "GPU_HTTP_ERROR",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
-                    "statusCode": status_code,
-                    "responseText": response_text,
-                    "gpuServerUrl": GPU_SERVER_URL,
+                    "detail": gpu_raw_text,
                 }
             }
-
-        except httpx.RequestError as e:
-            logger.exception("GPU request error")
+        except Exception:
+            logger.exception("GPU request failed")
             session_data["attempts"] += 1
             await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
             return {
                 "success": False,
                 "message": (
-                    "AI 서버 요청 처리 중 네트워크 오류가 발생했습니다.\n"
-                    f"상세: {repr(e)}\n"
+                    "AI 서버 통신 중 오류가 발생했습니다.\n"
+                    "잠시 후 다시 시도해주세요.\n"
                     f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
                 ),
                 "failureReason": {
-                    "type": "GPU_REQUEST_ERROR",
+                    "type": "GPU_REQUEST_FAILED",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
-                    "detail": repr(e),
-                    "gpuServerUrl": GPU_SERVER_URL,
                 }
             }
 
-        except Exception as e:
-            logger.exception("GPU request/parse failed")
-            traceback.print_exc()
-            session_data["attempts"] += 1
-            await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-            return {
-                "success": False,
-                "message": (
-                    "AI 서버 통신 처리 중 알 수 없는 오류가 발생했습니다.\n"
-                    f"상세: {repr(e)}\n"
-                    f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-                ),
-                "failureReason": {
-                    "type": "GPU_UNKNOWN_ERROR",
-                    "expectedPose": expected_pose,
-                    "expectedText": expected_text,
-                    "detail": repr(e),
-                    "gpuServerUrl": GPU_SERVER_URL,
-                }
-            }
+    detected_pose = gpu_result.get("detected_pose")
+    detected_text = gpu_result.get("detected_text")
 
-    if not isinstance(gpu_result, dict):
-        session_data["attempts"] += 1
-        await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-        return {
-            "success": False,
-            "message": (
-                "AI 서버 응답 형식이 올바르지 않습니다.\n"
-                f"남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-            ),
-            "failureReason": {
-                "type": "GPU_INVALID_RESPONSE",
-                "expectedPose": expected_pose,
-                "expectedText": expected_text,
-                "gpuResultType": str(type(gpu_result)),
-                "gpuServerUrl": GPU_SERVER_URL,
-            }
-        }
+    pose_ok = detected_pose == expected_pose
+    text_ok = detected_text == expected_text
 
-    if not gpu_result.get("success"):
+    if not pose_ok or not text_ok:
         session_data["attempts"] += 1
         await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
         remaining_attempts = MAX_ATTEMPTS - session_data["attempts"]
@@ -451,77 +305,20 @@ async def verify_captcha(sessionId: str = Form(...), image: UploadFile = File(..
             "success": False,
             "message": build_ai_failure_message(gpu_result, remaining_attempts),
             "failureReason": {
-                "type": "AI_DETECTION_FAILED",
+                "type": "MISMATCH",
                 "expectedPose": expected_pose,
                 "expectedText": expected_text,
-                "aiErrorCode": gpu_result.get("error_code"),
-                "aiMessage": gpu_result.get("message"),
-                "aiDetail": gpu_result.get("detail"),
-                "aiGuide": gpu_result.get("guide"),
-                "ocrCandidates": gpu_result.get("ocr_text_candidates"),
-                "inspection": gpu_result.get("inspection"),
-                "gpuServerUrl": GPU_SERVER_URL,
-            }
-        }
-
-    detected_pose = gpu_result.get("detected_pose")
-    pose_confidence = safe_float(gpu_result.get("pose_confidence"))
-    detected_text = gpu_result.get("detected_text")
-    ocr_confidence = safe_float(gpu_result.get("ocr_confidence"))
-    ocr_low_confidence = gpu_result.get("ocr_low_confidence", False)
-
-    pose_ok = detected_pose == expected_pose
-    text_ok = detected_text == expected_text
-
-    if not pose_ok or not text_ok:
-        session_data["attempts"] += 1
-        await redis_client.setex(f"captcha:{sessionId}", 300, json.dumps(session_data))
-
-        reasons = []
-
-        if not pose_ok:
-            reasons.append(f"손 포즈 불일치 (요구: {expected_pose} / 인식: {detected_pose})")
-
-        if not text_ok:
-            if ocr_low_confidence and ocr_confidence is not None:
-                reasons.append(
-                    f"문자 인식 신뢰도가 낮습니다. "
-                    f"(요구: {expected_text} / 인식: {detected_text}, OCR 신뢰도: {ocr_confidence:.2f})"
-                )
-            else:
-                reasons.append(f"문자열 불일치 (요구: {expected_text} / 인식: {detected_text})")
-
-        message = "AI 검사에 실패했습니다.\n" + "\n".join(reasons)
-
-        if pose_confidence is not None:
-            message += f"\n손 포즈 신뢰도: {pose_confidence:.2f}"
-
-        if ocr_confidence is not None:
-            message += f"\nOCR 신뢰도: {ocr_confidence:.2f}"
-
-        message += "\n손 포즈와 5자리 문자+숫자가 모두 선명하게 보이도록 다시 촬영해주세요."
-        message += f"\n남은 기회: {MAX_ATTEMPTS - session_data['attempts']}회"
-
-        return {
-            "success": False,
-            "message": message,
-            "failureReason": {
-                "type": "MISSION_MISMATCH",
-                "expectedPose": expected_pose,
                 "detectedPose": detected_pose,
-                "expectedText": expected_text,
                 "detectedText": detected_text,
-                "poseConfidence": pose_confidence,
-                "ocrConfidence": ocr_confidence,
-                "ocrCandidates": gpu_result.get("ocr_text_candidates"),
-                "inspection": gpu_result.get("inspection"),
-                "gpuServerUrl": GPU_SERVER_URL,
+                "poseConfidence": safe_float(gpu_result.get("pose_confidence")),
+                "ocrConfidence": safe_float(gpu_result.get("ocr_confidence")),
+                "remainingAttempts": remaining_attempts,
             }
         }
 
     pass_token = str(uuid.uuid4())
-    await redis_client.setex(f"captcha_pass:{pass_token}", 180, "PASSED")
     await redis_client.delete(f"captcha:{sessionId}")
+    await redis_client.setex(f"captcha:pass:{pass_token}", 300, "1")
 
     return {
         "success": True,
