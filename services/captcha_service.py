@@ -549,20 +549,92 @@ def _evaluate_headers(request: Request) -> tuple[float, bool]:
     return _clamp(score), False
 
 
-def _calculate_scores(payload: CaptchaInitRequest, request: Request) -> tuple[float, float, float, bool]:
+def _calculate_fingerprint_score(payload: CaptchaInitRequest) -> float:
+    """md 스펙 레이어3의 핑거프린트 20% 가중치용 점수.
+    브라우저 핑거프린트(canvas/webgl/플러그인/언어/시간대/화면) 안정성을 0~1로 평가.
+    """
+    env = payload.env
+    score = 0.0
+    if env.canvas_hash and env.canvas_hash not in {"", "no-canvas", "canvas-error"}:
+        score += 0.25
+    if env.webgl_renderer and env.webgl_renderer not in {"", "no-webgl", "webgl-error"}:
+        score += 0.25
+    if env.plugins_count > 0:
+        score += 0.15
+    if env.languages:
+        score += 0.10
+    if env.timezone:
+        score += 0.10
+    if env.screen.width > 0 and env.screen.height > 0:
+        score += 0.15
+    return _clamp(score)
+
+
+async def _calculate_scores(
+    payload: CaptchaInitRequest,
+    request: Request,
+    behavior_vector: list[float],
+) -> tuple[float, float, float, float, float, bool]:
+    """md 스펙 비간섭 검증 5겹 점수 계산.
+
+    Returns:
+        (rule_score, vector_score, environment_score, header_score, final_score, immediate_block)
+
+    - 레이어3(룰): 마우스35 + 클릭25 + 타이밍20 + 핑거프린트20
+    - 레이어4(벡터 KNN): pgvector 코사인 Top-5 → human_ratio 기반 점수
+    - 최종: rule×0.5 + vector×0.5  (md 스펙)
+    - 레이어1·2는 즉시 차단 게이트 역할 (점수에 직접 합산하지 않음)
+    """
     mouse_score = _calculate_mouse_score(payload)
     click_score = _calculate_click_score(payload)
     timing_score = _calculate_timing_score(payload)
-    behavior_score = _clamp((mouse_score * 0.35) + (click_score * 0.25) + (timing_score * 0.4))
+    fingerprint_score = _calculate_fingerprint_score(payload)
 
+    # 레이어3: 룰 기반 점수 (md 스펙 가중치 복구)
+    rule_score = _clamp(
+        (mouse_score * 0.35)
+        + (click_score * 0.25)
+        + (timing_score * 0.20)
+        + (fingerprint_score * 0.20)
+    )
+
+    # 레이어4: pgvector KNN (15차원 → K=5)
+    similar = await _search_similar_behaviors(behavior_vector, top_k=5)
+    vector_score = await _calculate_vector_score(similar)
+
+    # 레이어1·2: 환경/헤더 게이트 (즉시 차단만, 최종 점수엔 직접 반영 X)
     environment_score, env_block = _evaluate_environment(payload)
     header_score, header_block = _evaluate_headers(request)
 
+    # md 스펙: 룰×0.5 + 벡터×0.5
+    # Cold Start 보호: 벡터 데이터가 부족하면 룰 가중치를 높여 중립 값에 휩쓸리지 않게.
+    sample_size = len(similar)
+    if sample_size >= 5:
+        vector_weight = 0.5
+    elif sample_size >= 3:
+        vector_weight = 0.3
+    else:
+        vector_weight = 0.1  # 초기: 룰 기반에 거의 의존
     final_score = _clamp(
-        (behavior_score * 0.6) + (environment_score * 0.2) + (header_score * 0.2)
+        (rule_score * (1.0 - vector_weight)) + (vector_score * vector_weight)
     )
 
-    return behavior_score, environment_score, final_score, env_block or header_block
+    logger.info(
+        f"[captcha.score] mouse={mouse_score:.2f} click={click_score:.2f} "
+        f"timing={timing_score:.2f} fp={fingerprint_score:.2f} "
+        f"rule={rule_score:.2f} vector={vector_score:.2f}(n={sample_size}) "
+        f"env={environment_score:.2f} hdr={header_score:.2f} "
+        f"final={final_score:.2f}"
+    )
+
+    return (
+        rule_score,
+        vector_score,
+        environment_score,
+        header_score,
+        final_score,
+        env_block or header_block,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -912,15 +984,19 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
 
         return CaptchaInitResponse(status="challenge", session_id=session_id)
 
-    behavior_score, environment_score, final_score, immediate_block = _calculate_scores(
-        payload,
-        request,
-    )
-
-    # behavior 벡터화
+    # 행동 벡터 먼저 생성 (pgvector KNN 레이어4에서 사용)
     behavior_vector = _build_behavior_vector(payload)
     fp_hash = _fingerprint_hash(payload)
     user_agent = request.headers.get("user-agent", "")
+
+    (
+        rule_score,
+        vector_score,
+        environment_score,
+        header_score,
+        final_score,
+        immediate_block,
+    ) = await _calculate_scores(payload, request, behavior_vector)
 
     if immediate_block:
         # DB: block 기록 (fire-and-forget, FK 순서 보장)
@@ -928,13 +1004,13 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         _bg(_save_session_then_embedding(
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
-            behavior_score=behavior_score, environment_score=environment_score,
+            behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="block",
             behavior_vector=behavior_vector, behavior_label="bot",
         ))
         _bg(_save_bot_signature(
             client_ip, fp_hash, user_agent,
-            "immediate_block_env_or_header", behavior_score, final_score,
+            "immediate_block_env_or_header", rule_score, final_score,
         ))
         return CaptchaInitResponse(
             status="block",
@@ -943,15 +1019,13 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
 
     if final_score >= CAPTCHA_PASS_THRESHOLD:
         # PK 충돌 방지: 항상 새 UUID 생성 (다른 분기와 동일하게 통일)
-        # payload.session_id를 재사용하면 프론트가 init을 두 번 호출할 때
-        # UniqueViolation 발생함
         pass_session_id = str(uuid.uuid4())
         token = await _issue_captcha_token(client_ip, final_score, pass_session_id)
         # DB: pass 기록 (fire-and-forget, FK 순서 보장)
         _bg(_save_session_then_embedding(
             session_id=pass_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
-            behavior_score=behavior_score, environment_score=environment_score,
+            behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="pass",
             behavior_vector=behavior_vector, behavior_label="human",
         ))
@@ -963,13 +1037,13 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         _bg(_save_session_then_embedding(
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
-            behavior_score=behavior_score, environment_score=environment_score,
+            behavior_score=rule_score, vector_score=vector_score,
             final_score=final_score, status_result="block",
             behavior_vector=behavior_vector, behavior_label="bot",
         ))
         _bg(_save_bot_signature(
             client_ip, fp_hash, user_agent,
-            "low_score_block", behavior_score, final_score,
+            "low_score_block", rule_score, final_score,
         ))
         return CaptchaInitResponse(
             status="block",
@@ -984,8 +1058,10 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         "trigger_type": payload.trigger_type,
         "client_session_id": payload.session_id,
         "fingerprint_hash": fp_hash,
-        "behavior_score": round(behavior_score, 4),
+        "behavior_score": round(rule_score, 4),
+        "vector_score": round(vector_score, 4),
         "environment_score": round(environment_score, 4),
+        "header_score": round(header_score, 4),
         "final_score": round(final_score, 4),
         "attempts": 0,
         "status": "challenge",
@@ -998,7 +1074,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
     _bg(_save_session_then_embedding(
         session_id=session_id, trigger_type=payload.trigger_type,
         captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
-        behavior_score=behavior_score, environment_score=environment_score,
+        behavior_score=rule_score, vector_score=vector_score,
         final_score=final_score, status_result="challenge",
         behavior_vector=behavior_vector, behavior_label="unknown",
     ))
@@ -1124,11 +1200,13 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
         await _clear_active_session(client_ip)
 
         # DB: verify 성공 업데이트
+        # status='challenge_pass' 로 기록해 "비간섭 통과(pass)"와 "캡챠 풀고 통과(challenge_pass)"를 DB에서 구분.
+        # 프론트 응답은 그대로 성공 토큰만 반환 (CaptchaVerifyResponse 는 status 문자열을 노출하지 않음).
         try:
             async with AsyncSessionLocal() as db:
                 await db.execute(text("""
                     UPDATE captcha_sessions
-                    SET status = 'pass', attempt_count = :attempts,
+                    SET status = 'challenge_pass', attempt_count = :attempts,
                         solve_time_ms = :solve_ms, is_correct = true,
                         captcha_set_id = :captcha_set_id
                     WHERE id = :sid
@@ -1337,8 +1415,8 @@ async def _save_session_then_embedding(
     captcha_set_id: str | None,
     client_ip: str,
     fingerprint_hash: str,
-    behavior_score: float,
-    environment_score: float,
+    behavior_score: float,   # 레이어3 룰 점수
+    vector_score: float,     # 레이어4 KNN 점수
     final_score: float,
     status_result: str,
     behavior_vector: list[float],
@@ -1355,8 +1433,7 @@ async def _save_session_then_embedding(
         client_ip=client_ip,
         fingerprint_hash=fingerprint_hash,
         behavior_score=behavior_score,
-        environment_score=environment_score,
-        header_score=0.0,
+        vector_score=vector_score,
         final_score=final_score,
         status_result=status_result,
     )
@@ -1374,9 +1451,8 @@ async def _save_captcha_session_to_db(
     captcha_set_id: str | None,
     client_ip: str,
     fingerprint_hash: str,
-    behavior_score: float,
-    environment_score: float,
-    header_score: float,
+    behavior_score: float,       # 레이어3 룰 점수
+    vector_score: float,         # 레이어4 KNN 점수
     final_score: float,
     status_result: str,          # pass / challenge / block
     attempt_count: int = 0,
@@ -1404,7 +1480,7 @@ async def _save_captcha_session_to_db(
                 "captcha_set_id": captcha_set_id,
                 "client_ip": client_ip if client_ip != "unknown" else "0.0.0.0",
                 "behavior_score": round(behavior_score, 4),
-                "vector_score": round(environment_score, 4),
+                "vector_score": round(vector_score, 4),  # ← 버그 수정: 실제 KNN 점수 저장
                 "final_score": round(final_score, 4),
                 "status": status_result,
                 "attempt_count": attempt_count,
@@ -1562,19 +1638,26 @@ async def _search_similar_behaviors(vector: list[float], top_k: int = 5) -> list
 
 
 async def _calculate_vector_score(similar_results: list[dict]) -> float:
-    """유사 행동 검색 결과로 봇 의심 점수 계산 (높을수록 사람)"""
+    """유사 행동 검색 결과로 봇 의심 점수 계산 (높을수록 사람).
+
+    Cold Start: behavior_embeddings 가 비어있는 초반엔 0.7(인간 편향)을 반환.
+    실제 가중치는 _calculate_scores 에서 sample_size 기준으로 조정되므로,
+    여기서는 "데이터가 없을 때 정상 유저가 막히지 않도록" 하는 안전장치만 담당.
+    """
     if not similar_results:
-        return 0.5  # 데이터 없으면 중립
+        return 0.7  # Cold Start: 인간 쪽 약한 편향
 
-    bot_count = sum(1 for r in similar_results if r["label"] == "bot")
-    human_count = sum(1 for r in similar_results if r["label"] == "human")
-    total = len(similar_results)
+    # unknown 라벨(=challenge 중 미판정)은 집계에서 제외
+    labeled = [r for r in similar_results if r.get("label") in ("human", "bot")]
+    if not labeled:
+        return 0.7  # 라벨이 전부 unknown → 초기 데이터 풀과 동일하게 취급
 
-    if total == 0:
-        return 0.5
+    bot_count = sum(1 for r in labeled if r["label"] == "bot")
+    human_count = sum(1 for r in labeled if r["label"] == "human")
+    total = len(labeled)
 
     human_ratio = human_count / total
-    avg_sim = sum(r["similarity"] for r in similar_results) / total
+    avg_sim = sum(r["similarity"] for r in labeled) / total
 
     # human 비율이 높고 유사도 높으면 → 높은 점수
     return _clamp(human_ratio * 0.7 + avg_sim * 0.3)

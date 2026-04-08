@@ -30,7 +30,7 @@ app = FastAPI(
 # [중요] CORS 미들웨어를 먼저 등록하여 모든 요청에 대해 보안 헤더를 처리합니다.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 테스트 완료 후 settings.ALLOWED_ORIGINS로 복구하세요.
+    allow_origins=settings.ALLOWED_ORIGINS,  # credentials=True 와 wildcard("*") 동시 사용 불가
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
