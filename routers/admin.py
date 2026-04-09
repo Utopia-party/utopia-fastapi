@@ -294,11 +294,6 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
         category=service.category,
         maxMembers=service.max_members,
         monthlyPrice=service.monthly_price,
-        sellingPrice=(
-            service.selling_price
-            if service.selling_price is not None
-            else service.monthly_price
-        ),
         logoImageKey=service.logo_image_key,
         logoImageUrl=build_minio_asset_url(service.logo_image_key),
         isActive=service.is_active,
@@ -734,7 +729,6 @@ async def update_admin_service(
 
     service.max_members = payload.maxMembers
     service.monthly_price = payload.monthlyPrice
-    service.selling_price = payload.sellingPrice
     service.logo_image_key = payload.logoImageKey
     service.is_active = payload.isActive
     service.commission_rate = payload.commissionRate

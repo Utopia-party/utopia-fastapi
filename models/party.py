@@ -93,7 +93,6 @@ class Service(Base):
     category: Mapped[str] = mapped_column(String(30), nullable=False)
     max_members: Mapped[int] = mapped_column(Integer, nullable=False)
     monthly_price: Mapped[int] = mapped_column(Integer, nullable=False)
-    selling_price: Mapped[int | None] = mapped_column(Integer)
     logo_image_key: Mapped[str | None] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     commission_rate: Mapped[float | None] = mapped_column(Float)

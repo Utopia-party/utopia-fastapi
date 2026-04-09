@@ -64,7 +64,6 @@ class AdminServiceRecordOut(BaseModel):
     category: str
     maxMembers: int
     monthlyPrice: int
-    sellingPrice: int
     logoImageKey: str | None = None
     logoImageUrl: str | None = None
     isActive: bool
@@ -79,7 +78,6 @@ class AdminServiceRecordOut(BaseModel):
 class AdminServiceUpdateIn(BaseModel):
     maxMembers: int = Field(ge=1)
     monthlyPrice: int = Field(ge=0)
-    sellingPrice: int = Field(ge=0)
     logoImageKey: str | None = None
     isActive: bool
     commissionRate: float = Field(ge=0, le=1)
