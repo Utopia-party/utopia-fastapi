@@ -1,6 +1,7 @@
+from sqlalchemy import select
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+
 from core.database import get_db
 from core.security import require_user
 from models.notification import Notification
@@ -11,14 +12,12 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
 @router.get("/latest", response_model=list[NotificationOut])
-async def get_latest_notifications(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(Notification)
-        .where(Notification.user_id == None)  # noqa - 시스템 공지
-        .order_by(Notification.created_at.desc())
-        .limit(5)
-    )
-    return result.scalars().all()
+async def get_latest_notifications():
+    # Server DB does not support broadcast notices in `notifications`
+    # because `user_id` is required. Keep the endpoint stable for the
+    # frontend banner and return an empty list until a dedicated notice
+    # store is introduced.
+    return []
 
 
 @router.get("/me", response_model=list[NotificationOut])

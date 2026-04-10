@@ -1,6 +1,9 @@
 from pydantic import BaseModel, Field
 
 
+INT32_MAX = 1_000_000
+
+
 class DashboardMetricOut(BaseModel):
     id: str
     label: str
@@ -64,6 +67,7 @@ class AdminServiceRecordOut(BaseModel):
     category: str
     maxMembers: int
     monthlyPrice: int
+    originalPrice: int
     logoImageKey: str | None = None
     logoImageUrl: str | None = None
     isActive: bool
@@ -77,7 +81,8 @@ class AdminServiceRecordOut(BaseModel):
 
 class AdminServiceUpdateIn(BaseModel):
     maxMembers: int = Field(ge=1)
-    monthlyPrice: int = Field(ge=0)
+    monthlyPrice: int = Field(ge=0, le=INT32_MAX)
+    originalPrice: int = Field(ge=0, le=INT32_MAX)
     logoImageKey: str | None = None
     isActive: bool
     commissionRate: float = Field(ge=0, le=1)
@@ -87,6 +92,7 @@ class AdminServiceUpdateIn(BaseModel):
 
 class AdminUserRecordOut(BaseModel):
     id: str
+    name: str | None = None
     nickname: str
     status: str
     reportCount: int
@@ -117,6 +123,7 @@ class AdminUserStatusUpdateIn(BaseModel):
 
 class AdminPartyRecordOut(BaseModel):
     id: str
+    title: str
     service: str
     leaderId: str
     memberCount: int

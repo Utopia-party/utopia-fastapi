@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.database import Base
@@ -40,33 +40,6 @@ class AdminRole(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
-
-
-class Report(Base):
-    __tablename__ = "reports"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
-    )
-    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    reporter_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
-    )
-    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    category: Mapped[str] = mapped_column(String(50), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence_key: Mapped[str | None] = mapped_column(String(255))
-    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
-    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
-    )
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    action_result_code: Mapped[str | None] = mapped_column(String(30))
-    admin_memo: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
 
 class Receipt(Base):
     __tablename__ = "receipts"
@@ -159,7 +132,7 @@ class ActivityLog(Base):
     )
     action_type: Mapped[str] = mapped_column("action", String(50), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    ip_address: Mapped[str | None] = mapped_column(String(64))
+    ip_address: Mapped[str | None] = mapped_column(INET)
     user_agent: Mapped[str | None] = mapped_column(Text)
     extra_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB)
     target_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

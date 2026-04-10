@@ -16,10 +16,11 @@ from models.admin import (
     AdminRole,
     ModerationAction,
     Receipt,
-    Report,
     Settlement,
     SystemLog,
 )
+from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyMember, Service
 from models.user import User
@@ -80,6 +81,18 @@ def _to_int(value: Decimal | int | float | None) -> int:
     return int(value)
 
 
+def _user_display_name(user: User | None) -> str:
+    if not user:
+        return "-"
+    return user.name or user.nickname or str(user.id)
+
+
+def _actor_display_name(user: User | None, fallback: str | None = None) -> str:
+    if user:
+        return user.nickname or user.name or str(user.id)
+    return fallback or "system"
+
+
 def _admin_permissions_for_role(role: str) -> dict[str, Any]:
     role = role.upper()
     if role == "ROOT":
@@ -126,8 +139,10 @@ def _user_status_label(user: User, report_count: int, manual_status: str | None 
 
 
 def _party_status_label(party: Party, report_count: int) -> str:
+    # 파티 종료 수정
     if party.status.lower() == "ended":
-        return "종료 예정"
+        return "종료됨"
+    # 파티 종료 수정
     if report_count > 0:
         return "위험"
     if party.status.lower() == "recruiting":
@@ -136,23 +151,47 @@ def _party_status_label(party: Party, report_count: int) -> str:
 
 
 def _report_status_label(value: str) -> str:
+    normalized = (value or "").strip()
+    upper = normalized.upper()
+    lower = normalized.lower()
+
     return {
+        "PENDING": "접수",
+        "IN_REVIEW": "검토중",
+        "APPROVED": "처리",
+        "REJECTED": "기각",
+        # 이전 로컬 상태값도 읽을 수 있게 유지
         "pending": "접수",
         "processed": "처리",
+        "approved": "처리",
         "rejected": "기각",
-        "appealed": "이의제기",
-        "auto_processed": "AI처리",
-    }.get(value.lower(), value)
+        "in_review": "검토중",
+        "appealed": "검토중",
+        "auto_processed": "처리",
+    }.get(upper if upper in {"PENDING", "IN_REVIEW", "APPROVED", "REJECTED"} else lower, value)
 
 
 def _report_status_code(value: str) -> str:
+    normalized = (value or "").strip()
+
     return {
-        "접수": "pending",
-        "처리": "processed",
-        "기각": "rejected",
-        "이의제기": "appealed",
-        "AI처리": "auto_processed",
-    }.get(value, value.lower())
+        "접수": "PENDING",
+        "검토중": "IN_REVIEW",
+        "처리": "APPROVED",
+        "기각": "REJECTED",
+        "PENDING": "PENDING",
+        "IN_REVIEW": "IN_REVIEW",
+        "APPROVED": "APPROVED",
+        "REJECTED": "REJECTED",
+        "pending": "PENDING",
+        "in_review": "IN_REVIEW",
+        "approved": "APPROVED",
+        "rejected": "REJECTED",
+        # 이전 로컬 상태값도 서버 상태 체계로 정규화
+        "processed": "APPROVED",
+        "appealed": "IN_REVIEW",
+        "auto_processed": "APPROVED",
+    }.get(normalized, normalized.upper())
 
 
 def _report_type_label(value: str) -> str:
@@ -234,9 +273,18 @@ async def _append_system_log(
     service: str,
     message: str,
     actor: str | None = None,
-    ) -> None:
+    admin_id: Any | None = None,
+) -> None:
     metadata = {"actor": actor} if actor else None
-    db.add(SystemLog(level=level, service=service, message=message, extra_metadata=metadata))
+    db.add(
+        SystemLog(
+            level=level,
+            service=service,
+            message=message,
+            extra_metadata=metadata,
+            admin_id=admin_id,
+        )
+    )
 
 
 def _admin_permissions_payload(payload: AdminRoleUpdateIn) -> dict[str, bool]:
@@ -294,6 +342,11 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
         category=service.category,
         maxMembers=service.max_members,
         monthlyPrice=service.monthly_price,
+        originalPrice=(
+            service.original_price
+            if service.original_price is not None
+            else service.monthly_price
+        ),
         logoImageKey=service.logo_image_key,
         logoImageUrl=build_minio_asset_url(service.logo_image_key),
         isActive=service.is_active,
@@ -588,6 +641,7 @@ async def update_admin_role(
         service="admin",
         message=f"관리자 권한 변경: {target_user.nickname}",
         actor=admin.user.nickname,
+        admin_id=admin.user.id,
     )
     await db.commit()
     await db.refresh(role_row)
@@ -637,6 +691,7 @@ async def get_admin_users(
             continue
         if q and not (
             q in str(user.id).lower()
+            or q in (user.name or "").lower()
             or q in (user.nickname or "").lower()
             or q in status_label.lower()
         ):
@@ -645,6 +700,7 @@ async def get_admin_users(
         items.append(
             AdminUserRecordOut(
                 id=str(user.id),
+                name=user.name,
                 nickname=user.nickname,
                 status=status_label,
                 reportCount=int(report_count),
@@ -729,6 +785,7 @@ async def update_admin_service(
 
     service.max_members = payload.maxMembers
     service.monthly_price = payload.monthlyPrice
+    service.original_price = payload.originalPrice
     service.logo_image_key = payload.logoImageKey
     service.is_active = payload.isActive
     service.commission_rate = payload.commissionRate
@@ -748,6 +805,7 @@ async def update_admin_service(
         service="admin",
         message=f"서비스 설정 변경: {service.name}",
         actor=admin.user.nickname,
+        admin_id=admin.user.id,
     )
     await db.commit()
     await db.refresh(service)
@@ -793,7 +851,6 @@ async def update_admin_user_status(
             type="SYSTEM",
             title="계정 상태 변경",
             message=f"관리자에 의해 계정 상태가 '{payload.status}'로 변경되었습니다.",
-            created_by=admin.user.id,
         )
     )
     await _append_activity_log(
@@ -810,6 +867,7 @@ async def update_admin_user_status(
         service="admin",
         message=f"사용자 상태 변경: {target_user.nickname} -> {payload.status}",
         actor=admin.user.nickname,
+        admin_id=admin.user.id,
     )
     await db.commit()
     await db.refresh(target_user)
@@ -825,6 +883,7 @@ async def update_admin_user_status(
 
     return AdminUserRecordOut(
         id=str(target_user.id),
+        name=target_user.name,
         nickname=target_user.nickname,
         status=_user_status_label(target_user, int(report_count), payload.status),
         reportCount=int(report_count),
@@ -860,6 +919,7 @@ async def get_admin_parties(
             continue
         if q and not (
             q in str(party.id).lower()
+            or q in party.title.lower()
             or q in service.name.lower()
             or q in user.nickname.lower()
             or q in status_label.lower()
@@ -868,8 +928,10 @@ async def get_admin_parties(
 
         if status_label == "위험":
             payment_note = "검토 필요"
-        elif status_label == "종료 예정":
+        # 파티 종료 수정
+        elif status_label == "종료됨":
             payment_note = "종료됨"
+        # 파티 종료 수정
         elif status_label == "모집중":
             payment_note = "정산 대기"
         else:
@@ -878,6 +940,7 @@ async def get_admin_parties(
         items.append(
             AdminPartyRecordOut(
                 id=str(party.id),
+                title=party.title,
                 service=service.name,
                 leaderId=user.nickname,
                 memberCount=party.current_members,
@@ -917,7 +980,6 @@ async def force_end_admin_party(
                 message=f"관리자에 의해 파티가 종료되었습니다. 사유: {payload.reason or '운영 정책 위반'}",
                 reference_type="party",
                 reference_id=party.id,
-                created_by=admin.user.id,
             )
         )
 
@@ -934,6 +996,7 @@ async def force_end_admin_party(
         service="admin",
         message=f"파티 강제 종료: {party.title}",
         actor=admin.user.nickname,
+        admin_id=admin.user.id,
     )
     await db.commit()
 
@@ -947,6 +1010,7 @@ async def force_end_admin_party(
 
     return AdminPartyRecordOut(
         id=str(party.id),
+        title=party.title,
         service=service.name if service else "-",
         leaderId=host.nickname if host else str(party.leader_id),
         memberCount=party.current_members,
@@ -1142,6 +1206,21 @@ async def get_admin_logs(
         await db.execute(select(ModerationAction).order_by(ModerationAction.created_at.desc()).limit(100))
     ).scalars().all()
 
+    actor_ids = {
+        row.actor_user_id
+        for row in activity_rows
+        if row.actor_user_id is not None
+    }
+    actor_ids.update(row.admin_id for row in system_rows if row.admin_id is not None)
+    actor_ids.update(row.admin_id for row in moderation_rows if row.admin_id is not None)
+
+    users_by_id: dict[Any, User] = {}
+    if actor_ids:
+        actor_users = (
+            await db.execute(select(User).where(User.id.in_(actor_ids)))
+        ).scalars().all()
+        users_by_id = {user.id: user for user in actor_users}
+
     logs.extend(
         [
             SystemLogRecordOut(
@@ -1149,7 +1228,10 @@ async def get_admin_logs(
                 timestamp=_format_datetime(row.created_at),
                 type="ADMIN_ACTION",
                 message=row.description,
-                actor=str(row.actor_user_id) if row.actor_user_id else "system",
+                actor=_actor_display_name(
+                    users_by_id.get(row.actor_user_id),
+                    "system",
+                ),
             )
             for row in activity_rows
         ]
@@ -1161,8 +1243,11 @@ async def get_admin_logs(
                 timestamp=_format_datetime(row.created_at),
                 type=row.level.upper(),
                 message=row.message,
-                actor=((row.extra_metadata or {}).get("actor") if row.extra_metadata else None)
-                or (str(row.admin_id) if row.admin_id else row.service),
+                actor=_actor_display_name(
+                    users_by_id.get(row.admin_id),
+                    ((row.extra_metadata or {}).get("actor") if row.extra_metadata else None)
+                    or row.service,
+                ),
             )
             for row in system_rows
         ]
@@ -1174,7 +1259,10 @@ async def get_admin_logs(
                 timestamp=_format_datetime(row.created_at),
                 type="ADMIN_ACTION",
                 message=f"{row.action_type}: {row.reason or '-'}",
-                actor=str(row.admin_id) if row.admin_id else "system",
+                actor=_actor_display_name(
+                    users_by_id.get(row.admin_id),
+                    "system",
+                ),
             )
             for row in moderation_rows
         ]

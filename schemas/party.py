@@ -24,6 +24,7 @@ class PartyOut(BaseModel):
     category_name: Optional[str] = None
     max_members: Optional[int] = None
     monthly_price: Optional[int] = None
+    original_price: Optional[int] = None
     logo_image_key: Optional[str] = None
     logo_image_url: Optional[str] = None
     member_count: int = 0

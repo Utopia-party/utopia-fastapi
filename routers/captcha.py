@@ -11,49 +11,9 @@ import redis.asyncio as redis
 import asyncpg
 
 from core.config import settings
-from schemas.captcha import (
-    CaptchaChallengeResponse,
-    CaptchaInitRequest,
-    CaptchaInitResponse,
-    CaptchaStatusResponse,
-    CaptchaVerifyRequest,
-    CaptchaVerifyResponse,
-)
-from services.captcha_service import (
-    get_captcha_status,
-    get_challenge,
-    initiate_captcha,
-    verify_challenge,
-)
 
 router = APIRouter()
 logger = logging.getLogger("handocr-api")
-
-
-
-@router.post("/init", response_model=CaptchaInitResponse)
-async def captcha_init(payload: CaptchaInitRequest, request: Request):
-    return await initiate_captcha(payload, request)
-
-
-@router.get("/challenge", response_model=CaptchaChallengeResponse)
-async def captcha_challenge(session_id: str, request: Request):
-    return await get_challenge(session_id, request)
-
-
-@router.post("/verify", response_model=CaptchaVerifyResponse)
-async def captcha_verify(payload: CaptchaVerifyRequest, request: Request):
-    return await verify_challenge(payload, request)
-
-
-@router.get("/status", response_model=CaptchaStatusResponse)
-async def captcha_status(request: Request):
-    return await get_captcha_status(request)
-
-
-# ─────────────────────────────────────────────
-# HandOCR 캡챠 설정
-# ─────────────────────────────────────────────
 
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 GPU_SERVER_URL = settings.GPU_SERVER_URL

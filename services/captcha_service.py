@@ -32,6 +32,38 @@ from schemas.captcha import (
 logger = logging.getLogger("captcha_service")
 
 
+_OPTIONAL_CAPTCHA_TABLES: dict[str, bool] = {
+    "captcha_sets": True,
+    "captcha_sessions": True,
+    "behavior_embeddings": True,
+}
+
+
+def _is_missing_relation_error(exc: Exception, table_name: str) -> bool:
+    message = str(exc).lower()
+    return (
+        "undefinedtableerror" in message
+        or (f'relation "{table_name.lower()}" does not exist' in message)
+        or (f"relation '{table_name.lower()}' does not exist" in message)
+    )
+
+
+def _disable_optional_table(table_name: str, exc: Exception, context: str) -> None:
+    if not _OPTIONAL_CAPTCHA_TABLES.get(table_name, True):
+        return
+    _OPTIONAL_CAPTCHA_TABLES[table_name] = False
+    logger.warning(
+        "[DB] %s unavailable during %s; disabling optional DB feature: %s",
+        table_name,
+        context,
+        exc,
+    )
+
+
+def _optional_table_enabled(table_name: str) -> bool:
+    return _OPTIONAL_CAPTCHA_TABLES.get(table_name, True)
+
+
 # ─────────────────────────────────────────────
 # 설정값
 # ─────────────────────────────────────────────
@@ -787,7 +819,7 @@ async def _build_new_challenge_payload(
     all_photo_categories = list(photo_lib.keys())
     wrong_categories = [c for c in all_photo_categories if c not in categories]
     if not wrong_categories:
-        # 상원: 로컬처럼 사진 카테고리가 3종뿐인 경우에도 문제를 만들 수 있게 전체 사용 가능 카테고리에서 다시 고릅니다.
+        #  로컬처럼 사진 카테고리가 3종뿐인 경우에도 문제를 만들 수 있게 전체 사용 가능 카테고리에서 다시 고릅니다.
         wrong_categories = list(available_categories)
     answer_positions = sorted(random.sample(list(range(9)), 3))
     used_emoji_paths: set[str] = set()
@@ -1224,23 +1256,27 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
         # DB: verify 성공 업데이트
         # status='challenge_pass' 로 기록해 "비간섭 통과(pass)"와 "캡챠 풀고 통과(challenge_pass)"를 DB에서 구분.
         # 프론트 응답은 그대로 성공 토큰만 반환 (CaptchaVerifyResponse 는 status 문자열을 노출하지 않음).
-        try:
-            async with AsyncSessionLocal() as db:
-                await db.execute(text("""
-                    UPDATE captcha_sessions
-                    SET status = 'challenge_pass', attempt_count = :attempts,
-                        solve_time_ms = :solve_ms, is_correct = true,
-                        captcha_set_id = :captcha_set_id
-                    WHERE id = :sid
-                """), {
-                    "attempts": attempts + 1,
-                    "solve_ms": solve_time_ms,
-                    "captcha_set_id": captcha_set_id,
-                    "sid": payload.session_id,
-                })
-                await db.commit()
-        except Exception as e:
-            logger.error(f"[DB] verify 성공 업데이트 실패: {e}")
+        if _optional_table_enabled("captcha_sessions"):
+            try:
+                async with AsyncSessionLocal() as db:
+                    await db.execute(text("""
+                        UPDATE captcha_sessions
+                        SET status = 'challenge_pass', attempt_count = :attempts,
+                            solve_time_ms = :solve_ms, is_correct = true,
+                            captcha_set_id = :captcha_set_id
+                        WHERE id = :sid
+                    """), {
+                        "attempts": attempts + 1,
+                        "solve_ms": solve_time_ms,
+                        "captcha_set_id": captcha_set_id,
+                        "sid": payload.session_id,
+                    })
+                    await db.commit()
+            except Exception as e:
+                if _is_missing_relation_error(e, "captcha_sessions"):
+                    _disable_optional_table("captcha_sessions", e, "verify_challenge_pass")
+                else:
+                    logger.error(f"[DB] verify 성공 업데이트 실패: {e}")
 
         # behavior_embeddings.label 갱신 (까다로운 조건 통과 시에만 'human')
         verify_label, verify_reason = _decide_label(
@@ -1267,23 +1303,27 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
         await _mark_lock(client_ip)
 
         # DB: 실패 초과 → block 업데이트 + bot_signatures
-        try:
-            async with AsyncSessionLocal() as db:
-                await db.execute(text("""
-                    UPDATE captcha_sessions
-                    SET status = 'block', attempt_count = :attempts,
-                        solve_time_ms = :solve_ms, is_correct = false,
-                        captcha_set_id = :captcha_set_id
-                    WHERE id = :sid
-                """), {
-                    "attempts": attempts,
-                    "solve_ms": solve_time_ms,
-                    "captcha_set_id": captcha_set_id,
-                    "sid": payload.session_id,
-                })
-                await db.commit()
-        except Exception as e:
-            logger.error(f"[DB] verify 실패초과 업데이트 실패: {e}")
+        if _optional_table_enabled("captcha_sessions"):
+            try:
+                async with AsyncSessionLocal() as db:
+                    await db.execute(text("""
+                        UPDATE captcha_sessions
+                        SET status = 'block', attempt_count = :attempts,
+                            solve_time_ms = :solve_ms, is_correct = false,
+                            captcha_set_id = :captcha_set_id
+                        WHERE id = :sid
+                    """), {
+                        "attempts": attempts,
+                        "solve_ms": solve_time_ms,
+                        "captcha_set_id": captcha_set_id,
+                        "sid": payload.session_id,
+                    })
+                    await db.commit()
+            except Exception as e:
+                if _is_missing_relation_error(e, "captcha_sessions"):
+                    _disable_optional_table("captcha_sessions", e, "verify_challenge_block")
+                else:
+                    logger.error(f"[DB] verify 실패초과 업데이트 실패: {e}")
 
         # behavior_embeddings.label 갱신 (까다로운 조건 통과 시에만 'bot')
         # 5회 모두 틀릴 때 평균 풀이 시간을 사용 (한 번이라도 정상 속도면 사람일 가능성)
@@ -1342,6 +1382,8 @@ async def verify_challenge(payload: CaptchaVerifyRequest, request: Request) -> C
 
 async def _fetch_captcha_set_from_db() -> dict[str, Any] | None:
     """DB captcha_sets에서 랜덤 1세트를 가져와 이미지 URL 구성"""
+    if not _optional_table_enabled("captcha_sets"):
+        return None
     try:
         async with AsyncSessionLocal() as db:
             # use_count 100회 미만에서 랜덤 선택
@@ -1413,6 +1455,12 @@ async def _fetch_captcha_set_from_db() -> dict[str, Any] | None:
                 "answer_indices": list(answer_indices),
             }
     except Exception as e:
+        if any(
+            _is_missing_relation_error(e, table_name)
+            for table_name in ("captcha_sets", "emoji_images", "real_photos")
+        ):
+            _disable_optional_table("captcha_sets", e, "_fetch_captcha_set_from_db")
+            return None
         logger.error(f"[DB] captcha_sets 조회 실패: {e}")
         return None
 
@@ -1521,6 +1569,8 @@ async def _update_embedding_label(session_id: str, label: str) -> None:
         # unknown 으로 되돌리는 일은 없음
         logger.info(f"[label.skip] session={session_id} → unknown 유지")
         return
+    if not _optional_table_enabled("behavior_embeddings"):
+        return
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(text("""
@@ -1534,6 +1584,9 @@ async def _update_embedding_label(session_id: str, label: str) -> None:
             else:
                 logger.info(f"[label.skip] session={session_id} → 이미 라벨 확정됨, {label} 적용 안 함")
     except Exception as e:
+        if _is_missing_relation_error(e, "behavior_embeddings"):
+            _disable_optional_table("behavior_embeddings", e, "_update_embedding_label")
+            return
         logger.error(f"[DB] behavior_embedding label 업데이트 실패: {e}")
 
 
@@ -1589,6 +1642,8 @@ async def _save_captcha_session_to_db(
     is_correct: bool | None = None,
 ) -> None:
     """captcha_sessions 테이블에 INSERT (발표 메트릭용)"""
+    if not _optional_table_enabled("captcha_sessions"):
+        return
     try:
         async with AsyncSessionLocal() as db:
             await db.execute(text("""
@@ -1619,6 +1674,9 @@ async def _save_captcha_session_to_db(
             await db.commit()
             logger.info(f"[DB] captcha_session 저장: {session_id} → {status_result}")
     except Exception as e:
+        if _is_missing_relation_error(e, "captcha_sessions"):
+            _disable_optional_table("captcha_sessions", e, "_save_captcha_session_to_db")
+            return
         logger.error(f"[DB] captcha_session 저장 실패: {e}")
 
 
@@ -1731,6 +1789,8 @@ async def _save_behavior_embedding(
     label: str,
 ) -> None:
     """behavior_embeddings 테이블에 INSERT"""
+    if not _optional_table_enabled("behavior_embeddings"):
+        return
     try:
         async with AsyncSessionLocal() as db:
             vec_str = "[" + ",".join(str(v) for v in vector) + "]"
@@ -1745,11 +1805,16 @@ async def _save_behavior_embedding(
             })
             await db.commit()
     except Exception as e:
+        if _is_missing_relation_error(e, "behavior_embeddings"):
+            _disable_optional_table("behavior_embeddings", e, "_save_behavior_embedding")
+            return
         logger.error(f"[DB] behavior_embedding 저장 실패: {e}")
 
 
 async def _search_similar_behaviors(vector: list[float], top_k: int = 5) -> list[dict]:
     """pgvector 코사인 유사도 검색으로 유사 행동 패턴 조회"""
+    if not _optional_table_enabled("behavior_embeddings"):
+        return []
     try:
         async with AsyncSessionLocal() as db:
             vec_str = "[" + ",".join(str(v) for v in vector) + "]"
@@ -1762,6 +1827,9 @@ async def _search_similar_behaviors(vector: list[float], top_k: int = 5) -> list
             rows = result.fetchall()
             return [{"label": r[0], "similarity": round(r[1], 4)} for r in rows]
     except Exception as e:
+        if _is_missing_relation_error(e, "behavior_embeddings"):
+            _disable_optional_table("behavior_embeddings", e, "_search_similar_behaviors")
+            return []
         logger.error(f"[DB] pgvector 검색 실패: {e}")
         return []
 
