@@ -182,6 +182,8 @@ app.include_router(assets.router, prefix="/api", tags=["Assets"])
 app.include_router(admin.router, prefix="/api")  # 상원
 app.include_router(report.router, prefix="/api")  
 
+app.include_router(profile.router, prefix="/api")
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
