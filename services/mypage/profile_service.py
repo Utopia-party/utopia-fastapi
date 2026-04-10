@@ -24,22 +24,9 @@ MAX_IMAGE_SIZE = 5 * 1024 * 1024
 
 
 def _get_minio_client() -> Minio:
-    """내부 전용 클라이언트 - 업로드/삭제용"""
+    """내부 전용 클라이언트 - 업로드/삭제/Presigned URL 생성용"""
     return Minio(
         endpoint=settings.MINIO_ENDPOINT,
-        access_key=settings.MINIO_ACCESS_KEY,
-        secret_key=settings.MINIO_SECRET_KEY,
-        secure=settings.MINIO_SECURE,
-    )
-
-
-def _get_public_minio_client() -> Minio:
-    """브라우저용 Presigned URL 생성 전용 클라이언트 (공인 IP로 서명)"""
-    endpoint = settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT
-    # MinIO는 path 포함 endpoint 불가 → host만 추출
-    endpoint = endpoint.split("/")[0]
-    return Minio(
-        endpoint=endpoint,
         access_key=settings.MINIO_ACCESS_KEY,
         secret_key=settings.MINIO_SECRET_KEY,
         secure=settings.MINIO_SECURE,
@@ -66,11 +53,15 @@ def _get_extension(filename: Optional[str], content_type: Optional[str]) -> str:
 
 
 def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
-    """공인 IP 클라이언트로 서명 후 path prefix 삽입"""
+    """
+    내부 클라이언트로 Presigned URL 생성 후
+    nginx proxy_set_header Host가 내부 IP로 바꿔주므로
+    단순히 host 문자열만 외부 주소로 교체
+    """
     if not profile_image_key:
         return None
 
-    client = _get_public_minio_client()
+    client = _get_minio_client()
 
     url = client.presigned_get_object(
         settings.PROFILE_MINIO_BUCKET,
@@ -78,13 +69,12 @@ def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
         expires=timedelta(hours=1),
     )
 
-    # MINIO_PUBLIC_ENDPOINT에 path가 있으면 (예: 210.109.15.10/minio)
-    # 서명된 URL에 해당 path prefix 삽입
-    if settings.MINIO_PUBLIC_ENDPOINT and "/" in settings.MINIO_PUBLIC_ENDPOINT:
-        public_host = settings.MINIO_PUBLIC_ENDPOINT.split("/")[0]
-        path_prefix = "/" + "/".join(settings.MINIO_PUBLIC_ENDPOINT.split("/")[1:])
-        # http://210.109.15.10/profile-images/... → http://210.109.15.10/minio/profile-images/...
-        url = url.replace(f"{public_host}/", f"{public_host}{path_prefix}/", 1)
+    # http://10.10.0.10:9000/... → http://210.109.15.10/minio/...
+    if settings.MINIO_PUBLIC_ENDPOINT:
+        url = url.replace(
+            settings.MINIO_ENDPOINT,        # 10.10.0.10:9000
+            settings.MINIO_PUBLIC_ENDPOINT, # 210.109.15.10/minio
+        )
 
     return url
 
@@ -137,7 +127,6 @@ async def update_my_profile_service(
     current_user.nickname = nickname
     current_user.phone = phone
 
-    # 업로드/삭제는 내부 클라이언트 사용
     client = _get_minio_client()
     bucket_name = settings.PROFILE_MINIO_BUCKET
     _ensure_bucket_exists(client, bucket_name)
