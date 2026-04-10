@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     MINIO_ENDPOINT: str
     MINIO_ACCESS_KEY: str
     MINIO_SECRET_KEY: str
-    PROFILE_MINIO_BUCKET: str = "profile-images"
+    PROFILE_MINIO_BUCKET: str 
     MINIO_EMOJI_BUCKET: str
     MINIO_PHOTO_BUCKET: str
     MINIO_SECURE: bool = False
