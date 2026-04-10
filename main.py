@@ -14,7 +14,7 @@ from sqlalchemy import text
 from core.config import settings
 from core.database import AsyncSessionLocal, Base, engine
 from models.admin import ActivityLog
-from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties
+from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report
 from routers.mypage import profile
 logging.basicConfig(level=logging.DEBUG)
 
@@ -180,7 +180,7 @@ app.include_router(captcha.router, prefix="/api")
 app.include_router(assets.router, prefix="/api", tags=["Assets"])
 # 상원: 관리자 페이지가 실제 데이터를 읽고 상태를 바꿀 수 있도록 관리자 라우터를 연결합니다.
 app.include_router(admin.router, prefix="/api")  # 상원
-app.include_router(profile.router, prefix="/api")
+app.include_router(report.router, prefix="/api")  
 
 @app.get("/api/health")
 async def health():

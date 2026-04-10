@@ -42,33 +42,6 @@ class AdminRole(Base):
     )
 
 
-class Report(Base):
-    __tablename__ = "reports"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
-    )
-    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    reporter_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
-    )
-    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    category: Mapped[str] = mapped_column(String(50), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
-    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
-    )
-    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    action_result_code: Mapped[str | None] = mapped_column(String(30))
-    admin_memo: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
-    target_snapshot_name: Mapped[str | None] = mapped_column(String(255))
-
-
 class Receipt(Base):
     __tablename__ = "receipts"
 
