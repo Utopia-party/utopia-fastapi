@@ -4,7 +4,7 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
-from fastapi import HTTPException, UploadFile, status
+from fastapi import HTTPException, UploadFile
 from minio import Minio
 from minio.error import S3Error
 from sqlalchemy import select
@@ -36,6 +36,8 @@ def _get_minio_client() -> Minio:
 def _get_public_minio_client() -> Minio:
     """브라우저용 Presigned URL 생성 전용 클라이언트 (공인 IP로 서명)"""
     endpoint = settings.MINIO_PUBLIC_ENDPOINT or settings.MINIO_ENDPOINT
+    # MinIO는 path 포함 endpoint 불가 → host만 추출
+    endpoint = endpoint.split("/")[0]
     return Minio(
         endpoint=endpoint,
         access_key=settings.MINIO_ACCESS_KEY,
@@ -64,7 +66,7 @@ def _get_extension(filename: Optional[str], content_type: Optional[str]) -> str:
 
 
 def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
-    """공인 IP 클라이언트로 서명 → host 치환 없이 바로 사용 가능"""
+    """공인 IP 클라이언트로 서명 후 path prefix 삽입"""
     if not profile_image_key:
         return None
 
@@ -75,6 +77,14 @@ def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
         profile_image_key,
         expires=timedelta(hours=1),
     )
+
+    # MINIO_PUBLIC_ENDPOINT에 path가 있으면 (예: 210.109.15.10/minio)
+    # 서명된 URL에 해당 path prefix 삽입
+    if settings.MINIO_PUBLIC_ENDPOINT and "/" in settings.MINIO_PUBLIC_ENDPOINT:
+        public_host = settings.MINIO_PUBLIC_ENDPOINT.split("/")[0]
+        path_prefix = "/" + "/".join(settings.MINIO_PUBLIC_ENDPOINT.split("/")[1:])
+        # http://210.109.15.10/profile-images/... → http://210.109.15.10/minio/profile-images/...
+        url = url.replace(f"{public_host}/", f"{public_host}{path_prefix}/", 1)
 
     return url
 
@@ -127,6 +137,7 @@ async def update_my_profile_service(
     current_user.nickname = nickname
     current_user.phone = phone
 
+    # 업로드/삭제는 내부 클라이언트 사용
     client = _get_minio_client()
     bucket_name = settings.PROFILE_MINIO_BUCKET
     _ensure_bucket_exists(client, bucket_name)
