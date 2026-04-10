@@ -53,27 +53,20 @@ def _get_extension(filename: Optional[str], content_type: Optional[str]) -> str:
 
 def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
     """
-    MinIO에서 이미지 URL을 생성하고, 브라우저에서 접근 가능하도록 공인 IP로 치환합니다.
+    403 Forbidden 해결: 서명된 URL(Presigned) 대신 직접 접근 가능한 URL을 생성합니다.
+    주의: MinIO 콘솔에서 해당 버킷의 Access Policy가 'Public' 혹은 'Read-Only'여야 합니다.
     """
     if not profile_image_key:
         return None
 
-    client = _get_minio_client()
+    # settings.MINIO_PUBLIC_ENDPOINT: 예) 210.109.15.10/minio
+    # settings.PROFILE_MINIO_BUCKET: 예) profile-images
+    # 결과: http://210.109.15.10/minio/profile-images/profile/uuid_filename.png
     
-    # 내부 Endpoint(10.10.0.10) 기준으로 서명된 URL 생성
-    url = client.presigned_get_object(
-        settings.PROFILE_MINIO_BUCKET,
-        profile_image_key,
-        expires=timedelta(hours=1),
-    )
-
-    # 브라우저 접근을 위해 공인 IP(MINIO_PUBLIC_ENDPOINT)로 주소 교체
-    if settings.MINIO_PUBLIC_ENDPOINT:
-        # settings.MINIO_ENDPOINT(예: 10.10.0.10:9000)를 
-        # settings.MINIO_PUBLIC_ENDPOINT(예: 210.109.15.10/minio)로 변경
-        url = url.replace(settings.MINIO_ENDPOINT, settings.MINIO_PUBLIC_ENDPOINT)
+    base_url = settings.MINIO_PUBLIC_ENDPOINT
+    bucket = settings.PROFILE_MINIO_BUCKET
     
-    return url
+    return f"http://{base_url}/{bucket}/{profile_image_key}"
 
 
 def _to_profile_response(user: User) -> MyPageProfileResponse:
