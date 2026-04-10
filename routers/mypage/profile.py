@@ -1,9 +1,10 @@
 from typing import Optional
-
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.user import User
+from core.database import get_db
+from core.security import get_current_user
 from schemas.mypage.profile import (
     MyPageProfileResponse,
     UpdateMyPageProfileResponse,
@@ -13,16 +14,7 @@ from services.mypage.profile_service import (
     update_my_profile_service,
 )
 
-# 아래 import 경로/함수명은 네 프로젝트 실제 코드에 맞게 맞춰야 함
-# 예시:
-# from core.database import get_db
-# from core.dependencies import get_current_user
-
-from core.database import get_db
-from core.security import get_current_user
-
 router = APIRouter(tags=["mypage-profile"])
-
 
 @router.get("/users/me/profile", response_model=MyPageProfileResponse)
 async def get_my_profile(
@@ -33,7 +25,6 @@ async def get_my_profile(
         db=db,
         current_user=current_user,
     )
-
 
 @router.patch("/users/me/profile", response_model=UpdateMyPageProfileResponse)
 async def update_my_profile(
