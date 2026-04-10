@@ -44,6 +44,9 @@ from services.oauth_service import (
     get_kakao_access_token, get_kakao_user_info,
     get_naver_access_token, get_naver_user_info,
 )
+from services.mypage.profile_service import (
+    _build_profile_image_url,
+)
 
 router = APIRouter(tags=["auth"])
 
@@ -129,7 +132,7 @@ async def refresh_token_api(
 
     return {"message": "access token과 refresh token이 재발급되었습니다."}
 
-
+# 마이페이지 프로필 및 로그인 상태 관리
 @router.get("/me")
 async def me(
     access_token: str | None = Cookie(default=None, alias="access_token"),
@@ -159,6 +162,11 @@ async def me(
             "nickname": user.nickname,
             "provider": user.provider,
             "role": user.role,
+            "phone":user.phone,
+            "trust_score": user.trust_score,
+            "created_at" :user.created_at,
+            "updated_at":user.updated_at,
+            "profile_image": _build_profile_image_url(user.profile_image_key),
         },
     }
 
@@ -448,13 +456,13 @@ async def find_password(
     )
     user = result.scalar_one_or_none()
 
-    # # 로컬 활성 계정이면 비밀번호 재설정 허용 플래그를 Redis에 10분간 저장
-    # if user and user.provider == "local" and user.is_active:
-    #     await redis_client.setex(
-    #         f"password_reset_verified:{payload.email}",
-    #         600,  # 10분
-    #         "true",
-    #     )
+    # 로컬 활성 계정이면 비밀번호 재설정 허용 플래그를 Redis에 10분간 저장
+    if user and user.provider == "local" and user.is_active:
+        await redis_client.setex(
+            f"password_reset_verified:{payload.email}",
+            600,  # 10분
+            "true",
+        )
 
     # 보안을 위해 항상 같은 응답 반환
     return FindPasswordResponse(
@@ -537,5 +545,6 @@ async def login(request: Request, user_credentials: UserLogin, response: Respons
             "email": user.email,
             "nickname": user.nickname,
             "role": user.role,
+            "phone" : user.phone,
         },
     }

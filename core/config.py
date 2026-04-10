@@ -58,13 +58,13 @@ class Settings(BaseSettings):
     CAPTCHA_MIN_SOLVE_SECONDS: float = 0.8
 
     # MinIO
-    MINIO_ENDPOINT: str = "localhost:9001"
-    MINIO_ACCESS_KEY: str = "admin1234"
-    MINIO_SECRET_KEY: str = "partyup1234"
-    MINIO_SECURE: bool = False
-    MINIO_EMOJI_BUCKET: str = "captcha-emojis"
-    MINIO_PHOTO_BUCKET: str = "captcha-photos"
-    MINIO_PUBLIC_ENDPOINT: str = "" 
+    MINIO_ENDPOINT: str
+    MINIO_ACCESS_KEY: str
+    MINIO_SECRET_KEY: str
+    PROFILE_MINIO_BUCKET: str
+    MINIO_EMOJI_BUCKET: str
+    MINIO_PHOTO_BUCKET: str
+    MINIO_SECURE: bool = False    
 
     # OAuth - Google
     GOOGLE_CLIENT_ID: str = ""
