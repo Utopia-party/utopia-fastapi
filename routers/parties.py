@@ -25,6 +25,31 @@ from schemas.user import MessageOut
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
 
+def _service_monthly_price(service: Service | None) -> int | None:
+    if service is None:
+        return None
+    return service.monthly_price
+
+def _party_max_members(party: Party, service: Service | None) -> int | None:
+    return party.max_members or (service.max_members if service else None)
+
+def _party_member_count(party: Party) -> int:
+    if party.current_members is not None:
+        return party.current_members
+    member_count = len(party.members) if party.members is not None else 0
+    return member_count + (1 if party.leader_id else 0)
+
+def _party_total_price(party: Party, service: Service | None) -> int | None:
+    max_members = _party_max_members(party, service)
+    if party.monthly_per_person is not None and max_members:
+        return party.monthly_per_person * max_members
+    return _service_monthly_price(service)
+
+def _service_original_price(service: Service | None) -> int | None:
+    if service is None:
+        return None
+    return service.original_price if service.original_price is not None else service.monthly_price
+// 임시 추가 여기까지
 
 def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) -> PartyOut:
     svc = party.service
