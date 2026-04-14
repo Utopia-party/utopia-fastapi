@@ -69,6 +69,9 @@ def _build_party_out(
         )
         is_joined = is_leader or is_member
 
+    max_members = _party_max_members(party, svc)
+    monthly_price = round(svc.monthly_price / max_members) if svc and max_members else None
+    
     return PartyOut(
         id=party.id,
         leader_id=party.leader_id,
@@ -76,6 +79,7 @@ def _build_party_out(
         title=party.title,
         status=party.status,
         host_nickname=party.host.nickname if party.host else None,
+        host_trust_score=float(party.host.trust_score) if party.host and party.host.trust_score is not None else None,  
         service_name=svc.name if svc else None,
         category_name=svc.category if svc else None,
         max_members=_party_max_members(party, svc),
