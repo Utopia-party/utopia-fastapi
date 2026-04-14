@@ -59,17 +59,15 @@ def _build_party_out(
 ) -> PartyOut:
     svc = party.service
     is_joined = False
-    if current_user_id:
-      is_leader = party.leader_id == current_user_id
-      is_member = (
-          any(m.user_id == current_user_id for m in party.members)
-          if party.members
-          else False
-      )
-      is_joined = is_leader or is_member
 
-    max_members = _party_max_members(party, svc)
-    monthly_price = round(svc.monthly_price / max_members) if svc and max_members else None  # 추가: 서비스에서 매번 계산
+    if current_user_id:
+        is_leader = party.leader_id == current_user_id
+        is_member = (
+            any(m.user_id == current_user_id for m in party.members)
+            if party.members
+            else False
+        )
+        is_joined = is_leader or is_member
 
     return PartyOut(
         id=party.id,
@@ -78,16 +76,10 @@ def _build_party_out(
         title=party.title,
         status=party.status,
         host_nickname=party.host.nickname if party.host else None,
-        host_trust_score=float(party.host.trust_score) if party.host and party.host.trust_score is not None else None,  # 추가
         service_name=svc.name if svc else None,
         category_name=svc.category if svc else None,
-<<<<<<< Updated upstream
-        max_members=max_members,
-        monthly_price=monthly_price,
-=======
         max_members=_party_max_members(party, svc),
         monthly_price=party.monthly_per_person,
->>>>>>> Stashed changes
         original_price=_service_original_price(svc),
         member_count=_party_member_count(party),
         logo_image_key=svc.logo_image_key if svc else None,
@@ -106,8 +98,10 @@ async def consume_captcha_pass_token(pass_token: str) -> None:
     redis_key = f"captcha_pass:{pass_token}"
 
     try:
+        # Redis 6.2+ 지원 시 원자적으로 조회+삭제
         token_value = await redis_client.getdel(redis_key)
     except AttributeError:
+        # 하위 호환
         token_value = await redis_client.get(redis_key)
         if token_value:
             await redis_client.delete(redis_key)
@@ -127,6 +121,7 @@ async def list_services(db: AsyncSession = Depends(get_db)):
         .order_by(Service.category, Service.name)
     )
     services = result.scalars().all()
+
     return [
         ServiceOut(
             id=svc.id,
@@ -145,10 +140,7 @@ async def list_categories(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Service.category).distinct())
     categories = result.scalars().all()
     return [{"name": cat} for cat in categories if cat]
-<<<<<<< Updated upstream
-=======
 
->>>>>>> Stashed changes
 
 @router.get("", response_model=PartyListOut)
 async def list_parties(
@@ -168,13 +160,16 @@ async def list_parties(
 
     if service_id:
         q = q.where(Party.service_id == service_id)
+
     if category_name:
         q = q.join(Party.service).where(Service.category == category_name)
+
     if search:
         q = q.where(Party.title.ilike(f"%{search}%"))
 
     total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
     q = q.offset((page - 1) * size).limit(size).order_by(Party.id.desc())
+
     result = await db.execute(q)
     parties = result.scalars().all()
 
@@ -203,8 +198,10 @@ async def get_party(
         .where(Party.id == party_id)
     )
     party = result.scalar_one_or_none()
+
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+
     return _build_party_out(party, current_user.id if current_user else None)
 
 
@@ -217,16 +214,12 @@ async def create_party(
     svc = await db.get(Service, body.service_id)
     if not svc:
         raise HTTPException(status_code=404, detail="서비스를 찾을 수 없습니다.")
+
     if not svc.is_active:
         raise HTTPException(status_code=400, detail="비활성화된 서비스입니다.")
 
     max_members = body.max_members if body.max_members is not None else svc.max_members
 
-<<<<<<< Updated upstream
-    base_per_person = svc.monthly_price / max_members
-    commission = svc.commission_rate or 0.0
-    monthly_per_person = round(base_per_person * (1 + commission))
-=======
     if max_members < 2:
         raise HTTPException(status_code=400, detail="최대 인원은 2명 이상이어야 합니다.")
 
@@ -235,7 +228,6 @@ async def create_party(
             status_code=400,
             detail=f"최대 인원은 서비스 허용 인원({svc.max_members}명)을 초과할 수 없습니다.",
         )
->>>>>>> Stashed changes
 
     start_date = None
     end_date = None
@@ -266,6 +258,7 @@ async def create_party(
 
     await consume_captcha_pass_token(body.captcha_pass_token)
 
+    # 1인당 가격 = (전체요금 / 인원수) * (1 + 수수료율)
     base_per_person = svc.monthly_price / max_members
     commission = svc.commission_rate or 0.0
     monthly_per_person = round(base_per_person * (1 + commission))
@@ -316,8 +309,10 @@ async def join_party(
         select(Party).options(selectinload(Party.service)).where(Party.id == party_id)
     )
     party = result.scalar_one_or_none()
+
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+
     if party.leader_id == current_user.id:
         raise HTTPException(status_code=400, detail="자신이 개설한 파티입니다.")
 
