@@ -1,10 +1,13 @@
 import uuid
-from pydantic import BaseModel, Field
 from typing import Optional, List
+
+from pydantic import BaseModel, Field
+
 
 class CategoryOut(BaseModel):
     name: str
     model_config = {"from_attributes": True}
+
 
 class ServiceOut(BaseModel):
     id: uuid.UUID
@@ -15,6 +18,7 @@ class ServiceOut(BaseModel):
     logo_image_url: Optional[str] = None
     model_config = {"from_attributes": True}
 
+
 class PartyCreate(BaseModel):
     service_id: uuid.UUID
     title: str = Field(..., min_length=2, max_length=100)
@@ -23,6 +27,8 @@ class PartyCreate(BaseModel):
     min_trust_score: Optional[float] = Field(0.0, ge=0)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    captcha_pass_token: str = Field(..., min_length=1)
+
 
 class PartyOut(BaseModel):
     id: uuid.UUID
@@ -42,6 +48,7 @@ class PartyOut(BaseModel):
     member_count: int = 0
     is_joined: bool = False
     model_config = {"from_attributes": True}
+
 
 class PartyListOut(BaseModel):
     parties: List[PartyOut]
