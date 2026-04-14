@@ -25,31 +25,31 @@ from schemas.user import MessageOut
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
 
+# --- 도우미 함수들 (지우지 마세요) ---
+
 def _service_monthly_price(service: Service | None) -> int | None:
     if service is None:
         return None
     return service.monthly_price
 
 def _party_max_members(party: Party, service: Service | None) -> int | None:
+    # 파티 설정값이 있으면 우선, 없으면 서비스 기본값 사용
     return party.max_members or (service.max_members if service else None)
 
 def _party_member_count(party: Party) -> int:
+    # 현재 참여 중인 멤버 수 (방장 포함)
     if party.current_members is not None:
         return party.current_members
     member_count = len(party.members) if party.members is not None else 0
     return member_count + (1 if party.leader_id else 0)
 
-def _party_total_price(party: Party, service: Service | None) -> int | None:
-    max_members = _party_max_members(party, service)
-    if party.monthly_per_person is not None and max_members:
-        return party.monthly_per_person * max_members
-    return _service_monthly_price(service)
-
 def _service_original_price(service: Service | None) -> int | None:
+    # 서비스의 원래 가격 (할인 전)
     if service is None:
         return None
     return service.original_price if service.original_price is not None else service.monthly_price
-#임시 추가 여기까지
+
+# --- 데이터 조립 함수 (할인 정보 복구 핵심) ---
 
 def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) -> PartyOut:
     svc = party.service
@@ -68,15 +68,19 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         host_nickname=party.host.nickname if party.host else None,
         service_name=svc.name if svc else None,
         category_name=svc.category if svc else None,
-        max_members=party.max_members,
-        monthly_price=svc.monthly_price if svc else None,
-        original_price=_service_original_price(svc),
+        
+        # [중요] 수정된 포인트들
+        max_members=_party_max_members(party, svc),
+        monthly_price=party.monthly_per_person,      # 1인당 실제 지불 금액 (할인된 가격)
+        original_price=_service_original_price(svc),  # 서비스 원래 가격 (할인 배지 계산용)
+        member_count=_party_member_count(party),      # 방장 포함 총 인원
+        
         logo_image_key=svc.logo_image_key if svc else None,
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
-        member_count=len(party.members) if party.members is not None else 0,
         is_joined=is_joined,
     )
 
+# --- API 엔드포인트 ---
 
 @router.get("/services", response_model=list[ServiceOut])
 async def list_services(db: AsyncSession = Depends(get_db)):
@@ -99,13 +103,11 @@ async def list_services(db: AsyncSession = Depends(get_db)):
         for svc in services
     ]
 
-
 @router.get("/categories", response_model=list[CategoryOut])
 async def list_categories(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Service.category).distinct())
     categories = result.scalars().all()
     return [{"id": uuid.uuid4(), "name": cat} for cat in categories if cat]
-
 
 @router.get("", response_model=PartyListOut)
 async def list_parties(
@@ -145,7 +147,6 @@ async def list_parties(
         size=size,
     )
 
-
 @router.get("/{party_id}", response_model=PartyOut)
 async def get_party(
     party_id: uuid.UUID,
@@ -162,7 +163,6 @@ async def get_party(
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
     return _build_party_out(party, current_user.id if current_user else None)
 
-
 @router.post("", response_model=PartyOut, status_code=status.HTTP_201_CREATED)
 async def create_party(
     body: PartyCreate,
@@ -175,10 +175,13 @@ async def create_party(
     if not svc.is_active:
         raise HTTPException(status_code=400, detail="비활성화된 서비스입니다.")
 
-    # max_members: 요청값 우선, 없으면 서비스 기본값
     max_members = body.max_members if body.max_members is not None else svc.max_members
-    # monthly_per_person: 항상 서비스 값 사용 (고정)
-    monthly_per_person = svc.monthly_price
+    
+    # [수정] 1인당 요금 계산 로직 추가
+    if svc.monthly_price and max_members:
+        monthly_per_person = svc.monthly_price // max_members
+    else:
+        monthly_per_person = svc.monthly_price
 
     start_date = None
     end_date = None
@@ -215,7 +218,6 @@ async def create_party(
     )
     return _build_party_out(result.scalar_one(), current_user.id)
 
-
 @router.post("/{party_id}/join", response_model=MessageOut)
 async def join_party(
     party_id: uuid.UUID,
@@ -240,10 +242,9 @@ async def join_party(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 참여한 파티입니다.")
 
-    count = await db.scalar(
-        select(func.count()).select_from(PartyMember).where(PartyMember.party_id == party_id)
-    ) or 0
-    if count >= (party.max_members or 0):
+    # 현재 인원 체크 시 방장 포함 계산 로직 적용
+    current_count = _party_member_count(party)
+    if current_count >= (party.max_members or 0):
         raise HTTPException(status_code=400, detail="파티 인원이 가득 찼습니다.")
 
     try:
