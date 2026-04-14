@@ -25,8 +25,6 @@ from schemas.user import MessageOut
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
 
-# --- 도우미 함수들 ---
-
 def _service_monthly_price(service: Service | None) -> int | None:
     if service is None:
         return None
@@ -44,9 +42,7 @@ def _party_member_count(party: Party) -> int:
 def _service_original_price(service: Service | None) -> int | None:
     if service is None:
         return None
-    return service.original_price  # DB에 항상 있으므로 fallback 제거
-
-# --- 데이터 조립 함수 ---
+    return service.original_price  
 
 def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) -> PartyOut:
     svc = party.service
@@ -67,14 +63,12 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         category_name=svc.category if svc else None,
         max_members=_party_max_members(party, svc),
         monthly_price=party.monthly_per_person,
-        original_price=_service_original_price(svc),  # 추가
+        original_price=_service_original_price(svc),  
         member_count=_party_member_count(party),
         logo_image_key=svc.logo_image_key if svc else None,
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         is_joined=is_joined,
     )
-
-# --- API 엔드포인트 ---
 
 @router.get("/services", response_model=list[ServiceOut])
 async def list_services(db: AsyncSession = Depends(get_db)):
@@ -100,11 +94,11 @@ async def list_services(db: AsyncSession = Depends(get_db)):
 async def list_categories(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Service.category).distinct())
     categories = result.scalars().all()
-    return [{"name": cat} for cat in categories if cat]  # id 제거, name만 반환
+    return [{"name": cat} for cat in categories if cat]  
 
 @router.get("", response_model=PartyListOut)
 async def list_parties(
-    category_name: Optional[str] = Query(None),  # category_id → category_name으로 변경
+    category_name: Optional[str] = Query(None), 
     service_id: Optional[uuid.UUID] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
@@ -120,7 +114,7 @@ async def list_parties(
     if service_id:
         q = q.where(Party.service_id == service_id)
     if category_name:
-        q = q.join(Party.service).where(Service.category == category_name)  # 바로 name으로 필터
+        q = q.join(Party.service).where(Service.category == category_name) 
     if search:
         q = q.where(Party.title.ilike(f"%{search}%"))
 
