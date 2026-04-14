@@ -3,6 +3,11 @@ from pydantic import BaseModel, Field
 
 INT32_MAX = 1_000_000
 
+# 관리자 신고 관련 알림
+class AdminReportStatusUpdateIn(BaseModel):
+    status: str
+    actionResultCode: str = "NONE"
+    adminMemo: str | None = None
 
 class DashboardMetricOut(BaseModel):
     id: str

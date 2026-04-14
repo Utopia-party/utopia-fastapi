@@ -6,13 +6,33 @@ from models.report import Report
 from services.notification_service import notify_user
 
 
+def _resolve_report_result_label(action_result_code: str | None, status: str | None) -> str:
+    action_code = (action_result_code or "NONE").strip().upper()
+    status_code = (status or "").strip().upper()
+
+    if action_code == "WARNING":
+        return "경고 조치"
+    if action_code == "PENALTY":
+        return "제재 조치"
+    if status_code == "REJECTED":
+        return "신고가 기각되었어요"
+    if status_code == "APPROVED":
+        return "신고가 처리되었어요"
+
+    return "처리 결과가 등록되었어요"
+
+
 def _build_report_detail_message(report: Report) -> str:
     base = f"신고 대상: {report.target_snapshot_name or '알 수 없음'}"
+    result_label = _resolve_report_result_label(
+        report.action_result_code,
+        report.status,
+    )
 
     if report.admin_memo:
-        return f"{base}\n처리 결과: {report.action_result_code}\n상세: {report.admin_memo}"
+        return f"{base}\n처리 결과: {result_label}\n상세: {report.admin_memo}"
 
-    return f"{base}\n처리 결과: {report.action_result_code}"
+    return f"{base}\n처리 결과: {result_label}"
 
 
 async def notify_report_submitted(

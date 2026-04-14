@@ -34,6 +34,7 @@ from schemas.admin import (
     AdminServiceRecordOut,
     AdminServiceUpdateIn,
     AdminStatusUpdateIn,
+    AdminReportStatusUpdateIn,
     AdminUserDetailOut,
     AdminUserRecordOut,
     AdminUserStatusUpdateIn,
@@ -41,6 +42,11 @@ from schemas.admin import (
     ReportRecordOut,
     SettlementRecordOut,
     SystemLogRecordOut,
+)
+from services.notifications.report_notification_service import (
+    notify_report_result_to_reporter,
+    notify_report_warning_to_target,
+    notify_report_penalty_to_target,
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -1046,7 +1052,7 @@ async def get_admin_reports(
 @router.patch("/reports/{report_id}", response_model=ReportRecordOut)
 async def update_admin_report_status(
     report_id: str,
-    payload: AdminStatusUpdateIn,
+    payload: AdminReportStatusUpdateIn,
     admin: AdminContext = Depends(require_admin_report_permission),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1054,7 +1060,19 @@ async def update_admin_report_status(
     if not report:
         raise HTTPException(status_code=404, detail="신고를 찾을 수 없습니다.")
 
-    report.status = _report_status_code(payload.status)
+    next_status = _report_status_code(payload.status)
+    next_action_result_code = (payload.actionResultCode or "NONE").strip().upper()
+    next_admin_memo = payload.adminMemo.strip() if payload.adminMemo else None
+
+    if next_status not in {"PENDING", "IN_REVIEW", "APPROVED", "REJECTED"}:
+        raise HTTPException(status_code=400, detail="유효하지 않은 신고 상태입니다.")
+
+    if next_action_result_code not in {"NONE", "WARNING", "PENALTY"}:
+        raise HTTPException(status_code=400, detail="유효하지 않은 처리 결과 코드입니다.")
+
+    report.status = next_status
+    report.action_result_code = next_action_result_code
+    report.admin_memo = next_admin_memo
     report.reviewed_by = admin.user.id
     report.reviewed_at = datetime.now(timezone.utc)
 
@@ -1062,10 +1080,34 @@ async def update_admin_report_status(
         db,
         actor_user_id=admin.user.id,
         action_type="report_status_updated",
-        description=f"{report.id} 신고 상태를 {payload.status}로 변경",
+        description=(
+            f"{report.id} 신고 상태를 {payload.status}로 변경 "
+            f"(결과 코드: {next_action_result_code})"
+        ),
         path=f"/api/admin/reports/{report_id}",
     )
     await db.commit()
+    await db.refresh(report)
+
+    # 신고자: 처리 결과 알림
+    await notify_report_result_to_reporter(
+        db=db,
+        report=report,
+    )
+
+    # 피신고자: 경고 알림
+    if report.action_result_code == "WARNING":
+        await notify_report_warning_to_target(
+            db=db,
+            report=report,
+        )
+
+    # 피신고자: 제재 알림
+    elif report.action_result_code == "PENALTY":
+        await notify_report_penalty_to_target(
+            db=db,
+            report=report,
+        )
 
     return ReportRecordOut(
         id=str(report.id),
