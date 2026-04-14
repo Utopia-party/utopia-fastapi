@@ -449,31 +449,12 @@ async def start_captcha(request: Request):
     active_session_key = f"captcha:active_session:{ip}"
     existing_session_id = await redis_client.get(active_session_key)
 
-    # active session이 있으면 에러 반환 대신 기존 문제 재사용
+    # 기존 진행 중 세션이 있으면 재사용하지 않고 폐기
     if existing_session_id:
-        existing_session_str = await redis_client.get(f"captcha:{existing_session_id}")
+        await redis_client.delete(f"captcha:{existing_session_id}")
+        await redis_client.delete(active_session_key)
 
-        # active_session 키는 있는데 실제 세션이 없으면 stale key 정리
-        if existing_session_str:
-            existing_session = json.loads(existing_session_str)
-            existing_ttl = await redis_client.ttl(f"captcha:{existing_session_id}")
-
-            # active_session TTL도 세션 TTL에 맞춰 갱신
-            if existing_ttl and existing_ttl > 0:
-                await redis_client.expire(active_session_key, existing_ttl)
-
-            return {
-                "success": True,
-                "sessionId": existing_session_id,
-                "text": existing_session["text"],
-                "pose": existing_session["pose"],
-                "reused": True,
-                "remainingSeconds": existing_ttl if existing_ttl and existing_ttl > 0 else CAPTCHA_SESSION_TTL,
-            }
-        else:
-            await redis_client.delete(active_session_key)
-
-    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    chars = "ABCDEFGHIJKLMNPQRSTUVWXYZ123456789"
     random_text = "".join(random.choice(chars) for _ in range(5))
     random_pose = random.choice(ALL_POSES)
 
@@ -497,8 +478,6 @@ async def start_captcha(request: Request):
         "sessionId": session_id,
         "text": random_text,
         "pose": random_pose,
-        "reused": False,
-        "remainingSeconds": CAPTCHA_SESSION_TTL,
     }
 
 

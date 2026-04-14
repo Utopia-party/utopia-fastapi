@@ -5,7 +5,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database import Base
 from datetime import date, datetime
 
-
 class Party(Base):
     __tablename__ = "parties"
 
@@ -21,15 +20,15 @@ class Party(Base):
     title: Mapped[str] = mapped_column(String(100), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     max_members: Mapped[int | None] = mapped_column(Integer)
-    current_members: Mapped[int | None] = mapped_column(Integer)
+    current_members: Mapped[int | None] = mapped_column(Integer, server_default="1")
     monthly_per_person: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="recruiting")
+    min_trust_score: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")  
     start_date: Mapped[date | None] = mapped_column(Date)
     end_date: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-
-    host: Mapped["User"] = relationship("User", back_populates="hosted_parties", foreign_keys=[leader_id])  # noqa
+    host: Mapped["User"] = relationship("User", back_populates="hosted_parties", foreign_keys=[leader_id])
     service: Mapped["Service"] = relationship("Service", back_populates="parties")
     members: Mapped[list["PartyMember"]] = relationship("PartyMember", back_populates="party")
     chats: Mapped[list["PartyChat"]] = relationship("PartyChat", back_populates="party")
@@ -49,12 +48,11 @@ class PartyMember(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False, server_default="member")
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="active")
-    # ✅ Fix: DateTime → DateTime(timezone=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     party: Mapped["Party"] = relationship("Party", back_populates="members")
-    user: Mapped["User"] = relationship("User", back_populates="party_members")  # noqa
+    user: Mapped["User"] = relationship("User", back_populates="party_members")
 
 
 class PartyChat(Base):
@@ -73,10 +71,9 @@ class PartyChat(Base):
     message_type: Mapped[str] = mapped_column(String(20), nullable=False, server_default="text")
     is_flagged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     flag_reason: Mapped[str | None] = mapped_column(String(100))
-    flag_confidence: Mapped[float | None] = mapped_column()
+    flag_confidence: Mapped[float | None] = mapped_column(Float)
     moderation_status: Mapped[str | None] = mapped_column(String(20))
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    # ✅ Fix: DateTime → DateTime(timezone=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     party: Mapped["Party"] = relationship("Party", back_populates="chats")
@@ -100,7 +97,6 @@ class Service(Base):
     leader_discount_rate: Mapped[float | None] = mapped_column(Float)
     referral_discount_rate: Mapped[float | None] = mapped_column(Float)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
-    # ✅ Fix: DateTime → DateTime(timezone=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
