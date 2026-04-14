@@ -25,8 +25,6 @@ from schemas.user import MessageOut
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
 
-# --- 도우미 함수들 ---
-
 def _party_max_members(party: Party, service: Service | None) -> int | None:
     return party.max_members or (service.max_members if service else None)
 
@@ -40,8 +38,6 @@ def _service_original_price(service: Service | None) -> int | None:
     if service is None:
         return None
     return service.original_price
-
-# --- 데이터 조립 함수 ---
 
 def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) -> PartyOut:
     svc = party.service
@@ -73,8 +69,6 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         is_joined=is_joined,
     )
-
-# --- API 엔드포인트 ---
 
 @router.get("/services", response_model=list[ServiceOut])
 async def list_services(db: AsyncSession = Depends(get_db)):
