@@ -49,7 +49,7 @@ def _service_original_price(service: Service | None) -> int | None:
     if service is None:
         return None
     return service.original_price if service.original_price is not None else service.monthly_price
-// 임시 추가 여기까지
+#임시 추가 여기까지
 
 def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) -> PartyOut:
     svc = party.service
