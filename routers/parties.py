@@ -70,6 +70,7 @@ def _build_party_out(party: Party, current_user_id: Optional[uuid.UUID] = None) 
         category_name=svc.category if svc else None,
         max_members=party.max_members,
         monthly_price=svc.monthly_price if svc else None,
+        original_price=_service_original_price(svc),
         logo_image_key=svc.logo_image_key if svc else None,
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         member_count=len(party.members) if party.members is not None else 0,
