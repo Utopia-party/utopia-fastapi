@@ -7,12 +7,17 @@ class EmbeddingService:
     @staticmethod
     async def generate_embedding(payload: dict) -> list[float]:
         """
-        GPU 서버 호출해서 임베딩 생성
+        Ollama 임베딩 모델로 임베딩 생성
         """
+        text = payload.get("text", "")
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             res = await client.post(
-                settings.GPU_EMBEDDING_URL,
-                json=payload,
+                f"{settings.OLLAMA_URL}/api/embeddings",
+                json={
+                    "model": settings.OLLAMA_EMBED_MODEL,
+                    "prompt": text,
+                },
             )
             res.raise_for_status()
             data = res.json()
@@ -52,5 +57,4 @@ class EmbeddingService:
 최소 신뢰도: {party_data.get("min_trust")}
 설명: {party_data.get("description")}
 """
-
         return await EmbeddingService.generate_embedding({"text": text})

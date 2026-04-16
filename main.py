@@ -15,8 +15,12 @@ from core.config import settings
 from core.database import AsyncSessionLocal, Base, engine
 from models.admin import ActivityLog
 from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report, ws_notifications
+<<<<<<< HEAD
 from routers.mypage import profile
 from routers.quick_match import router as quick_match_router
+=======
+from routers.mypage import parties as mypage_parties, profile
+>>>>>>> dd4938b4ae7a8b21ea8e4eddffdc2aed5ffec986
 logging.basicConfig(level=logging.DEBUG)
 
 @asynccontextmanager
@@ -186,6 +190,7 @@ app.include_router(admin.router, prefix="/api")  # 상원
 app.include_router(report.router, prefix="/api")  
 
 app.include_router(profile.router, prefix="/api")
+app.include_router(mypage_parties.router, prefix="/api")
 
 @app.get("/api/health")
 async def health():
