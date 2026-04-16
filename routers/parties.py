@@ -19,8 +19,11 @@ from schemas.party import (
     CategoryOut,
     PartyCreate,
     PartyListOut,
+    PartyMembersOut,
+    PartyMemberOut,
     PartyOut,
     ServiceOut,
+    TransferLeaderRequest,
 )
 from schemas.user import MessageOut
 
@@ -59,15 +62,22 @@ def _build_party_out(
 ) -> PartyOut:
     svc = party.service
     is_joined = False
+    my_member_status: Optional[str] = None
 
     if current_user_id:
         is_leader = party.leader_id == current_user_id
-        is_member = (
-            any(m.user_id == current_user_id for m in party.members)
-            if party.members
-            else False
+        my_row = next(
+            (m for m in (party.members or []) if m.user_id == current_user_id),
+            None,
         )
-        is_joined = is_leader or is_member
+        my_row_status = (my_row.status or "").lower() if my_row else None
+        is_member_active = my_row_status == "active"
+        is_joined = is_leader or is_member_active
+
+        if is_leader:
+            my_member_status = "leader"
+        elif my_row_status:
+            my_member_status = my_row_status  # pending / active / kicked / left / rejected
 
     max_members = _party_max_members(party, svc)
     monthly_price = round(svc.monthly_price / max_members) if svc and max_members else None
@@ -89,6 +99,7 @@ def _build_party_out(
         logo_image_key=svc.logo_image_key if svc else None,
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         is_joined=is_joined,
+        my_member_status=my_member_status,
     )
 
 
@@ -304,11 +315,12 @@ async def create_party(
 
 
 @router.post("/{party_id}/join", response_model=MessageOut)
-async def join_party(
+async def apply_to_party(
     party_id: uuid.UUID,
     current_user: User = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """파티 참여 신청 (기존 /join). 리더 승인 필요 — status='pending'으로 생성."""
     result = await db.execute(
         select(Party).options(selectinload(Party.service)).where(Party.id == party_id)
     )
@@ -320,28 +332,353 @@ async def join_party(
     if party.leader_id == current_user.id:
         raise HTTPException(status_code=400, detail="자신이 개설한 파티입니다.")
 
-    existing = await db.execute(
+    existing_result = await db.execute(
         select(PartyMember).where(
             PartyMember.party_id == party_id,
             PartyMember.user_id == current_user.id,
         )
     )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="이미 참여한 파티입니다.")
+    existing_row = existing_result.scalar_one_or_none()
 
-    current_count = _party_member_count(party)
-    if current_count >= (party.max_members or 0):
-        raise HTTPException(status_code=400, detail="파티 인원이 가득 찼습니다.")
+    if existing_row is not None:
+        current_status = (existing_row.status or "").lower()
+        if current_status == "active":
+            raise HTTPException(status_code=400, detail="이미 참여중인 파티입니다.")
+        if current_status == "pending":
+            raise HTTPException(status_code=400, detail="이미 신청하신 파티입니다. 리더 승인을 기다려주세요.")
+        if current_status == "kicked":
+            raise HTTPException(status_code=403, detail="이 파티에서 강퇴된 이력이 있어 재신청할 수 없습니다.")
+        # 'left' 또는 'rejected' → 재신청 허용
+
+    # 신청 시점에도 여석 확인 (pending 포함 카운트가 아닌 active+pending < max)
+    pending_count_row = await db.execute(
+        select(func.count(PartyMember.id)).where(
+            PartyMember.party_id == party_id,
+            PartyMember.status.in_(["active", "pending"]),
+        )
+    )
+    pending_plus_active = pending_count_row.scalar() or 0
+    # +1 은 리더. leader는 party_members 테이블에 없을 수 있음 → parties.leader_id 기반으로 포함
+    effective_count = pending_plus_active + (1 if party.leader_id else 0)
+    if effective_count >= (party.max_members or 0):
+        raise HTTPException(status_code=400, detail="파티 인원이 가득 찼거나 대기자가 많습니다.")
 
     try:
-        db.add(PartyMember(party_id=party_id, user_id=current_user.id))
+        if existing_row is not None:
+            # 과거 left/rejected → pending으로 재신청
+            existing_row.status = "pending"
+            existing_row.leader_review_status = "pending"
+            existing_row.join_type = "apply"
+            existing_row.left_at = None
+            existing_row.approved_at = None
+            existing_row.rejected_at = None
+        else:
+            db.add(
+                PartyMember(
+                    party_id=party_id,
+                    user_id=current_user.id,
+                    role="member",
+                    status="pending",
+                    join_type="apply",
+                    leader_review_status="pending",
+                )
+            )
+        # current_members 는 승인 시점에만 증가 (여기선 건드리지 않음)
         await db.commit()
     except Exception as e:
         await db.rollback()
-        logger.error(f"Error joining party: {e}")
+        logger.error(f"Error applying to party: {e}")
         raise HTTPException(
             status_code=500,
-            detail="파티 가입 처리 중 서버 오류가 발생했습니다.",
+            detail="파티 신청 처리 중 서버 오류가 발생했습니다.",
         )
 
-    return MessageOut(message="파티 참여가 완료되었습니다.")
+    return MessageOut(message="참여 신청이 완료되었습니다. 리더 승인을 기다려주세요.")
+
+
+# =====================================================================
+# v2: 내 파티 멤버 관리 — 조회/탈퇴/강퇴/리더 위임
+# =====================================================================
+
+async def _load_party_with_members(db: AsyncSession, party_id: uuid.UUID) -> Party:
+    """party + host + service + active members(with user) 한 번에 로드."""
+    result = await db.execute(
+        select(Party)
+        .options(
+            selectinload(Party.host),
+            selectinload(Party.service),
+            selectinload(Party.members).selectinload(PartyMember.user),
+        )
+        .where(Party.id == party_id)
+    )
+    party = result.scalar_one_or_none()
+    if not party:
+        raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+    return party
+
+
+def _is_active_member(m: PartyMember) -> bool:
+    return (m.status or "active").lower() == "active"
+
+
+@router.get("/{party_id}/members", response_model=PartyMembersOut)
+async def list_party_members(
+    party_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """파티 멤버 목록(리더 포함). 강퇴/위임 모달에서 사용. 현재 유저가 멤버 또는 리더여야 함."""
+    party = await _load_party_with_members(db, party_id)
+
+    is_leader = (party.leader_id == current_user.id)
+    is_member = any(_is_active_member(m) and m.user_id == current_user.id for m in party.members)
+    if not (is_leader or is_member):
+        raise HTTPException(status_code=403, detail="파티에 속해있지 않습니다.")
+
+    out: list[PartyMemberOut] = []
+    # 리더 먼저
+    if party.host:
+        out.append(PartyMemberOut(
+            user_id=party.leader_id,
+            nickname=party.host.nickname,
+            role="leader",
+            is_current_user=(party.leader_id == current_user.id),
+        ))
+    for m in party.members:
+        if not _is_active_member(m):
+            continue
+        if m.user_id == party.leader_id:
+            continue  # 중복 방지
+        out.append(PartyMemberOut(
+            user_id=m.user_id,
+            nickname=m.user.nickname if m.user else None,
+            role=m.role or "member",
+            is_current_user=(m.user_id == current_user.id),
+        ))
+    return PartyMembersOut(members=out)
+
+
+@router.post("/{party_id}/leave", response_model=MessageOut)
+async def leave_party(
+    party_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """파티 탈퇴. 리더는 반드시 리더 위임 후 탈퇴 가능."""
+    party = await _load_party_with_members(db, party_id)
+
+    if party.leader_id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="리더는 먼저 리더 위임 후 탈퇴할 수 있습니다.",
+        )
+
+    member = next(
+        (m for m in party.members if m.user_id == current_user.id and _is_active_member(m)),
+        None,
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="이 파티에 속해있지 않습니다.")
+
+    try:
+        member.status = "left"
+        member.left_at = func.now()
+        party.current_members = max(0, _party_member_count(party) - 1)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error leaving party: {e}")
+        raise HTTPException(status_code=500, detail="파티 탈퇴 처리 중 오류가 발생했습니다.")
+
+    return MessageOut(message="파티에서 탈퇴했습니다.")
+
+
+@router.delete("/{party_id}/members/{user_id}", response_model=MessageOut)
+async def kick_member(
+    party_id: uuid.UUID,
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """참여자 강퇴. 리더만 호출 가능. 본인 강퇴 불가."""
+    party = await _load_party_with_members(db, party_id)
+
+    if party.leader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리더만 강퇴할 수 있습니다.")
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="자기 자신은 강퇴할 수 없습니다.")
+    if user_id == party.leader_id:
+        raise HTTPException(status_code=400, detail="리더는 강퇴할 수 없습니다.")
+
+    target = next(
+        (m for m in party.members if m.user_id == user_id and _is_active_member(m)),
+        None,
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="대상 멤버를 찾을 수 없습니다.")
+
+    try:
+        target.status = "kicked"
+        target.left_at = func.now()
+        party.current_members = max(0, _party_member_count(party) - 1)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error kicking member: {e}")
+        raise HTTPException(status_code=500, detail="강퇴 처리 중 오류가 발생했습니다.")
+
+    return MessageOut(message="멤버를 강퇴했습니다.")
+
+
+@router.post("/{party_id}/transfer-leader", response_model=MessageOut)
+async def transfer_leader(
+    party_id: uuid.UUID,
+    body: TransferLeaderRequest,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """리더 위임. 현재 리더만 호출 가능. 대상은 active 멤버여야 함."""
+    party = await _load_party_with_members(db, party_id)
+
+    if party.leader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리더만 위임할 수 있습니다.")
+    if body.new_leader_user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="자기 자신에게 위임할 수 없습니다.")
+
+    target = next(
+        (m for m in party.members
+         if m.user_id == body.new_leader_user_id and _is_active_member(m)),
+        None,
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="대상 멤버를 찾을 수 없습니다.")
+
+    try:
+        # 기존 리더를 party_members에 member로 편입 (없으면 새로 삽입)
+        old_leader_row = next(
+            (m for m in party.members if m.user_id == current_user.id),
+            None,
+        )
+        if old_leader_row is None:
+            db.add(PartyMember(
+                party_id=party.id,
+                user_id=current_user.id,
+                role="member",
+                status="active",
+            ))
+        else:
+            old_leader_row.role = "member"
+            old_leader_row.status = "active"
+            old_leader_row.left_at = None
+
+        # 새 리더 지정
+        target.role = "leader"
+        party.leader_id = body.new_leader_user_id
+
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error transferring leader: {e}")
+        raise HTTPException(status_code=500, detail="리더 위임 처리 중 오류가 발생했습니다.")
+
+    return MessageOut(message="리더를 위임했습니다.")
+
+
+# =====================================================================
+# v3: 파티 신청 승인/거절 (리더 전용)
+# =====================================================================
+
+@router.get("/{party_id}/applications", response_model=PartyMembersOut)
+async def list_applications(
+    party_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """대기 중인 파티 신청자 목록 조회 (리더 전용)."""
+    party = await _load_party_with_members(db, party_id)
+    if party.leader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리더만 조회할 수 있습니다.")
+
+    items = [
+        PartyMemberOut(
+            user_id=m.user_id,
+            nickname=(m.user.nickname if m.user else None),
+            role=m.role or "member",
+            is_current_user=False,
+        )
+        for m in party.members
+        if (m.status or "").lower() == "pending"
+    ]
+    return PartyMembersOut(members=items)
+
+
+@router.post("/{party_id}/applications/{user_id}/approve", response_model=MessageOut)
+async def approve_application(
+    party_id: uuid.UUID,
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """참여 신청 승인 — status='active', current_members++"""
+    party = await _load_party_with_members(db, party_id)
+    if party.leader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리더만 승인할 수 있습니다.")
+
+    target = next(
+        (m for m in party.members
+         if m.user_id == user_id and (m.status or "").lower() == "pending"),
+        None,
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="대기 중인 신청을 찾을 수 없습니다.")
+
+    current_count = party.current_members or 0
+    if current_count >= (party.max_members or 0):
+        raise HTTPException(status_code=400, detail="파티 정원이 가득 차서 승인할 수 없습니다.")
+
+    try:
+        target.status = "active"
+        target.leader_review_status = "approved"
+        target.approved_at = func.now()
+        target.rejected_at = None
+        party.current_members = current_count + 1
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error approving application: {e}")
+        raise HTTPException(status_code=500, detail="승인 처리 중 오류가 발생했습니다.")
+
+    return MessageOut(message="신청을 승인했습니다.")
+
+
+@router.post("/{party_id}/applications/{user_id}/reject", response_model=MessageOut)
+async def reject_application(
+    party_id: uuid.UUID,
+    user_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """참여 신청 거절 — status='rejected'. current_members 변경 없음."""
+    party = await _load_party_with_members(db, party_id)
+    if party.leader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="리더만 거절할 수 있습니다.")
+
+    target = next(
+        (m for m in party.members
+         if m.user_id == user_id and (m.status or "").lower() == "pending"),
+        None,
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="대기 중인 신청을 찾을 수 없습니다.")
+
+    try:
+        target.status = "rejected"
+        target.leader_review_status = "rejected"
+        target.rejected_at = func.now()
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error rejecting application: {e}")
+        raise HTTPException(status_code=500, detail="거절 처리 중 오류가 발생했습니다.")
+
+    return MessageOut(message="신청을 거절했습니다.")

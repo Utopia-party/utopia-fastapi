@@ -51,6 +51,14 @@ class PartyMember(Base):
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     left_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # 승인 플로우 / 빠른매칭 관련 컬럼
+    join_type: Mapped[str | None] = mapped_column(String(20))  # 'apply' | 'match' | 'direct'
+    match_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    leader_review_status: Mapped[str | None] = mapped_column(String(20))  # 'pending' | 'approved' | 'rejected'
+    matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     party: Mapped["Party"] = relationship("Party", back_populates="members")
     user: Mapped["User"] = relationship("User", back_populates="party_members")
 
