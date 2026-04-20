@@ -2,7 +2,7 @@ import json
 import asyncio
 import uuid
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -13,24 +13,24 @@ from core.database import get_db, AsyncSessionLocal
 from models.party import Party, PartyMember, PartyChat, Service
 from models.user import User
 from services.mypage.profile_service import _build_profile_image_url
- 
+
 router = APIRouter(prefix="/chat", tags=["chat"])
- 
+
 # Redis 클라이언트 설정
 redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
- 
+
 REDIS_TTL = 60 * 60 * 24 * 3
 OLLAMA_URL = settings.OLLAMA_URL
 OLLAMA_MODEL = settings.OLLAMA_MODEL
- 
- 
+
+
 # Redis 키 생성 함수들
 def warn_key(party_id: str, user_id: str) -> str:
     return f"warn:{party_id}:{user_id}"
- 
+
 def redis_msg_key(party_id: str) -> str:
     return f"chat:party:{party_id}:messages"
- 
+
 def blocked_key(party_id: str, user_id: str) -> str:
     return f"blocked:{party_id}:{user_id}"
 
@@ -96,8 +96,8 @@ def _serialize_member(
         "profile_image": _safe_profile_image_url(user.profile_image_key),
         "is_active": bool(user.is_active),
     }
- 
- 
+
+
 # 메시지 필터링 (Ollama 연동)
 async def check_message(content: str) -> dict:
     prompt = f"""채팅 메시지에 욕설, 비속어, 혐오 표현이 있는지 판단하세요.
@@ -125,24 +125,24 @@ JSON으로만 응답하세요:
             }
     except Exception:
         return {"violation": False, "severe": False, "reason": ""}
- 
- 
+
+
 # 웹소켓 연결 관리 클래스
 class ConnectionManager:
     def __init__(self):
         self.active: dict[str, list[WebSocket]] = {}
- 
+
     async def connect(self, party_id: str, ws: WebSocket):
         await ws.accept()
         self.active.setdefault(party_id, []).append(ws)
- 
+
     def disconnect(self, party_id: str, ws: WebSocket):
         if party_id in self.active:
             try:
                 self.active[party_id].remove(ws)
             except ValueError:
                 pass
- 
+
     async def broadcast(self, party_id: str, message: dict):
         msg_str = json.dumps(message, ensure_ascii=False)
         if party_id in self.active:
@@ -151,17 +151,17 @@ class ConnectionManager:
                     await ws.send_text(msg_str)
                 except Exception:
                     self.disconnect(party_id, ws)
- 
+
     async def send_personal(self, ws: WebSocket, message: dict):
         try:
             await ws.send_text(json.dumps(message, ensure_ascii=False))
         except Exception:
             pass
- 
- 
+
+
 manager = ConnectionManager()
- 
- 
+
+
 # 백그라운드 모더레이션 로직
 async def moderate_in_background(party_id: str, user_id: str, content: str, ws: WebSocket):
     moderation = await check_message(content)
@@ -170,13 +170,13 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         await manager.send_personal(ws, {
             "type": "error",
             "content": f"🚫 심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
-            "created_at": datetime.now().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await redis_client.rpop(redis_msg_key(party_id))
         await manager.broadcast(party_id, {
             "type": "system",
             "content": "부적절한 메시지가 삭제되었습니다.",
-            "created_at": datetime.now().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
     elif moderation["violation"]:
         key = warn_key(party_id, user_id)
@@ -187,10 +187,10 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
             await manager.send_personal(ws, {"type": "error", "content": "🚫 경고 3회 누적으로 채팅이 차단되었습니다."})
         else:
             await manager.send_personal(ws, {"type": "warning", "content": f"⚠️ 경고 {warn_count}/3회: 부적절한 표현 감지."})
- 
- 
+
+
 # ── 일반 API 엔드포인트 ──────────────────────────────────────
- 
+
 @router.get("/parties/{party_id}/messages")
 async def get_messages(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     cached = await redis_client.lrange(redis_msg_key(str(party_id)), 0, -1)
@@ -208,8 +208,8 @@ async def get_messages(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     )
     rows = result.all()
     return [_serialize_message(chat, sender) for chat, sender in reversed(rows)]
- 
- 
+
+
 @router.get("/parties/{party_id}/info")
 async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     party_result = await db.execute(
@@ -275,10 +275,10 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         "host_nickname": party.host.nickname if party.host else None,
         "members": members,
     }
- 
- 
+
+
 # ── 웹소켓 메인 핸들러 ────────────────────────────────────────
- 
+
 @router.websocket("/ws/{party_id}")
 async def websocket_chat(
     party_id: str,
@@ -289,25 +289,19 @@ async def websocket_chat(
     safe_user_id = user_id
     if user_id == "undefined" or not user_id:
         safe_user_id = "guest"
- 
+
     await manager.connect(party_id, ws)
- 
+
     try:
-        await manager.broadcast(party_id, {
-            "type": "system",
-            "content": f"{nickname}님이 입장했습니다.",
-            "created_at": datetime.now().isoformat(),
-        })
- 
         while True:
             data = await ws.receive_text()
- 
+
             is_blocked = await redis_client.get(blocked_key(party_id, safe_user_id))
             if is_blocked:
                 await manager.send_personal(ws, {"type": "error", "content": "채팅이 차단되어 보낼 수 없습니다."})
                 continue
- 
-            now = datetime.now().isoformat()
+
+            now = datetime.now(timezone.utc).isoformat()  
             message = {
                 "type": "message",
                 "party_id": party_id,
@@ -316,12 +310,12 @@ async def websocket_chat(
                 "content": data,
                 "created_at": now,
             }
- 
+
             key = redis_msg_key(party_id)
             await redis_client.rpush(key, json.dumps(message, ensure_ascii=False))
             await redis_client.ltrim(key, -200, -1)
             await redis_client.expire(key, REDIS_TTL)
- 
+
             try:
                 async with AsyncSessionLocal() as db:
                     sender_uuid = None
@@ -329,7 +323,7 @@ async def websocket_chat(
                         sender_uuid = uuid.UUID(safe_user_id)
                     except (ValueError, TypeError):
                         sender_uuid = None
- 
+
                     new_chat = PartyChat(
                         party_id=uuid.UUID(party_id),
                         sender_id=sender_uuid,
@@ -339,17 +333,12 @@ async def websocket_chat(
                     await db.commit()
             except Exception as db_err:
                 print(f"[DB ERROR] {db_err}")
- 
+
             await manager.broadcast(party_id, message)
             asyncio.create_task(moderate_in_background(party_id, safe_user_id, data, ws))
- 
+
     except WebSocketDisconnect:
         manager.disconnect(party_id, ws)
-        await manager.broadcast(party_id, {
-            "type": "system",
-            "content": f"{nickname}님이 퇴장했습니다.",
-            "created_at": datetime.now().isoformat(),
-        })
     except Exception as e:
         print(f"[WS_FATAL_ERROR] {e}")
         manager.disconnect(party_id, ws)
