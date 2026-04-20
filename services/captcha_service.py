@@ -612,15 +612,17 @@ async def _calculate_scores(
     payload: CaptchaInitRequest,
     request: Request,
     behavior_vector: list[float],
-) -> tuple[float, float, float, float, float, bool]:
-    """md 스펙 비간섭 검증 5겹 점수 계산.
+) -> tuple[float, float, float, float, float, float, float, bool]:
+    """비간섭 검증 5겹 점수 계산 (L5 LSTM 포함).
 
     Returns:
-        (rule_score, vector_score, environment_score, header_score, fingerprint_score, final_score, immediate_block)
+        (rule_score, vector_score, lstm_score, environment_score,
+         header_score, fingerprint_score, final_score, immediate_block)
 
     - 레이어3(룰): 마우스35 + 클릭25 + 타이밍20 + 핑거프린트20
     - 레이어4(벡터 KNN): pgvector 코사인 Top-5 → human_ratio 기반 점수
-    - 최종: rule×0.5 + vector×0.5  (md 스펙)
+    - 레이어5(LSTM): 마우스 시계열 궤적 → bot 확률 → 1-bot_prob로 사람 점수 변환
+    - 최종: shadow 모드면 rule+KNN만, 해제 시 rule×0.3 + KNN×0.2 + LSTM×0.5
     - 레이어1·2는 즉시 차단 게이트 역할 (점수에 직접 합산하지 않음)
     """
     mouse_score = _calculate_mouse_score(payload)
@@ -628,7 +630,7 @@ async def _calculate_scores(
     timing_score = _calculate_timing_score(payload)
     fingerprint_score = _calculate_fingerprint_score(payload)
 
-    # 레이어3: 룰 기반 점수 (md 스펙 가중치 복구)
+    # 레이어3: 룰 기반 점수
     rule_score = _clamp(
         (mouse_score * 0.35)
         + (click_score * 0.25)
@@ -640,27 +642,63 @@ async def _calculate_scores(
     similar = await _search_similar_behaviors(behavior_vector, top_k=5)
     vector_score = await _calculate_vector_score(similar)
 
+    # 레이어5: LSTM 시계열 분석
+    lstm_score = 0.5  # 기본값 (중립)
+    lstm_available = False
+    if getattr(settings, "LSTM_ENABLED", False):
+        try:
+            from lstm_inference import predict_bot_probability
+            # mouse_moves를 dict 리스트로 변환 (Pydantic → dict)
+            moves_raw = [{"x": m.x, "y": m.y, "t": m.t} for m in payload.mouse_moves]
+            bot_prob, lstm_available = await predict_bot_probability(moves_raw)
+            # bot_prob는 0=사람, 1=봇이므로 반전시켜서 "높을수록 사람" 스케일로 통일
+            lstm_score = _clamp(1.0 - bot_prob)
+        except Exception as e:
+            logger.warning(f"[LSTM] 호출 실패, fallback 사용: {e}")
+
     # 레이어1·2: 환경/헤더 게이트 (즉시 차단만, 최종 점수엔 직접 반영 X)
     environment_score, env_block = _evaluate_environment(payload)
     header_score, header_block = _evaluate_headers(request)
 
-    # md 스펙: 룰×0.5 + 벡터×0.5
-    # Cold Start 보호: 벡터 데이터가 부족하면 룰 가중치를 높여 중립 값에 휩쓸리지 않게.
+    # ── final_score 합산 ──
+    is_shadow = getattr(settings, "LSTM_SHADOW_MODE", True)
     sample_size = len(similar)
-    if sample_size >= 5:
-        vector_weight = 0.5
-    elif sample_size >= 3:
-        vector_weight = 0.3
-    else:
-        vector_weight = 0.1  # 초기: 룰 기반에 거의 의존
-    final_score = _clamp(
-        (rule_score * (1.0 - vector_weight)) + (vector_score * vector_weight)
-    )
 
+    if not is_shadow and lstm_available:
+        # LSTM 활성 모드: rule 30% + KNN 20% + LSTM 50%
+        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.5)
+        # KNN Cold Start 보호: 데이터 부족 시 KNN 비중을 rule로 이전
+        if sample_size >= 5:
+            knn_weight = 0.2
+        elif sample_size >= 3:
+            knn_weight = 0.1
+        else:
+            knn_weight = 0.0  # KNN 데이터 없으면 rule에 의존
+        rule_weight = 1.0 - lstm_weight - knn_weight
+        final_score = _clamp(
+            (rule_score * rule_weight)
+            + (vector_score * knn_weight)
+            + (lstm_score * lstm_weight)
+        )
+    else:
+        # Shadow 모드 또는 LSTM 미사용: 기존 rule + KNN만
+        if sample_size >= 5:
+            vector_weight = 0.5
+        elif sample_size >= 3:
+            vector_weight = 0.3
+        else:
+            vector_weight = 0.1
+        final_score = _clamp(
+            (rule_score * (1.0 - vector_weight)) + (vector_score * vector_weight)
+        )
+
+    # Shadow 모드일 때 LSTM 점수를 로그에 남겨서 비교 분석 가능하게
+    shadow_tag = " [SHADOW]" if is_shadow and lstm_available else ""
     logger.info(
         f"[captcha.score] mouse={mouse_score:.2f} click={click_score:.2f} "
         f"timing={timing_score:.2f} fp={fingerprint_score:.2f} "
         f"rule={rule_score:.2f} vector={vector_score:.2f}(n={sample_size}) "
+        f"lstm={lstm_score:.2f}(avail={lstm_available}){shadow_tag} "
         f"env={environment_score:.2f} hdr={header_score:.2f} "
         f"final={final_score:.2f}"
     )
@@ -668,6 +706,7 @@ async def _calculate_scores(
     return (
         rule_score,
         vector_score,
+        lstm_score,
         environment_score,
         header_score,
         fingerprint_score,
@@ -1032,6 +1071,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
     (
         rule_score,
         vector_score,
+        lstm_score,
         environment_score,
         header_score,
         fingerprint_score,
@@ -1052,7 +1092,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
-            final_score=final_score, status_result="block",
+            lstm_score=lstm_score, final_score=final_score, status_result="block",
             behavior_vector=behavior_vector, behavior_label=block_label,
         ))
         _bg(_save_bot_signature(
@@ -1079,7 +1119,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
             session_id=pass_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
-            final_score=final_score, status_result="pass",
+            lstm_score=lstm_score, final_score=final_score, status_result="pass",
             behavior_vector=behavior_vector, behavior_label=pass_label,
         ))
         return CaptchaInitResponse(status="pass", token=token)
@@ -1097,7 +1137,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
             session_id=block_session_id, trigger_type=payload.trigger_type,
             captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
             behavior_score=rule_score, vector_score=vector_score,
-            final_score=final_score, status_result="block",
+            lstm_score=lstm_score, final_score=final_score, status_result="block",
             behavior_vector=behavior_vector, behavior_label=low_label,
         ))
         _bg(_save_bot_signature(
@@ -1135,7 +1175,7 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
         session_id=session_id, trigger_type=payload.trigger_type,
         captcha_set_id=None, client_ip=client_ip, fingerprint_hash=fp_hash,
         behavior_score=rule_score, vector_score=vector_score,
-        final_score=final_score, status_result="challenge",
+        lstm_score=lstm_score, final_score=final_score, status_result="challenge",
         behavior_vector=behavior_vector, behavior_label="unknown",
     ))
 
@@ -1605,6 +1645,7 @@ async def _save_session_then_embedding(
     fingerprint_hash: str,
     behavior_score: float,   # 레이어3 룰 점수
     vector_score: float,     # 레이어4 KNN 점수
+    lstm_score: float | None = None,  # 레이어5 LSTM 점수
     final_score: float,
     status_result: str,
     behavior_vector: list[float],
@@ -1622,6 +1663,7 @@ async def _save_session_then_embedding(
         fingerprint_hash=fingerprint_hash,
         behavior_score=behavior_score,
         vector_score=vector_score,
+        lstm_score=lstm_score,
         final_score=final_score,
         status_result=status_result,
     )
@@ -1641,8 +1683,9 @@ async def _save_captcha_session_to_db(
     fingerprint_hash: str,
     behavior_score: float,       # 레이어3 룰 점수
     vector_score: float,         # 레이어4 KNN 점수
-    final_score: float,
-    status_result: str,          # pass / challenge / block
+    lstm_score: float | None = None,  # 레이어5 LSTM 점수
+    final_score: float = 0.0,
+    status_result: str = "unknown",   # pass / challenge / block
     attempt_count: int = 0,
     solve_time_ms: int | None = None,
     is_correct: bool | None = None,
@@ -1655,12 +1698,12 @@ async def _save_captcha_session_to_db(
             await db.execute(text("""
                 INSERT INTO captcha_sessions (
                     id, trigger_type, captcha_set_id, client_ip,
-                    behavior_score, vector_score,
+                    behavior_score, vector_score, lstm_score,
                     final_score, status, attempt_count, solve_time_ms,
                     is_correct
                 ) VALUES (
                     :id, :trigger_type, :captcha_set_id, CAST(:client_ip AS inet),
-                    :behavior_score, :vector_score,
+                    :behavior_score, :vector_score, :lstm_score,
                     :final_score, :status, :attempt_count, :solve_time_ms,
                     :is_correct
                 )
@@ -1670,7 +1713,8 @@ async def _save_captcha_session_to_db(
                 "captcha_set_id": captcha_set_id,
                 "client_ip": client_ip if client_ip != "unknown" else "0.0.0.0",
                 "behavior_score": round(behavior_score, 4),
-                "vector_score": round(vector_score, 4),  # ← 버그 수정: 실제 KNN 점수 저장
+                "vector_score": round(vector_score, 4),
+                "lstm_score": round(lstm_score, 4) if lstm_score is not None else None,
                 "final_score": round(final_score, 4),
                 "status": status_result,
                 "attempt_count": attempt_count,

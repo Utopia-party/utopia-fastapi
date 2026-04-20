@@ -57,7 +57,10 @@ class Settings(BaseSettings):
     CAPTCHA_RATE_LIMIT_WINDOW_SECONDS: int = 60
     CAPTCHA_RATE_LIMIT_MAX_REQUESTS: int = 10
     CAPTCHA_MIN_SOLVE_SECONDS: float = 0.8
-
+    # LSTM
+    LSTM_ENABLED: bool = True
+    LSTM_SHADOW_MODE: bool = True    # True면 로그만, final_score 미반영
+    LSTM_WEIGHT: float = 0.5         # shadow 해제 후: rule 0.3 + KNN 0.2 + LSTM 0.5
     # MinIO
     MINIO_ENDPOINT: str
     MINIO_ACCESS_KEY: str
