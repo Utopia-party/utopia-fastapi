@@ -1,4 +1,5 @@
 import uuid
+from datetime import date, datetime
 from typing import Optional, List
 
 from pydantic import BaseModel, Field
@@ -51,6 +52,11 @@ class PartyOut(BaseModel):
     # 현재 로그인 유저의 해당 파티 참여 상태
     # None | 'pending' | 'active' | 'kicked' | 'left' | 'rejected' | 'leader'
     my_member_status: Optional[str] = None
+    # 추가 필드
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    min_trust_score: Optional[float] = None
+    created_at: Optional[datetime] = None
     model_config = {"from_attributes": True}
 
 

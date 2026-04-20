@@ -101,6 +101,10 @@ def _build_party_out(
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         is_joined=is_joined,
         my_member_status=my_member_status,
+        start_date=party.start_date,
+        end_date=party.end_date,
+        min_trust_score=party.min_trust_score,
+        created_at=party.created_at,
     )
 
 
