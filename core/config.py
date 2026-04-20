@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     NAVER_CLIENT_SECRET: str = ""
     NAVER_REDIRECT_URI: str = ""
 
+    # 포트원
+    PORTONE_API_SECRET: str = ""
+
     class Config:
         env_file = ".env"
 
