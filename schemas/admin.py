@@ -14,6 +14,8 @@ class DashboardMetricOut(BaseModel):
     label: str
     value: str
     helper: str
+    delta: str | None = None
+    trend: str | None = None
 
 
 class DashboardSummaryRowOut(BaseModel):
@@ -21,11 +23,39 @@ class DashboardSummaryRowOut(BaseModel):
     value: str
 
 
+class DashboardSeriesPointOut(BaseModel):
+    label: str
+    current: int
+    comparison: int
+
+
+class DashboardChartOut(BaseModel):
+    id: str
+    label: str
+    description: str
+    unit: str
+    points: list[DashboardSeriesPointOut]
+
+
+class DashboardRecentActivityOut(BaseModel):
+    timestamp: str
+    title: str
+    description: str
+
+
 class AdminDashboardOut(BaseModel):
     metrics: list[DashboardMetricOut]
     member_stats: list[DashboardSummaryRowOut]
     sales_stats: list[DashboardSummaryRowOut]
     today_summary: str
+    period_label: str
+    comparison_label: str
+    compare_mode: str
+    range_start: str
+    range_end: str
+    chart_points: list[DashboardSeriesPointOut]
+    chart_groups: list[DashboardChartOut]
+    recent_activities: list[DashboardRecentActivityOut]
 
 
 class AdminRoleRecordOut(BaseModel):
@@ -102,7 +132,7 @@ class AdminUserRecordOut(BaseModel):
     status: str
     reportCount: int
     partyCount: int
-    trustScore: int
+    trustScore: float
     lastActive: str
 
 
@@ -114,7 +144,7 @@ class AdminUserDetailOut(BaseModel):
     phone: str | None = None
     role: str
     status: str
-    trustScore: int
+    trustScore: float
     reportCount: int
     partyCount: int
     createdAt: str | None = None
@@ -130,6 +160,7 @@ class AdminPartyRecordOut(BaseModel):
     id: str
     title: str
     service: str
+    category: str
     leaderId: str
     memberCount: int
     status: str
@@ -168,7 +199,9 @@ class ReceiptRecordOut(BaseModel):
 class SettlementRecordOut(BaseModel):
     id: str
     partyId: str
+    partyName: str
     leaderId: str
+    leaderName: str
     totalAmount: int
     memberCount: int
     billingMonth: str

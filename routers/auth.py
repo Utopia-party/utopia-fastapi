@@ -73,6 +73,7 @@ class SocialSignupBody(BaseModel):
     oauth: str
     oauth_id: str
     email: Optional[str] = None
+    name: Optional[str] = None
     nickname: str
     phone: Optional[str] = None
 
@@ -173,6 +174,7 @@ async def me(
         "user": {
             "user_id": str(user.id),
             "email": user.email,
+            "name": user.name,
             "nickname": user.nickname,
             "provider": user.provider,
             "role": user.role,
@@ -215,18 +217,19 @@ def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     if oauth == "google":
         token = get_google_access_token(code)
         info = get_google_user_info(token)
-        return str(info.get("sub")), info.get("email")
+        return str(info.get("sub")), info.get("email"), info.get("name")
     elif oauth == "kakao":
         token = get_kakao_access_token(code)
         info = get_kakao_user_info(token)
         account = info.get("kakao_account", {}) or {}
-        return str(info.get("id")), account.get("email")
+        profile = account.get("profile", {}) or {}
+        return str(info.get("id")), account.get("email"), profile.get("nickname")
     elif oauth == "naver":
         if not state:
             raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
         token = get_naver_access_token(code, state)
         info = get_naver_user_info(token)
-        return str(info.get("id")), info.get("email")
+        return str(info.get("id")), info.get("email"), info.get("name") or info.get("nickname")
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
 
@@ -237,13 +240,17 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
     code = data.code
     state = data.state
 
-    oauth_id, email = get_oauth_user_info(oauth, code, state)
+    oauth_id, email, name = get_oauth_user_info(oauth, code, state)
 
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     user = result.scalar_one_or_none()
     if user:
         if not user.is_active:
             raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
+        if not (user.name or "").strip():
+            user.name = (name or user.nickname or "").strip() or None
+            await db.commit()
+            await db.refresh(user)
         await issue_tokens_and_save(response, db, user)
         return {
             "status": "LOGIN_SUCCESS",
@@ -259,6 +266,8 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
                 raise HTTPException(status_code=400, detail="이미 다른 소셜 계정에 연결된 이메일입니다.")
             email_user.provider = oauth
             email_user.provider_id = oauth_id
+            if not (email_user.name or "").strip():
+                email_user.name = (name or email_user.nickname or "").strip() or None
             await db.commit()
             await db.refresh(email_user)
             await issue_tokens_and_save(response, db, email_user)
@@ -268,7 +277,13 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
                 "user": {"email": email_user.email, "nickname": email_user.nickname},
             }
 
-    return {"status": "NEED_NICKNAME", "oauth": oauth, "oauth_id": oauth_id, "email": email}
+    return {
+        "status": "NEED_NICKNAME",
+        "oauth": oauth,
+        "oauth_id": oauth_id,
+        "email": email,
+        "name": name,
+    }
 
 
 @router.post("/auth/social/signup")
@@ -276,6 +291,7 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
     oauth = data.oauth.lower().strip()
     oauth_id = data.oauth_id
     email = data.email
+    name = (data.name or "").strip()
     nickname = data.nickname.strip()
     phone = data.phone
 
@@ -302,6 +318,7 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
 
     user = User(
         email=email,
+        name=name or nickname,
         nickname=nickname,
         provider=oauth,
         provider_id=oauth_id,

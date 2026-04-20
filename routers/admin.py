@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -22,13 +22,15 @@ from models.admin import (
 from models.report import Report
 
 from models.notification import Notification
-from models.party import Party, PartyMember, Service
+from models.party import Party, PartyChat, PartyMember, Service
 from models.user import User
 from schemas.admin import (
     AdminDashboardOut,
     AdminPartyActionIn,
     AdminPartyRecordOut,
     AdminPermissionOut,
+    DashboardChartOut,
+    DashboardRecentActivityOut,
     AdminRoleRecordOut,
     AdminRoleUpdateIn,
     AdminServiceRecordOut,
@@ -38,6 +40,7 @@ from schemas.admin import (
     AdminUserDetailOut,
     AdminUserRecordOut,
     AdminUserStatusUpdateIn,
+    DashboardSeriesPointOut,
     ReceiptRecordOut,
     ReportRecordOut,
     SettlementRecordOut,
@@ -85,6 +88,80 @@ def _to_int(value: Decimal | int | float | None) -> int:
     if isinstance(value, Decimal):
         return int(float(value))
     return int(value)
+
+
+def _utc_day_start(value: date) -> datetime:
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+def _date_range_bounds(
+    date_from: date | None,
+    date_to: date | None,
+) -> tuple[datetime | None, datetime | None]:
+    dt_from = _utc_day_start(date_from) if date_from else None
+    dt_to = (_utc_day_start(date_to) + timedelta(days=1)) if date_to else None
+    return dt_from, dt_to
+
+
+def _format_change(current: int | float, comparison: int | float, suffix: str = "%") -> tuple[str, str]:
+    if comparison == 0:
+        if current == 0:
+            return "변동 없음", "flat"
+        return "비교 기준 없음", "up"
+
+    change_rate = ((current - comparison) / comparison) * 100
+    if abs(change_rate) < 0.05:
+        return "변동 없음", "flat"
+    direction = "up" if change_rate > 0 else "down"
+    return f"{change_rate:+.1f}{suffix}", direction
+
+
+def _bucket_labels(
+    start_date: date,
+    end_date: date,
+) -> tuple[list[date], str]:
+    total_days = (end_date - start_date).days + 1
+    if total_days <= 31:
+        return [start_date + timedelta(days=offset) for offset in range(total_days)], "day"
+
+    month_starts: list[date] = []
+    cursor = date(start_date.year, start_date.month, 1)
+    last = date(end_date.year, end_date.month, 1)
+    while cursor <= last:
+        month_starts.append(cursor)
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+    return month_starts, "month"
+
+
+def _shift_comparison_range(
+    start_date: date,
+    end_date: date,
+    compare_mode: str,
+) -> tuple[date, date]:
+    if compare_mode == "year_over_year":
+        def shift_one_year(value: date) -> date:
+            try:
+                return date(value.year - 1, value.month, value.day)
+            except ValueError:
+                if value.month == 2 and value.day == 29:
+                    return date(value.year - 1, 2, 28)
+                raise
+
+        return shift_one_year(start_date), shift_one_year(end_date)
+
+    span_days = (end_date - start_date).days + 1
+    comparison_end = start_date - timedelta(days=1)
+    comparison_start = comparison_end - timedelta(days=span_days - 1)
+    return comparison_start, comparison_end
+
+
+def _series_label(value: date, bucket_mode: str) -> str:
+    if bucket_mode == "day":
+        return value.strftime("%m/%d")
+    return value.strftime("%Y-%m")
 
 
 def _user_display_name(user: User | None) -> str:
@@ -139,7 +216,8 @@ def _user_status_label(user: User, report_count: int, manual_status: str | None 
         return "정지"
     if manual_status in {"정상", "주의"}:
         return manual_status
-    if _to_int(user.trust_score) < 75 or report_count >= 2:
+    trust_score = float(user.trust_score) if user.trust_score is not None else 36.5
+    if trust_score < 36.5 or report_count >= 2:
         return "주의"
     return "정상"
 
@@ -365,6 +443,60 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
     )
 
 
+async def _report_target_display_map(
+    db: AsyncSession,
+    reports: list[Report],
+) -> dict[tuple[str, Any], str]:
+    display_map: dict[tuple[str, Any], str] = {}
+    user_ids = {report.target_id for report in reports if report.target_type.lower() == "user"}
+    party_ids = {report.target_id for report in reports if report.target_type.lower() in {"party", "chat"}}
+    chat_ids = {report.target_id for report in reports if report.target_type.lower() == "chat"}
+
+    users_by_id: dict[Any, User] = {}
+    parties_by_id: dict[Any, Party] = {}
+    chats_by_id: dict[Any, PartyChat] = {}
+
+    if user_ids:
+        user_rows = (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
+        users_by_id = {user.id: user for user in user_rows}
+    if party_ids:
+        party_rows = (await db.execute(select(Party).where(Party.id.in_(party_ids)))).scalars().all()
+        parties_by_id = {party.id: party for party in party_rows}
+    if chat_ids:
+        chat_rows = (await db.execute(select(PartyChat).where(PartyChat.id.in_(chat_ids)))).scalars().all()
+        chats_by_id = {chat.id: chat for chat in chat_rows}
+        sender_ids = {chat.sender_id for chat in chat_rows if chat.sender_id is not None}
+        missing_user_ids = sender_ids - set(users_by_id.keys())
+        if missing_user_ids:
+            sender_rows = (
+                await db.execute(select(User).where(User.id.in_(missing_user_ids)))
+            ).scalars().all()
+            users_by_id.update({user.id: user for user in sender_rows})
+
+    for report in reports:
+        target_type = report.target_type.lower()
+        display_name = report.target_snapshot_name
+
+        if target_type == "user":
+            target_user = users_by_id.get(report.target_id)
+            display_name = display_name or _user_display_name(target_user)
+        elif target_type == "party":
+            target_party = parties_by_id.get(report.target_id)
+            display_name = display_name or (target_party.title if target_party else None)
+        elif target_type == "chat":
+            target_chat = chats_by_id.get(report.target_id)
+            if target_chat:
+                target_party = parties_by_id.get(target_chat.party_id)
+                sender = users_by_id.get(target_chat.sender_id)
+                chat_label = sender.nickname if sender else "채팅 사용자"
+                party_label = target_party.title if target_party else "파티 채팅"
+                display_name = display_name or f"{party_label} / {chat_label}"
+
+        display_map[(target_type, report.target_id)] = display_name or str(report.target_id)
+
+    return display_map
+
+
 def _assert_admin_permission(
     admin: AdminContext,
     permission_name: str,
@@ -491,19 +623,78 @@ async def require_admin_role_permission(
 async def get_admin_dashboard(
     _: AdminContext = Depends(require_admin_context),
     db: AsyncSession = Depends(get_db),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    compare_mode: str = Query(default="previous_period"),
 ):
-    total_users = await db.scalar(select(func.count()).select_from(User)) or 0
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_signups = await db.scalar(
-        select(func.count()).select_from(User).where(User.created_at >= today_start)
-    ) or 0
-    pending_reports = await db.scalar(
-        select(func.count()).select_from(Report).where(func.lower(Report.status) == "pending")
-    ) or 0
-    pending_settlements = await db.scalar(
-        select(func.count()).select_from(Settlement).where(func.lower(Settlement.status) == "pending")
-    ) or 0
+    if compare_mode not in {"previous_period", "year_over_year"}:
+        raise HTTPException(status_code=400, detail="유효하지 않은 비교 기준입니다.")
 
+    today = datetime.now(timezone.utc).date()
+    end_day = date_to or today
+    start_day = date_from or (end_day - timedelta(days=29))
+    if start_day > end_day:
+        raise HTTPException(status_code=400, detail="시작일은 종료일보다 늦을 수 없습니다.")
+
+    current_from, current_to = _date_range_bounds(start_day, end_day)
+    comparison_start_day, comparison_end_day = _shift_comparison_range(
+        start_day,
+        end_day,
+        compare_mode,
+    )
+    comparison_from, comparison_to = _date_range_bounds(
+        comparison_start_day,
+        comparison_end_day,
+    )
+
+    current_users = (
+        await db.execute(
+            select(User).where(User.created_at >= current_from, User.created_at < current_to)
+        )
+    ).scalars().all()
+    comparison_users = (
+        await db.execute(
+            select(User).where(User.created_at >= comparison_from, User.created_at < comparison_to)
+        )
+    ).scalars().all()
+    current_receipts = (
+        await db.execute(
+            select(Receipt).where(Receipt.created_at >= current_from, Receipt.created_at < current_to)
+        )
+    ).scalars().all()
+    comparison_receipts = (
+        await db.execute(
+            select(Receipt).where(Receipt.created_at >= comparison_from, Receipt.created_at < comparison_to)
+        )
+    ).scalars().all()
+    current_reports = (
+        await db.execute(
+            select(Report).where(Report.created_at >= current_from, Report.created_at < current_to)
+        )
+    ).scalars().all()
+    comparison_reports = (
+        await db.execute(
+            select(Report).where(Report.created_at >= comparison_from, Report.created_at < comparison_to)
+        )
+    ).scalars().all()
+    current_settlements = (
+        await db.execute(
+            select(Settlement).where(
+                Settlement.created_at >= current_from,
+                Settlement.created_at < current_to,
+            )
+        )
+    ).scalars().all()
+    comparison_settlements = (
+        await db.execute(
+            select(Settlement).where(
+                Settlement.created_at >= comparison_from,
+                Settlement.created_at < comparison_to,
+            )
+        )
+    ).scalars().all()
+
+    total_users = await db.scalar(select(func.count()).select_from(User)) or 0
     active_users = await db.scalar(
         select(func.count()).select_from(User).where(User.is_active.is_(True))
     ) or 0
@@ -514,54 +705,239 @@ async def get_admin_dashboard(
         select(func.count()).select_from(User).where(func.lower(User.role) == "admin")
     ) or 0
 
-    approved_amount = await db.scalar(
-        select(func.coalesce(func.sum(Receipt.ocr_amount), 0)).where(func.lower(Receipt.status) == "approved")
-    ) or 0
-    pending_amount = await db.scalar(
-        select(func.coalesce(func.sum(Receipt.ocr_amount), 0)).where(func.lower(Receipt.status) == "pending")
-    ) or 0
-    rejected_amount = await db.scalar(
-        select(func.coalesce(func.sum(Receipt.ocr_amount), 0)).where(func.lower(Receipt.status) == "rejected")
-    ) or 0
+    current_signups = len(current_users)
+    comparison_signups = len(comparison_users)
+    current_sales = sum(
+        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "approved"
+    )
+    comparison_sales = sum(
+        receipt.ocr_amount for receipt in comparison_receipts if (receipt.status or "").lower() == "approved"
+    )
+    current_reports_count = len(current_reports)
+    comparison_reports_count = len(comparison_reports)
+    current_pending_settlements = sum(
+        1 for settlement in current_settlements if (settlement.status or "").lower() == "pending"
+    )
+    comparison_pending_settlements = sum(
+        1
+        for settlement in comparison_settlements
+        if (settlement.status or "").lower() == "pending"
+    )
+
+    approved_amount = current_sales
+    pending_amount = sum(
+        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "pending"
+    )
+    rejected_amount = sum(
+        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "rejected"
+    )
+
+    bucket_starts, bucket_mode = _bucket_labels(start_day, end_day)
+    bucket_index = {bucket: idx for idx, bucket in enumerate(bucket_starts)}
+
+    chart_seed = [
+        ("sales", "승인 매출", "승인된 영수증 금액 기준 비교 그래프", "currency"),
+        ("members", "신규 가입", "선택 기간 신규 가입 수 비교 그래프", "count"),
+        ("reports", "신고 접수", "선택 기간 신고 접수 건수 비교 그래프", "count"),
+        ("settlements", "정산 대기", "선택 기간 생성된 대기 정산 비교 그래프", "count"),
+    ]
+    chart_buckets: dict[str, list[DashboardSeriesPointOut]] = {
+        chart_id: [
+            DashboardSeriesPointOut(
+                label=_series_label(bucket, bucket_mode),
+                current=0,
+                comparison=0,
+            )
+            for bucket in bucket_starts
+        ]
+        for chart_id, _, _, _ in chart_seed
+    }
+
+    def _align_bucket(
+        value_date: date,
+        source_start: date,
+    ) -> date:
+        if bucket_mode == "day":
+            return start_day + timedelta(days=(value_date - source_start).days)
+
+        month_offset = (value_date.year - source_start.year) * 12 + (
+            value_date.month - source_start.month
+        )
+        base_month = start_day.month + month_offset
+        year = start_day.year + ((base_month - 1) // 12)
+        month = ((base_month - 1) % 12) + 1
+        return date(year, month, 1)
+
+    def _current_bucket(value_date: date) -> date:
+        if bucket_mode == "day":
+            return start_day + timedelta(days=(value_date - start_day).days)
+        return date(value_date.year, value_date.month, 1)
+
+    for user in current_users:
+        bucket = _current_bucket(user.created_at.astimezone(timezone.utc).date())
+        if bucket in bucket_index:
+            chart_buckets["members"][bucket_index[bucket]].current += 1
+    for user in comparison_users:
+        bucket = _align_bucket(
+            user.created_at.astimezone(timezone.utc).date(),
+            comparison_start_day,
+        )
+        if bucket in bucket_index:
+            chart_buckets["members"][bucket_index[bucket]].comparison += 1
+
+    for report in current_reports:
+        bucket = _current_bucket(report.created_at.astimezone(timezone.utc).date())
+        if bucket in bucket_index:
+            chart_buckets["reports"][bucket_index[bucket]].current += 1
+    for report in comparison_reports:
+        bucket = _align_bucket(
+            report.created_at.astimezone(timezone.utc).date(),
+            comparison_start_day,
+        )
+        if bucket in bucket_index:
+            chart_buckets["reports"][bucket_index[bucket]].comparison += 1
+
+    for settlement in current_settlements:
+        if (settlement.status or "").lower() != "pending":
+            continue
+        bucket = _current_bucket(settlement.created_at.astimezone(timezone.utc).date())
+        if bucket in bucket_index:
+            chart_buckets["settlements"][bucket_index[bucket]].current += 1
+    for settlement in comparison_settlements:
+        if (settlement.status or "").lower() != "pending":
+            continue
+        bucket = _align_bucket(
+            settlement.created_at.astimezone(timezone.utc).date(),
+            comparison_start_day,
+        )
+        if bucket in bucket_index:
+            chart_buckets["settlements"][bucket_index[bucket]].comparison += 1
+
+    for receipt in current_receipts:
+        if (receipt.status or "").lower() != "approved":
+            continue
+        bucket = _current_bucket(receipt.created_at.astimezone(timezone.utc).date())
+        if bucket in bucket_index:
+            chart_buckets["sales"][bucket_index[bucket]].current += receipt.ocr_amount
+
+    for receipt in comparison_receipts:
+        if (receipt.status or "").lower() != "approved":
+            continue
+        bucket = _align_bucket(
+            receipt.created_at.astimezone(timezone.utc).date(),
+            comparison_start_day,
+        )
+        if bucket in bucket_index:
+            chart_buckets["sales"][bucket_index[bucket]].comparison += receipt.ocr_amount
+
+    chart_groups = [
+        DashboardChartOut(
+            id=chart_id,
+            label=label,
+            description=description,
+            unit=unit,
+            points=chart_buckets[chart_id],
+        )
+        for chart_id, label, description, unit in chart_seed
+    ]
+
+    recent_activity_rows = (
+        await db.execute(
+            select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(5)
+        )
+    ).scalars().all()
+    activity_actor_ids = {row.actor_user_id for row in recent_activity_rows if row.actor_user_id is not None}
+    activity_users: dict[Any, User] = {}
+    if activity_actor_ids:
+        user_rows = (
+            await db.execute(select(User).where(User.id.in_(activity_actor_ids)))
+        ).scalars().all()
+        activity_users = {user.id: user for user in user_rows}
+
+    signup_delta, signup_trend = _format_change(current_signups, comparison_signups)
+    sales_delta, sales_trend = _format_change(current_sales, comparison_sales)
+    report_delta, report_trend = _format_change(current_reports_count, comparison_reports_count)
+    settlement_delta, settlement_trend = _format_change(
+        current_pending_settlements,
+        comparison_pending_settlements,
+    )
+    comparison_label = (
+        "전년 동기 비교"
+        if compare_mode == "year_over_year"
+        else "직전 동일 기간 비교"
+    )
 
     return AdminDashboardOut(
         metrics=[
             {
                 "id": "members",
-                "label": "회원 수",
-                "value": f"{total_users:,}",
-                "helper": "현재 운영 중인 전체 회원 기준",
+                "label": "신규 가입",
+                "value": f"{current_signups:,}",
+                "helper": "선택 기간 내 신규 가입 수",
+                "delta": signup_delta,
+                "trend": signup_trend,
             },
             {
-                "id": "today",
-                "label": "오늘 가입",
-                "value": f"+{today_signups}",
-                "helper": "오늘 00:00 이후 가입 완료",
+                "id": "sales",
+                "label": "승인 매출",
+                "value": f"₩ {int(current_sales):,}",
+                "helper": "승인된 영수증 기준 매출 합계",
+                "delta": sales_delta,
+                "trend": sales_trend,
             },
             {
                 "id": "reports",
-                "label": "신고(접수)",
-                "value": f"{pending_reports}",
-                "helper": "실시간 검토 대기 건수",
+                "label": "신고 접수",
+                "value": f"{current_reports_count:,}",
+                "helper": "선택 기간 내 신규 신고 건수",
+                "delta": report_delta,
+                "trend": report_trend,
             },
             {
                 "id": "settlements",
-                "label": "정산 승인 대기",
-                "value": f"{pending_settlements}",
-                "helper": "관리자 승인 대기 상태",
+                "label": "정산 대기",
+                "value": f"{current_pending_settlements:,}",
+                "helper": "선택 기간 내 생성된 대기 정산",
+                "delta": settlement_delta,
+                "trend": settlement_trend,
             },
         ],
         member_stats=[
-            {"label": "활성 사용자(가입)", "value": f"{active_users}"},
-            {"label": "정지 사용자", "value": f"{suspended_users}"},
-            {"label": "관리자 계정", "value": f"{admin_users}"},
+            {"label": "전체 회원", "value": f"{total_users:,}"},
+            {"label": "활성 사용자", "value": f"{active_users:,}"},
+            {"label": "정지 사용자", "value": f"{suspended_users:,}"},
+            {"label": "관리자 계정", "value": f"{admin_users:,}"},
         ],
         sales_stats=[
-            {"label": "이번달 승인 금액", "value": f"₩ {int(approved_amount):,}"},
+            {"label": "승인 금액", "value": f"₩ {int(approved_amount):,}"},
             {"label": "대기 금액", "value": f"₩ {int(pending_amount):,}"},
             {"label": "거절 금액", "value": f"₩ {int(rejected_amount):,}"},
+            {
+                "label": "비교 기준",
+                "value": (
+                    f"{comparison_start_day.isoformat()} ~ {comparison_end_day.isoformat()}"
+                ),
+            },
         ],
-        today_summary=f"접수 신고 {pending_reports}건 / 정산 대기 {pending_settlements}건 / 실시간 가입 +{today_signups}",
+        today_summary=(
+            f"{start_day.isoformat()} ~ {end_day.isoformat()} 기준 "
+            f"가입 {current_signups}건 / 신고 {current_reports_count}건 / 승인 매출 ₩ {int(current_sales):,}"
+        ),
+        period_label=f"{start_day.isoformat()} ~ {end_day.isoformat()}",
+        comparison_label=comparison_label,
+        compare_mode=compare_mode,
+        range_start=start_day.isoformat(),
+        range_end=end_day.isoformat(),
+        chart_points=chart_buckets["sales"],
+        chart_groups=chart_groups,
+        recent_activities=[
+            DashboardRecentActivityOut(
+                timestamp=_format_datetime(row.created_at),
+                title=row.action_type,
+                description=f"{_actor_display_name(activity_users.get(row.actor_user_id), 'system')} · {row.description}",
+            )
+            for row in recent_activity_rows
+        ],
     )
 
 
@@ -661,6 +1037,8 @@ async def get_admin_users(
     db: AsyncSession = Depends(get_db),
     keyword: str = Query(default=""),
     status_filter: str = Query(default="", alias="status"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
     report_counts = _report_target_counts_subquery("user", "user_id")
     party_counts = (
@@ -682,6 +1060,12 @@ async def get_admin_users(
         .outerjoin(latest_status_actions, latest_status_actions.c.target_user_id == User.id)
         .order_by(User.created_at.desc())
     )
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(User.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(User.created_at < dt_to)
+
     result = await db.execute(stmt)
     rows = result.all()
 
@@ -711,7 +1095,7 @@ async def get_admin_users(
                 status=status_label,
                 reportCount=int(report_count),
                 partyCount=int(party_count),
-                trustScore=_to_int(user.trust_score),
+                trustScore=float(user.trust_score) if user.trust_score is not None else 36.5,
                 lastActive=_format_relative(user.last_login_at or user.updated_at),
             )
         )
@@ -755,7 +1139,7 @@ async def get_admin_user_detail(
         phone=user.phone,
         role=user.role,
         status=_user_status_label(user, int(report_count), _manual_status_label(manual_action)),
-        trustScore=_to_int(user.trust_score),
+        trustScore=float(user.trust_score) if user.trust_score is not None else 36.5,
         reportCount=int(report_count),
         partyCount=int(party_count),
         createdAt=_format_datetime(user.created_at),
@@ -894,7 +1278,7 @@ async def update_admin_user_status(
         status=_user_status_label(target_user, int(report_count), payload.status),
         reportCount=int(report_count),
         partyCount=int(party_count),
-        trustScore=_to_int(target_user.trust_score),
+        trustScore=float(target_user.trust_score) if target_user.trust_score is not None else 36.5,
         lastActive=_format_relative(target_user.last_login_at or target_user.updated_at),
     )
 
@@ -905,6 +1289,9 @@ async def get_admin_parties(
     db: AsyncSession = Depends(get_db),
     keyword: str = Query(default=""),
     status_filter: str = Query(default="", alias="status"),
+    category_filter: str = Query(default="", alias="category"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
     report_counts = _report_target_counts_subquery("party", "party_id")
 
@@ -915,18 +1302,30 @@ async def get_admin_parties(
         .outerjoin(report_counts, report_counts.c.party_id == Party.id)
         .order_by(Party.created_at.desc())
     )
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(Party.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(Party.created_at < dt_to)
+    if category_filter.strip():
+        stmt = stmt.where(func.lower(Service.category) == category_filter.strip().lower())
+
     rows = (await db.execute(stmt)).all()
 
     q = keyword.lower().strip()
+    category_q = category_filter.lower().strip()
     items: list[AdminPartyRecordOut] = []
     for party, service, user, report_count in rows:
         status_label = _party_status_label(party, int(report_count))
         if status_filter and status_label != status_filter:
             continue
+        if category_q and category_q != (service.category or "").lower():
+            continue
         if q and not (
             q in str(party.id).lower()
             or q in party.title.lower()
             or q in service.name.lower()
+            or q in (service.category or "").lower()
             or q in user.nickname.lower()
             or q in status_label.lower()
         ):
@@ -948,6 +1347,7 @@ async def get_admin_parties(
                 id=str(party.id),
                 title=party.title,
                 service=service.name,
+                category=service.category,
                 leaderId=user.nickname,
                 memberCount=party.current_members,
                 status=status_label,
@@ -1018,6 +1418,7 @@ async def force_end_admin_party(
         id=str(party.id),
         title=party.title,
         service=service.name if service else "-",
+        category=service.category if service else "-",
         leaderId=host.nickname if host else str(party.leader_id),
         memberCount=party.current_members,
         status=_party_status_label(party, int(report_count)),
@@ -1031,17 +1432,45 @@ async def force_end_admin_party(
 async def get_admin_reports(
     _: AdminContext = Depends(require_admin_report_permission),
     db: AsyncSession = Depends(get_db),
+    keyword: str = Query(default=""),
+    report_type: str = Query(default="", alias="type"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
-    rows = (await db.execute(select(Report).order_by(Report.created_at.desc()))).scalars().all()
+    stmt = select(Report).order_by(Report.created_at.desc())
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(Report.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(Report.created_at < dt_to)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    target_display_map = await _report_target_display_map(db, rows)
+    q = keyword.lower().strip()
+    rt = report_type.lower().strip()
+
     items: list[ReportRecordOut] = []
     for report in rows:
+        type_label = _report_type_label(report.target_type)
+        status_label = _report_status_label(report.status)
+        if rt and type_label != rt and report.target_type.lower() != rt:
+            continue
+        if q and not (
+            q in str(report.id).lower()
+            or q in str(report.target_id).lower()
+            or q in (report.category or "").lower()
+            or q in (report.description or "").lower()
+            or q in status_label.lower()
+            or q in type_label.lower()
+        ):
+            continue
         items.append(
             ReportRecordOut(
                 id=str(report.id),
-                type=_report_type_label(report.target_type),
-                target=str(report.target_id),
+                type=type_label,
+                target=target_display_map.get((report.target_type.lower(), report.target_id), str(report.target_id)),
                 reason=report.category,
-                status=_report_status_label(report.status),
+                status=status_label,
                 content=report.description or "",
                 createdAt=_format_datetime(report.created_at),
             )
@@ -1112,7 +1541,7 @@ async def update_admin_report_status(
     return ReportRecordOut(
         id=str(report.id),
         type=_report_type_label(report.target_type),
-        target=str(report.target_id),
+        target=report.target_snapshot_name or str(report.target_id),
         reason=report.category,
         status=_report_status_label(report.status),
         content=report.description or "",
@@ -1124,19 +1553,44 @@ async def update_admin_report_status(
 async def get_admin_receipts(
     _: AdminContext = Depends(require_admin_receipt_permission),
     db: AsyncSession = Depends(get_db),
+    keyword: str = Query(default=""),
+    status_filter: str = Query(default="", alias="status"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
-    rows = (await db.execute(select(Receipt).order_by(Receipt.created_at.desc()))).scalars().all()
-    return [
-        ReceiptRecordOut(
-            id=str(receipt.id),
-            userId=str(receipt.user_id),
-            partyId=str(receipt.party_id),
-            ocrAmount=receipt.ocr_amount,
-            status=_receipt_status_label(receipt.status),
-            createdAt=_format_datetime(receipt.created_at),
+    stmt = select(Receipt).order_by(Receipt.created_at.desc())
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(Receipt.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(Receipt.created_at < dt_to)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    q = keyword.lower().strip()
+
+    items: list[ReceiptRecordOut] = []
+    for receipt in rows:
+        status_label = _receipt_status_label(receipt.status)
+        if status_filter and status_label != status_filter:
+            continue
+        if q and not (
+            q in str(receipt.id).lower()
+            or q in str(receipt.user_id).lower()
+            or q in str(receipt.party_id).lower()
+            or q in status_label.lower()
+        ):
+            continue
+        items.append(
+            ReceiptRecordOut(
+                id=str(receipt.id),
+                userId=str(receipt.user_id),
+                partyId=str(receipt.party_id),
+                ocrAmount=receipt.ocr_amount,
+                status=status_label,
+                createdAt=_format_datetime(receipt.created_at),
+            )
         )
-        for receipt in rows
-    ]
+    return items
 
 
 @router.patch("/receipts/{receipt_id}", response_model=ReceiptRecordOut)
@@ -1176,21 +1630,59 @@ async def update_admin_receipt_status(
 async def get_admin_settlements(
     _: AdminContext = Depends(require_admin_settlement_permission),
     db: AsyncSession = Depends(get_db),
+    keyword: str = Query(default=""),
+    status_filter: str = Query(default="", alias="status"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
-    rows = (await db.execute(select(Settlement).order_by(Settlement.created_at.desc()))).scalars().all()
-    return [
-        SettlementRecordOut(
-            id=str(stl.id),
-            partyId=str(stl.party_id),
-            leaderId=str(stl.leader_id),
-            totalAmount=stl.total_amount,
-            memberCount=stl.member_count,
-            billingMonth=stl.billing_month,
-            status=_settlement_status_label(stl.status),
-            createdAt=_format_datetime(stl.created_at),
+    leader_user = aliased(User)
+    stmt = (
+        select(Settlement, Party, leader_user)
+        .join(Party, Settlement.party_id == Party.id)
+        .join(leader_user, Settlement.leader_id == leader_user.id)
+        .order_by(Settlement.created_at.desc())
+    )
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(Settlement.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(Settlement.created_at < dt_to)
+
+    rows = (await db.execute(stmt)).all()
+    q = keyword.lower().strip()
+
+    items: list[SettlementRecordOut] = []
+    for stl, party, leader in rows:
+        status_label = _settlement_status_label(stl.status)
+        party_name = party.title
+        leader_name = _user_display_name(leader)
+        if status_filter and status_label != status_filter:
+            continue
+        if q and not (
+            q in str(stl.id).lower()
+            or q in str(stl.party_id).lower()
+            or q in str(stl.leader_id).lower()
+            or q in party_name.lower()
+            or q in leader_name.lower()
+            or q in (stl.billing_month or "").lower()
+            or q in status_label.lower()
+        ):
+            continue
+        items.append(
+            SettlementRecordOut(
+                id=str(stl.id),
+                partyId=str(stl.party_id),
+                partyName=party_name,
+                leaderId=str(stl.leader_id),
+                leaderName=leader_name,
+                totalAmount=stl.total_amount,
+                memberCount=stl.member_count,
+                billingMonth=stl.billing_month,
+                status=status_label,
+                createdAt=_format_datetime(stl.created_at),
+            )
         )
-        for stl in rows
-    ]
+    return items
 
 
 @router.patch("/settlements/{settlement_id}", response_model=SettlementRecordOut)
@@ -1219,10 +1711,15 @@ async def update_admin_settlement_status(
     )
     await db.commit()
 
+    party = await db.get(Party, stl.party_id)
+    leader = await db.get(User, stl.leader_id)
+
     return SettlementRecordOut(
         id=str(stl.id),
         partyId=str(stl.party_id),
+        partyName=party.title if party else str(stl.party_id),
         leaderId=str(stl.leader_id),
+        leaderName=_user_display_name(leader),
         totalAmount=stl.total_amount,
         memberCount=stl.member_count,
         billingMonth=stl.billing_month,
@@ -1235,18 +1732,31 @@ async def update_admin_settlement_status(
 async def get_admin_logs(
     _: AdminContext = Depends(require_admin_log_permission),
     db: AsyncSession = Depends(get_db),
+    keyword: str = Query(default=""),
+    log_type: str = Query(default="", alias="type"),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
 ):
     logs: list[SystemLogRecordOut] = []
 
-    activity_rows = (
-        await db.execute(select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(100))
-    ).scalars().all()
-    system_rows = (
-        await db.execute(select(SystemLog).order_by(SystemLog.created_at.desc()).limit(100))
-    ).scalars().all()
-    moderation_rows = (
-        await db.execute(select(ModerationAction).order_by(ModerationAction.created_at.desc()).limit(100))
-    ).scalars().all()
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+
+    activity_stmt = select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(100)
+    system_stmt = select(SystemLog).order_by(SystemLog.created_at.desc()).limit(100)
+    moderation_stmt = select(ModerationAction).order_by(ModerationAction.created_at.desc()).limit(100)
+
+    if dt_from:
+        activity_stmt = activity_stmt.where(ActivityLog.created_at >= dt_from)
+        system_stmt = system_stmt.where(SystemLog.created_at >= dt_from)
+        moderation_stmt = moderation_stmt.where(ModerationAction.created_at >= dt_from)
+    if dt_to:
+        activity_stmt = activity_stmt.where(ActivityLog.created_at < dt_to)
+        system_stmt = system_stmt.where(SystemLog.created_at < dt_to)
+        moderation_stmt = moderation_stmt.where(ModerationAction.created_at < dt_to)
+
+    activity_rows = (await db.execute(activity_stmt)).scalars().all()
+    system_rows = (await db.execute(system_stmt)).scalars().all()
+    moderation_rows = (await db.execute(moderation_stmt)).scalars().all()
 
     actor_ids = {
         row.actor_user_id
@@ -1311,4 +1821,21 @@ async def get_admin_logs(
     )
 
     logs.sort(key=lambda item: item.timestamp, reverse=True)
+
+    q = keyword.lower().strip()
+    lt = log_type.upper().strip()
+    if q or lt:
+        filtered: list[SystemLogRecordOut] = []
+        for log in logs:
+            if lt and log.type.upper() != lt:
+                continue
+            if q and not (
+                q in log.message.lower()
+                or q in log.actor.lower()
+                or q in log.type.lower()
+            ):
+                continue
+            filtered.append(log)
+        return filtered[:200]
+
     return logs[:200]

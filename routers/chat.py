@@ -88,7 +88,7 @@ def _serialize_member(
     return {
         "user_id": str(user.id),
         "nickname": user.nickname,
-        "name": user.name,
+        "name": (user.name or user.nickname),
         "role": role,
         "status": status,
         "trust_score": float(user.trust_score) if user.trust_score is not None else None,
@@ -266,7 +266,6 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         "max_members": _party_max_members(party, service),
         "member_count": _party_member_count(party, members),
         "monthly_price": _party_total_price(party, service),
-        "leader_discount_rate": float(service.leader_discount_rate) if service and service.leader_discount_rate is not None else None,
         "referral_discount_rate": float(service.referral_discount_rate) if service and service.referral_discount_rate is not None else None,
         "monthly_per_person": party.monthly_per_person,
         "start_date": party.start_date.isoformat() if party.start_date else None,
