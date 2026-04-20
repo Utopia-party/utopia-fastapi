@@ -14,6 +14,7 @@ from core.database import get_db
 from core.redis_client import redis_client
 from models.user import User
 from models.refresh_token import RefreshToken
+from models.mypage.trust_score import TrustScore
 from schemas.auth import (
     UserCreate,
     UserResponse,
@@ -73,11 +74,23 @@ class SocialSignupBody(BaseModel):
     oauth_id: str
     email: Optional[str] = None
     nickname: str
-    phone: Optional[str] = None 
+    phone: Optional[str] = None
 
 
 def get_email_auth_key(email: str) -> str:
     return f"email_auth:{email}"
+
+
+def build_initial_trust_score_history(user_id, trust_score_value: float) -> TrustScore:
+    return TrustScore(
+        user_id=user_id,
+        previous_score=0.0,
+        new_score=trust_score_value,
+        change_amount=trust_score_value,
+        reason="가입 초기 신뢰도 부여",
+        reference_id=None,
+        created_by=user_id,
+    )
 
 
 @router.post("/refresh")
@@ -133,7 +146,7 @@ async def refresh_token_api(
 
     return {"message": "access token과 refresh token이 재발급되었습니다."}
 
-# 마이페이지 프로필 및 로그인 상태 관리
+
 @router.get("/me")
 async def me(
     access_token: str | None = Cookie(default=None, alias="access_token"),
@@ -163,15 +176,15 @@ async def me(
             "nickname": user.nickname,
             "provider": user.provider,
             "role": user.role,
-            "phone":user.phone,
+            "phone": user.phone,
             "trust_score": user.trust_score,
-            "created_at" :user.created_at,
-            "updated_at":user.updated_at,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
             "profile_image": _build_profile_image_url(user.profile_image_key),
         },
     }
 
-# 로그아웃
+
 @router.post("/logout")
 async def logout(
     request: Request,
@@ -217,7 +230,7 @@ def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
 
-# 소셜 로그인
+
 @router.post("/auth/login")
 async def social_login(data: SocialLoginBody, response: Response, db: AsyncSession = Depends(get_db)):
     oauth = data.oauth.lower().strip()
@@ -264,7 +277,7 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
     oauth_id = data.oauth_id
     email = data.email
     nickname = data.nickname.strip()
-    phone =data.phone
+    phone = data.phone
 
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     existing = result.scalar_one_or_none()
@@ -296,6 +309,14 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
         phone=phone,
     )
     db.add(user)
+    await db.flush()
+
+    initial_trust_history = build_initial_trust_score_history(
+        user_id=user.id,
+        trust_score_value=float(user.trust_score),
+    )
+    db.add(initial_trust_history)
+
     await db.commit()
     await db.refresh(user)
     await issue_tokens_and_save(response, db, user)
@@ -307,7 +328,6 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
     }
 
 
-# 회원가입
 @router.post("/users", response_model=UserResponse, status_code=201)
 async def signup(
     request: Request,
@@ -346,6 +366,14 @@ async def signup(
         provider="local",
     )
     db.add(new_user)
+    await db.flush()
+
+    initial_trust_history = build_initial_trust_score_history(
+        user_id=new_user.id,
+        trust_score_value=float(new_user.trust_score),
+    )
+    db.add(initial_trust_history)
+
     await db.commit()
     await db.refresh(new_user)
 
@@ -359,10 +387,12 @@ async def signup(
 
     return new_user
 
+
 @router.get("/users/check-email")
 async def check_email(email: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == email))
     return {"exists": result.scalar_one_or_none() is not None}
+
 
 @router.post("/email-request")
 async def email_request(
@@ -411,6 +441,7 @@ async def email_request(
         "expires_in": settings.EMAIL_AUTH_TTL_SECONDS,
     }
 
+
 @router.post("/email-verify")
 async def email_verify(email: str, code: str):
     redis_key = get_email_auth_key(email)
@@ -422,12 +453,13 @@ async def email_verify(email: str, code: str):
     await redis_client.delete(redis_key)
     return {"success": True, "message": "이메일 인증에 성공했습니다."}
 
+
 @router.get("/users/check-nickname")
 async def check_nickname(nickname: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.nickname == nickname))
     return {"exists": result.scalar_one_or_none() is not None}
 
-# 이메일 찾기
+
 @router.post("/users/find-id", response_model=FindIdResponse)
 async def find_id(
     payload: FindIdRequest,
@@ -446,7 +478,7 @@ async def find_id(
 
     return FindIdResponse(email=user.email)
 
-# 비밀번호 찾기
+
 @router.post("/users/find-password", response_model=FindPasswordResponse)
 async def find_password(
     payload: FindPasswordRequest,
@@ -457,18 +489,17 @@ async def find_password(
     )
     user = result.scalar_one_or_none()
 
-    # 로컬 활성 계정이면 비밀번호 재설정 허용 플래그를 Redis에 10분간 저장
     if user and user.provider == "local" and user.is_active:
         await redis_client.setex(
             f"password_reset_verified:{payload.email}",
-            600,  # 10분
+            600,
             "true",
         )
 
-    # 보안을 위해 항상 같은 응답 반환
     return FindPasswordResponse(
         message="입력하신 이메일로 비밀번호 재설정 안내를 진행할 수 있습니다."
     )
+
 
 @router.post("/users/reset-password", response_model=ResetPasswordResponse)
 async def reset_password(
@@ -517,9 +548,13 @@ async def reset_password(
     )
 
 
-# 일반로그인
 @router.post("/login")
-async def login(request: Request, user_credentials: UserLogin, response: Response, db: AsyncSession = Depends(get_db),):
+async def login(
+    request: Request,
+    user_credentials: UserLogin,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(User).where(User.email == user_credentials.email))
     user = result.scalar_one_or_none()
 
@@ -546,6 +581,6 @@ async def login(request: Request, user_credentials: UserLogin, response: Respons
             "email": user.email,
             "nickname": user.nickname,
             "role": user.role,
-            "phone" : user.phone,
+            "phone": user.phone,
         },
     }
