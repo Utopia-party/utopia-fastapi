@@ -10,8 +10,9 @@ from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
 from core.config import settings
 from core.database import get_db, AsyncSessionLocal
-from models.party import Party, PartyMember, PartyChat
+from models.party import Party, PartyMember, PartyChat, Service
 from models.user import User
+from services.mypage.profile_service import _build_profile_image_url
  
 router = APIRouter(prefix="/chat", tags=["chat"])
  
@@ -32,6 +33,69 @@ def redis_msg_key(party_id: str) -> str:
  
 def blocked_key(party_id: str, user_id: str) -> str:
     return f"blocked:{party_id}:{user_id}"
+
+
+def _party_max_members(party: Party, service: Service | None) -> int | None:
+    if party.max_members is not None:
+        return party.max_members
+    if service is not None:
+        return service.max_members
+    return None
+
+
+def _party_member_count(party: Party, members: list[dict]) -> int:
+    if party.current_members is not None:
+        return party.current_members
+    return len(members)
+
+
+def _party_total_price(party: Party, service: Service | None) -> int | None:
+    if service is not None:
+        return service.monthly_price
+
+    max_members = _party_max_members(party, service)
+    if party.monthly_per_person is not None and max_members:
+        return party.monthly_per_person * max_members
+    return None
+
+
+def _safe_profile_image_url(profile_image_key: str | None) -> str | None:
+    try:
+        return _build_profile_image_url(profile_image_key)
+    except Exception:
+        return None
+
+
+def _serialize_message(chat: PartyChat, sender: User | None) -> dict:
+    return {
+        "type": "message",
+        "party_id": str(chat.party_id),
+        "user_id": str(chat.sender_id) if chat.sender_id else None,
+        "nickname": sender.nickname if sender else None,
+        "profile_image": _safe_profile_image_url(sender.profile_image_key) if sender else None,
+        "content": chat.message,
+        "created_at": chat.created_at.isoformat(),
+    }
+
+
+def _serialize_member(
+    user: User,
+    *,
+    role: str,
+    status: str,
+    joined_at: datetime | None,
+) -> dict:
+    return {
+        "user_id": str(user.id),
+        "nickname": user.nickname,
+        "name": user.name,
+        "role": role,
+        "status": status,
+        "trust_score": float(user.trust_score) if user.trust_score is not None else None,
+        "joined_at": joined_at.isoformat() if joined_at else None,
+        "profile_image": _safe_profile_image_url(user.profile_image_key),
+        "is_active": bool(user.is_active),
+    }
  
  
 # 메시지 필터링 (Ollama 연동)
@@ -131,78 +195,86 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
 async def get_messages(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     cached = await redis_client.lrange(redis_msg_key(str(party_id)), 0, -1)
     if cached:
-        return [json.loads(m) for m in cached]
+        parsed = [json.loads(message) for message in cached]
+        if all(item.get("nickname") is not None for item in parsed if item.get("type") == "message"):
+            return parsed
+
     result = await db.execute(
-        select(PartyChat)
+        select(PartyChat, User)
+        .outerjoin(User, PartyChat.sender_id == User.id)
         .where(PartyChat.party_id == party_id, PartyChat.is_deleted == False)
         .order_by(PartyChat.created_at.desc())
         .limit(100)
     )
-    chats = result.scalars().all()
-    return [
-        {
-            "type": "message",
-            "party_id": str(c.party_id),
-            "user_id": str(c.sender_id),
-            "content": c.message,
-            "created_at": c.created_at.isoformat(),
-        }
-        for c in reversed(chats)
-    ]
+    rows = result.all()
+    return [_serialize_message(chat, sender) for chat, sender in reversed(rows)]
  
  
 @router.get("/parties/{party_id}/info")
 async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    # Party + host + service 한 번에 로드
-    result = await db.execute(
+    party_result = await db.execute(
         select(Party)
-        .options(
-            selectinload(Party.host),
-            selectinload(Party.service),
-            selectinload(Party.members).selectinload(PartyMember.user),
-        )
+        .options(selectinload(Party.host), selectinload(Party.service))
         .where(Party.id == party_id)
     )
-    party = result.scalar_one_or_none()
+    party = party_result.scalar_one_or_none()
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
- 
-    # active 멤버만 필터링 + profile_image 포함
-    active_members = [
-        {
-            "user_id": str(m.user.id),
-            "nickname": m.user.nickname,
-            "role": m.role,
-            "status": m.status,
-            "profile_image": getattr(m.user, "profile_image", None),
-        }
-        for m in party.members
-        if m.status == "active" and m.user is not None
+
+    result = await db.execute(
+        select(PartyMember, User)
+        .join(User, PartyMember.user_id == User.id)
+        .where(PartyMember.party_id == party_id, PartyMember.status == "active")
+        .order_by(PartyMember.joined_at.asc())
+    )
+    rows = result.all()
+
+    members = [
+        _serialize_member(
+            user,
+            role=member.role,
+            status=member.status,
+            joined_at=member.joined_at,
+        )
+        for member, user in rows
     ]
- 
-    # 1인당 비용: Party.monthly_per_person 우선, 없으면 Service.monthly_price / max_members 계산
-    per_person = party.monthly_per_person
-    total_price = None
-    if party.service:
-        total_price = party.service.monthly_price
-        if per_person is None and party.max_members:
-            per_person = round(total_price / party.max_members)
- 
+
+    if party.host and not any(member["user_id"] == str(party.host.id) for member in members):
+        members.insert(
+            0,
+            _serialize_member(
+                party.host,
+                role="leader",
+                status="active",
+                joined_at=party.created_at,
+            ),
+        )
+
+    members.sort(
+        key=lambda member: (
+            0 if member["role"] == "leader" else 1,
+            member["joined_at"] or "",
+        )
+    )
+
+    service = party.service
+
     return {
         "party_id": str(party.id),
         "title": party.title,
-        "description": party.description,
-        "status": party.status,
-        "max_members": party.max_members,
-        "member_count": party.current_members or len(active_members),
-        "monthly_price": total_price,
-        "monthly_per_person": per_person,
+        "status": party.status.lower() if party.status else None,
+        "max_members": _party_max_members(party, service),
+        "member_count": _party_member_count(party, members),
+        "monthly_price": _party_total_price(party, service),
+        "leader_discount_rate": float(service.leader_discount_rate) if service and service.leader_discount_rate is not None else None,
+        "referral_discount_rate": float(service.referral_discount_rate) if service and service.referral_discount_rate is not None else None,
+        "monthly_per_person": party.monthly_per_person,
         "start_date": party.start_date.isoformat() if party.start_date else None,
         "end_date": party.end_date.isoformat() if party.end_date else None,
-        "category_name": party.service.category if party.service else None,
-        "service_name": party.service.name if party.service else None,
+        "category_name": service.category if service else None,
+        "service_name": service.name if service else None,
         "host_nickname": party.host.nickname if party.host else None,
-        "members": active_members,
+        "members": members,
     }
  
  

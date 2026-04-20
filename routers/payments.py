@@ -5,7 +5,6 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from core.database import get_db
-from core.config import settings
 from models.payment import Payment
 from models.party import Party
 from models.user import User
@@ -50,9 +49,11 @@ class CardConfirmRequest(BaseModel):
     pg_transaction_id: str
     amount: int
 
+
 class TransferRegisterRequest(BaseModel):
     party_id: uuid.UUID
     amount: int
+
 
 class PaymentOut(BaseModel):
     id: uuid.UUID
@@ -67,10 +68,11 @@ class PaymentOut(BaseModel):
         from_attributes = True
 
 
-# ── 포트원 결제 검증 (실서비스 전환 시 주석 해제) ──────────────────
+# ── 포트원 결제 검증 ──────────────────────────────────────────────
 
 async def verify_portone_payment(payment_id: str, expected_amount: int) -> dict:
     try:
+        from core.config import settings
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"https://api.portone.io/payments/{payment_id}",
@@ -100,6 +102,27 @@ async def verify_portone_payment(payment_id: str, expected_amount: int) -> dict:
         raise HTTPException(status_code=400, detail=f"포트원 검증 중 오류: {str(e)}")
 
 
+# ── 결제 상태 확인 ────────────────────────────────────────────────
+
+@router.get("/status")
+async def get_payment_status(
+    party_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    billing_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    result = await db.execute(
+        select(Payment).where(
+            Payment.user_id == current_user.id,
+            Payment.party_id == party_id,
+            Payment.billing_month == billing_month,
+            Payment.status == "approved",
+        )
+    )
+    paid = result.scalar_one_or_none() is not None
+    return {"paid": paid, "billing_month": billing_month}
+
+
 # ── 카드 결제 승인 ────────────────────────────────────────────────
 
 @router.post("/card/confirm", response_model=PaymentOut)
@@ -111,22 +134,36 @@ async def card_confirm(
     print(f"[PAYMENT] card_confirm 요청: party_id={body.party_id}, pg_id={body.pg_transaction_id}, amount={body.amount}")
     print(f"[PAYMENT] 유저: {current_user.id} / {current_user.nickname}")
 
-    # 포트원 검증 (테스트 중 문제 생기면 아래 줄 주석처리)
-    await verify_portone_payment(body.pg_transaction_id, body.amount)
+    # 실서비스 전환 시 아래 주석 해제
+    # await verify_portone_payment(body.pg_transaction_id, body.amount)
 
-    # 중복 결제 방지
+    # 1. pg_transaction_id 중복 방지
     existing = await db.execute(
         select(Payment).where(Payment.pg_transaction_id == body.pg_transaction_id)
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="이미 처리된 결제입니다.")
 
-    # 파티 존재 확인
+    # 2. 이번 달 같은 파티 중복 결제 방지
+    now = datetime.now(timezone.utc)
+    billing_month = now.strftime("%Y-%m")
+
+    duplicate = await db.execute(
+        select(Payment).where(
+            Payment.user_id == current_user.id,
+            Payment.party_id == body.party_id,
+            Payment.billing_month == billing_month,
+            Payment.status == "approved",
+        )
+    )
+    if duplicate.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="이번 달 결제가 이미 완료되었습니다.")
+
+    # 3. 파티 존재 확인
     party = await db.get(Party, body.party_id)
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
 
-    now = datetime.now(timezone.utc)
     commission_rate = 0.10
     payment = Payment(
         user_id=current_user.id,
@@ -137,7 +174,7 @@ async def card_confirm(
         amount=body.amount,
         payment_method="card",
         status="approved",
-        billing_month=now.strftime("%Y-%m"),
+        billing_month=billing_month,
         paid_at=now,
         pricing_type="normal",
         pg_provider="portone",
@@ -162,11 +199,25 @@ async def transfer_register(
     print(f"[PAYMENT] transfer_register 요청: party_id={body.party_id}, amount={body.amount}")
     print(f"[PAYMENT] 유저: {current_user.id} / {current_user.nickname}")
 
+    # 이번 달 같은 파티 중복 결제 방지
+    now = datetime.now(timezone.utc)
+    billing_month = now.strftime("%Y-%m")
+
+    duplicate = await db.execute(
+        select(Payment).where(
+            Payment.user_id == current_user.id,
+            Payment.party_id == body.party_id,
+            Payment.billing_month == billing_month,
+            Payment.status.in_(["approved", "pending"]),
+        )
+    )
+    if duplicate.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="이번 달 결제가 이미 존재합니다.")
+
     party = await db.get(Party, body.party_id)
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
 
-    now = datetime.now(timezone.utc)
     commission_rate = 0.10
     payment = Payment(
         user_id=current_user.id,
@@ -177,7 +228,7 @@ async def transfer_register(
         amount=body.amount,
         payment_method="transfer",
         status="pending",
-        billing_month=now.strftime("%Y-%m"),
+        billing_month=billing_month,
         paid_at=None,
         pricing_type="normal",
         pg_provider=None,
