@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -18,6 +21,8 @@ from models.quick_match.result import QuickMatchResult
 from models.user import User
 from services.quick_match.embedding_service import EmbeddingService
 
+logger = logging.getLogger(__name__)
+
 
 class QuickMatchService:
     async def create_request(
@@ -27,6 +32,8 @@ class QuickMatchService:
         service_id: uuid.UUID,
         preferred_conditions: dict | None,
     ):
+        start_time = time.perf_counter()
+
         user = await db.get(User, user_id)
         if not user:
             raise Exception("USER_NOT_FOUND")
@@ -106,6 +113,16 @@ class QuickMatchService:
         db.add(request)
         await db.commit()
         await db.refresh(request)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "[QuickMatch] create_request done request_id=%s user_id=%s service_id=%s elapsed=%.3fs",
+            request.id,
+            user_id,
+            service_id,
+            elapsed,
+        )
+
         return request
 
     async def find_candidates(
@@ -113,9 +130,18 @@ class QuickMatchService:
         db: AsyncSession,
         request_id: uuid.UUID,
     ):
+        start_time = time.perf_counter()
+
         request = await db.get(QuickMatchRequest, request_id)
         if not request:
             raise Exception("REQUEST_NOT_FOUND")
+
+        logger.info(
+            "[QuickMatch] find_candidates start request_id=%s user_id=%s service_id=%s",
+            request_id,
+            request.user_id,
+            request.service_id,
+        )
 
         if request.status != QuickMatchRequestStatus.REQUESTED:
             raise Exception("INVALID_REQUEST_STATUS")
@@ -152,6 +178,12 @@ class QuickMatchService:
         parties = party_result.scalars().all()
 
         if not parties:
+            elapsed = time.perf_counter() - start_time
+            logger.warning(
+                "[QuickMatch] no recruiting party request_id=%s elapsed=%.3fs",
+                request.id,
+                elapsed,
+            )
             await self.fail_request(
                 db=db,
                 request_id=request.id,
@@ -159,11 +191,18 @@ class QuickMatchService:
             )
             raise Exception("NO_RECRUITING_PARTY")
 
+        existing_members_result = await db.execute(
+            select(PartyMember.party_id).where(
+                PartyMember.user_id == request.user_id,
+            )
+        )
+        joined_party_ids = set(existing_members_result.scalars().all())
+
         preferred_conditions = self._normalize_preferred_conditions(request.preferred_conditions)
         user_trust_score = float(getattr(user, "trust_score", 0) or 0)
         user_profile = request.ai_profile_snapshot or {}
 
-        normal_candidates: list[dict[str, Any]] = []
+        normal_candidates_base: list[dict[str, Any]] = []
         fallback_candidates: list[dict[str, Any]] = []
 
         for party in parties:
@@ -178,28 +217,46 @@ class QuickMatchService:
             remaining_seat = max((party_max_members - party_current_members), 0)
             filter_reasons["remaining_seat"] = remaining_seat
             if party_current_members >= party_max_members:
-                filter_reasons["excluded_reason"] = "party_full"
+                self._reject_candidate(
+                    db=db,
+                    request_id=request.id,
+                    party_id=party.id,
+                    filter_reasons=filter_reasons,
+                    reason="party_full",
+                )
                 continue
 
             min_trust_score = float(getattr(party, "min_trust_score", 0) or 0)
             filter_reasons["party_min_trust_score"] = min_trust_score
             filter_reasons["user_trust_score"] = user_trust_score
             if user_trust_score < min_trust_score:
-                filter_reasons["excluded_reason"] = "trust_score_too_low"
+                self._reject_candidate(
+                    db=db,
+                    request_id=request.id,
+                    party_id=party.id,
+                    filter_reasons=filter_reasons,
+                    reason="trust_score_too_low",
+                )
                 continue
 
             if self._is_policy_excluded(user=user, party=party):
-                filter_reasons["excluded_reason"] = "policy_excluded"
+                self._reject_candidate(
+                    db=db,
+                    request_id=request.id,
+                    party_id=party.id,
+                    filter_reasons=filter_reasons,
+                    reason="policy_excluded",
+                )
                 continue
 
-            existing_member_result = await db.execute(
-                select(PartyMember).where(
-                    PartyMember.party_id == party.id,
-                    PartyMember.user_id == request.user_id,
+            if party.id in joined_party_ids:
+                self._reject_candidate(
+                    db=db,
+                    request_id=request.id,
+                    party_id=party.id,
+                    filter_reasons=filter_reasons,
+                    reason="already_member",
                 )
-            )
-            if existing_member_result.scalar_one_or_none():
-                filter_reasons["excluded_reason"] = "already_member"
                 continue
 
             rule_score, rule_reason = self._calculate_rule_score(
@@ -217,7 +274,6 @@ class QuickMatchService:
 
             party_profile = self._build_party_profile(party)
 
-            # 1차: 일반 AI 매칭 후보
             if user_embedding and user_embedding.embedding_vector:
                 party_embedding = await self._get_or_create_party_embedding(
                     db=db,
@@ -231,42 +287,32 @@ class QuickMatchService:
                         party_embedding.embedding_vector,
                     )
 
-                    llm_result = await EmbeddingService.generate_match_evaluation(
-                        {
-                            "user_profile": user_profile,
-                            "party_profile": party_profile,
-                            "rule_score": rule_score,
-                            "vector_score": vector_score,
-                        }
-                    )
-                    llm_score = float(llm_result.get("score", 0) or 0)
-
-                    normal_filter_reasons = dict(filter_reasons)
-                    normal_filter_reasons["llm_reason"] = llm_result.get("reason")
-                    normal_filter_reasons["match_mode"] = "normal"
-
-                    ai_score = self._calculate_ai_score(
-                        rule_score=rule_score,
-                        vector_score=vector_score,
-                        llm_score=llm_score,
-                    )
-
-                    normal_candidates.append(
+                    normal_candidates_base.append(
                         {
                             "party": party,
                             "rule_score": rule_score,
                             "vector_score": vector_score,
-                            "llm_score": llm_score,
-                            "ai_score": ai_score,
-                            "filter_reasons": normal_filter_reasons,
+                            "party_profile": party_profile,
+                            "filter_reasons": dict(filter_reasons),
                         }
                     )
                 else:
                     filter_reasons["normal_match_unavailable_reason"] = "party_embedding_not_found"
+                    self._reject_candidate(
+                        db=db,
+                        request_id=request.id,
+                        party_id=party.id,
+                        filter_reasons=filter_reasons,
+                        reason="party_embedding_not_found",
+                    )
             else:
                 filter_reasons["normal_match_unavailable_reason"] = "user_embedding_not_found"
+                logger.warning(
+                    "[QuickMatch] user embedding not found request_id=%s user_id=%s",
+                    request.id,
+                    request.user_id,
+                )
 
-            # 2차: 일반 후보가 아예 없을 때만 사용할 fallback 후보
             if fallback_ok:
                 fallback_filter_reasons = dict(filter_reasons)
                 fallback_filter_reasons["match_mode"] = "fallback"
@@ -288,17 +334,92 @@ class QuickMatchService:
                     }
                 )
 
-        selected_pool: list[dict[str, Any]] = []
-        selected_mode = "normal"
+        normal_candidates: list[dict[str, Any]] = []
+        if normal_candidates_base:
+            llm_results = await asyncio.gather(
+                *[
+                    EmbeddingService.generate_match_evaluation(
+                        {
+                            "user_profile": user_profile,
+                            "party_profile": item["party_profile"],
+                            "rule_score": item["rule_score"],
+                            "vector_score": item["vector_score"],
+                        }
+                    )
+                    for item in normal_candidates_base
+                ],
+                return_exceptions=True,
+            )
 
+            for item, llm_result in zip(normal_candidates_base, llm_results):
+                if isinstance(llm_result, Exception):
+                    llm_score = round(
+                        min(
+                            1.0,
+                            max(
+                                0.0,
+                                (float(item["rule_score"]) * 0.5)
+                                + (float(item["vector_score"]) * 0.5),
+                            ),
+                        ),
+                        4,
+                    )
+                    llm_reason = "LLM 호출 실패로 rule/vector 기반 대체 점수 사용"
+                else:
+                    llm_score = float(llm_result.get("score", 0) or 0)
+                    llm_reason = llm_result.get("reason")
+
+                normal_filter_reasons = dict(item["filter_reasons"])
+                normal_filter_reasons["llm_reason"] = llm_reason
+                normal_filter_reasons["match_mode"] = "normal"
+
+                ai_score = self._calculate_ai_score(
+                    rule_score=float(item["rule_score"]),
+                    vector_score=float(item["vector_score"]),
+                    llm_score=llm_score,
+                )
+
+                normal_candidates.append(
+                    {
+                        "party": item["party"],
+                        "rule_score": float(item["rule_score"]),
+                        "vector_score": float(item["vector_score"]),
+                        "llm_score": llm_score,
+                        "ai_score": ai_score,
+                        "filter_reasons": normal_filter_reasons,
+                    }
+                )
+
+        selected_pool: list[dict[str, Any]] = []
         if normal_candidates:
             selected_pool = normal_candidates
-            selected_mode = "normal"
         elif fallback_candidates:
             selected_pool = fallback_candidates
-            selected_mode = "fallback"
 
         if not selected_pool:
+            rejected_result = await db.execute(
+                select(QuickMatchCandidate).where(
+                    QuickMatchCandidate.request_id == request.id,
+                    QuickMatchCandidate.status == QuickMatchCandidateStatus.REJECTED,
+                )
+            )
+            rejected_candidates = rejected_result.scalars().all()
+
+            reason_counts: dict[str, int] = {}
+            for candidate in rejected_candidates:
+                excluded_reason = (candidate.filter_reasons or {}).get("excluded_reason", "unknown")
+                reason_counts[excluded_reason] = reason_counts.get(excluded_reason, 0) + 1
+
+            elapsed = time.perf_counter() - start_time
+            logger.warning(
+                "[QuickMatch] no candidate request_id=%s checked_parties=%s rejected=%s reason_counts=%s elapsed=%.3fs",
+                request.id,
+                len(parties),
+                len(rejected_candidates),
+                reason_counts,
+                elapsed,
+            )
+
             await self.fail_request(
                 db=db,
                 request_id=request.id,
@@ -340,6 +461,16 @@ class QuickMatchService:
         for candidate in created_candidates:
             await db.refresh(candidate)
 
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "[QuickMatch] find_candidates done request_id=%s selected_candidates=%s normal_candidates=%s fallback_candidates=%s elapsed=%.3fs",
+            request.id,
+            len(created_candidates),
+            len(normal_candidates),
+            len(fallback_candidates),
+            elapsed,
+        )
+
         return created_candidates
 
     async def select_party(
@@ -347,6 +478,8 @@ class QuickMatchService:
         db: AsyncSession,
         request_id: uuid.UUID,
     ):
+        start_time = time.perf_counter()
+
         result = await db.execute(
             select(QuickMatchCandidate).where(QuickMatchCandidate.request_id == request_id)
         )
@@ -424,6 +557,17 @@ class QuickMatchService:
 
         await db.commit()
         await db.refresh(result_row)
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            "[QuickMatch] select_party done request_id=%s party_id=%s candidate_id=%s final_score=%.4f elapsed=%.3fs",
+            request.id,
+            candidate.party_id,
+            candidate.id,
+            float(candidate.ai_score),
+            elapsed,
+        )
+
         return result_row
 
     async def join_party(
@@ -431,6 +575,8 @@ class QuickMatchService:
         db: AsyncSession,
         request_id: uuid.UUID,
     ):
+        start_time = time.perf_counter()
+
         request = await db.get(QuickMatchRequest, request_id)
         if not request:
             raise Exception("REQUEST_NOT_FOUND")
@@ -457,10 +603,20 @@ class QuickMatchService:
             party_max_members = int(getattr(party, "max_members", 0) or 0)
 
             if party.status != "recruiting":
+                logger.warning(
+                    "[QuickMatch] join failed status changed request_id=%s party_id=%s",
+                    request.id,
+                    party.id,
+                )
                 await self.fail_request(db, request.id, "PARTY_STATUS_CHANGED")
                 return await self.retry_match(db, request.id)
 
             if party_current_members >= party_max_members:
+                logger.warning(
+                    "[QuickMatch] join failed full party request_id=%s party_id=%s",
+                    request.id,
+                    party.id,
+                )
                 await self.fail_request(db, request.id, "PARTY_FULL")
                 return await self.retry_match(db, request.id)
 
@@ -472,13 +628,18 @@ class QuickMatchService:
             )
             existing_member = existing_member_result.scalar_one_or_none()
             if existing_member:
+                logger.warning(
+                    "[QuickMatch] join failed already joined request_id=%s party_id=%s user_id=%s",
+                    request.id,
+                    party.id,
+                    request.user_id,
+                )
                 await self.fail_request(db, request.id, "ALREADY_JOINED")
                 return await self.retry_match(db, request.id)
 
             now = datetime.utcnow()
 
             matched_at = request.matched_at
-
             if matched_at is None:
                 matched_at = now
             elif matched_at.tzinfo is not None:
@@ -504,6 +665,16 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(new_member)
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                "[QuickMatch] join_party done request_id=%s party_id=%s user_id=%s current_members=%s elapsed=%.3fs",
+                request.id,
+                party.id,
+                request.user_id,
+                party.current_members,
+                elapsed,
+            )
 
             return {
                 "party_member_id": new_member.id,
@@ -531,6 +702,14 @@ class QuickMatchService:
 
         await db.commit()
         await db.refresh(request)
+
+        logger.warning(
+            "[QuickMatch] fail_request request_id=%s reason=%s retry_count=%s",
+            request.id,
+            reason,
+            request.retry_count,
+        )
+
         return request
 
     async def retry_match(
@@ -549,6 +728,13 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
+
+            logger.warning(
+                "[QuickMatch] retry expired request_id=%s reason=%s",
+                request.id,
+                request.fail_reason,
+            )
+
             return request
 
         result = await db.execute(
@@ -571,6 +757,12 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
+
+            logger.warning(
+                "[QuickMatch] retry failed no more candidates request_id=%s",
+                request.id,
+            )
+
             return request
 
         candidates.sort(
@@ -616,6 +808,12 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
+
+            logger.warning(
+                "[QuickMatch] retry failed no selectable candidate request_id=%s",
+                request.id,
+            )
+
             return request
 
         next_candidate.status = QuickMatchCandidateStatus.SELECTED
@@ -627,6 +825,13 @@ class QuickMatchService:
         request.fail_reason = None
 
         await db.commit()
+
+        logger.info(
+            "[QuickMatch] retry_match next candidate request_id=%s next_party_id=%s retry_count=%s",
+            request.id,
+            next_candidate.party_id,
+            request.retry_count,
+        )
 
         return {
             "request_id": request.id,
@@ -746,6 +951,38 @@ class QuickMatchService:
 
         await db.flush()
         return party_embedding
+
+    def _reject_candidate(
+        self,
+        db: AsyncSession,
+        request_id: uuid.UUID,
+        party_id: uuid.UUID,
+        filter_reasons: dict[str, Any],
+        reason: str,
+    ) -> None:
+        rejected_reasons = dict(filter_reasons)
+        rejected_reasons["excluded_reason"] = reason
+
+        logger.info(
+            "[QuickMatch] candidate rejected request_id=%s party_id=%s reason=%s details=%s",
+            request_id,
+            party_id,
+            reason,
+            rejected_reasons,
+        )
+
+        candidate = QuickMatchCandidate(
+            request_id=request_id,
+            party_id=party_id,
+            rule_score=0,
+            vector_score=0,
+            llm_score=0,
+            ai_score=0,
+            rank=None,
+            status=QuickMatchCandidateStatus.REJECTED,
+            filter_reasons=rejected_reasons,
+        )
+        db.add(candidate)
 
     def _normalize_preferred_conditions(self, preferred_conditions: dict[str, Any] | None) -> dict[str, Any]:
         normalized = dict(preferred_conditions or {})

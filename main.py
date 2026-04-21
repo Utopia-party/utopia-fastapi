@@ -14,12 +14,14 @@ from sqlalchemy import text
 from core.config import settings
 from core.database import AsyncSessionLocal, Base, engine
 from models.admin import ActivityLog
-from routers.mypage import profile
-from routers.quick_match import router as quick_match_router
 
 from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report, ws_notifications, payments
 
-from routers.mypage import parties as mypage_parties, profile,trust_history
+from routers.mypage import profile, trust_history
+from routers.mypage import parties as mypage_parties
+from routers.mypage import payments as mypage_payments
+
+from routers.quick_match import router as quick_match_router
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -177,6 +179,7 @@ async def admin_access_log_middleware(request: Request, call_next):
 # 라우터 등록 (prefix="/api" 유지)
 app.include_router(auth.router, prefix="/api")
 app.include_router(parties.router, prefix="/api")
+app.include_router(payments.router, prefix="/api")
 app.include_router(quick_match_router, prefix="/api")
 app.include_router(notifications.router, prefix="/api")
 app.include_router(ws_notifications.router)
@@ -193,8 +196,7 @@ app.include_router(report.router, prefix="/api")
 app.include_router(profile.router, prefix="/api")
 app.include_router(mypage_parties.router, prefix="/api")
 app.include_router(trust_history.router, prefix="/api")
-
-app.include_router(payments.router, prefix="/api")
+app.include_router(mypage_payments.router, prefix="/api")
 
 @app.get("/api/health")
 async def health():

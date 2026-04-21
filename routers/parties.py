@@ -1,7 +1,7 @@
 import uuid
 import logging
 from datetime import date
-from typing import Optional
+from typing import Optional, Any
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,6 +13,7 @@ from core.config import settings
 from core.database import get_db
 from core.minio_assets import build_minio_asset_url
 from core.security import require_user, get_current_user_optional
+from models.admin import ActivityLog
 from models.party import Party, PartyMember, Service
 from models.user import User
 from schemas.party import (
@@ -31,6 +32,24 @@ router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+async def create_activity_log(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    action: str,
+    description: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    target_id: Optional[uuid.UUID] = None,
+) -> None:
+    log = ActivityLog(
+        actor_user_id=user_id,
+        action_type=action,
+        description=description,
+        extra_metadata=metadata or {},
+        target_id=target_id,
+    )
+    db.add(log)
 
 
 def _service_monthly_price(service: Service | None) -> int | None:
@@ -167,7 +186,7 @@ async def list_parties(
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     size: int = Query(12, ge=1, le=50),
-    random: bool = Query(False),  # ← 추가
+    random: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -188,7 +207,6 @@ async def list_parties(
 
     total = await db.scalar(select(func.count()).select_from(q.subquery())) or 0
 
-    # ← 변경: random=True면 랜덤 정렬, 아니면 최신순
     order = func.random() if random else Party.id.desc()
     q = q.offset((page - 1) * size).limit(size).order_by(order)
 
@@ -299,6 +317,17 @@ async def create_party(
 
     try:
         db.add(party)
+        await db.flush()
+
+        await create_activity_log(
+            db=db,
+            user_id=current_user.id,
+            action="CREATE_PARTY",
+            description="파티 생성",
+            metadata={"party_title": party.title},
+            target_id=party.id,
+        )
+
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -476,6 +505,16 @@ async def leave_party(
         member.status = "left"
         member.left_at = func.now()
         party.current_members = max(0, _party_member_count(party) - 1)
+
+        await create_activity_log(
+            db=db,
+            user_id=current_user.id,
+            action="LEAVE_PARTY",
+            description="파티 탈퇴",
+            metadata={"party_title": party.title},
+            target_id=party.id,
+        )
+
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -624,6 +663,16 @@ async def approve_application(
         target.approved_at = func.now()
         target.rejected_at = None
         party.current_members = current_count + 1
+
+        await create_activity_log(
+            db=db,
+            user_id=user_id,
+            action="JOIN_PARTY",
+            description="파티 참가",
+            metadata={"party_title": party.title},
+            target_id=party.id,
+        )
+
         await db.commit()
     except Exception as e:
         await db.rollback()

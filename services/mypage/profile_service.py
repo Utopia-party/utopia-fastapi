@@ -2,17 +2,23 @@ import io
 import os
 import uuid
 from datetime import timedelta
-from typing import Optional
+from typing import Optional,Any
 
 from fastapi import HTTPException, UploadFile
 from minio import Minio
 from minio.error import S3Error
-from sqlalchemy import select
+from sqlalchemy import select, func, distinct
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from models.user import User
-from schemas.mypage.profile import MyPageProfileResponse, UpdateMyPageProfileResponse
+from models.party import PartyMember
+from models.admin import ActivityLog
+from schemas.mypage.profile import (
+    MyPageProfileResponse,
+    UpdateMyPageProfileResponse,
+    RecentActivityItem,
+)
 
 ALLOWED_IMAGE_CONTENT_TYPES = {
     "image/jpeg",
@@ -78,8 +84,31 @@ def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
 
     return url
 
+def _normalize_metadata(metadata: Any) -> dict:
+    if isinstance(metadata, dict):
+        return metadata
+    return {}
 
-def _to_profile_response(user: User) -> MyPageProfileResponse:
+
+def _to_recent_activity_item(activity: ActivityLog) -> RecentActivityItem:
+    return RecentActivityItem(
+        id=str(activity.id),
+        action=activity.action_type,  
+        description=activity.description,
+        ip_address=str(activity.ip_address) if activity.ip_address else None,
+        user_agent=activity.user_agent,
+        metadata=_normalize_metadata(activity.extra_metadata),
+        target_id=str(activity.target_id) if activity.target_id else None,
+        created_at=activity.created_at,
+    )
+
+def _to_profile_response(
+    user: User,
+    total_party_participations: int = 0,
+    active_party_count: int = 0,
+    recommendation_count: int = 0,
+    recent_activities: list[RecentActivityItem] | None = None,
+) -> MyPageProfileResponse:
     return MyPageProfileResponse(
         user_id=str(user.id),
         email=user.email,
@@ -91,14 +120,93 @@ def _to_profile_response(user: User) -> MyPageProfileResponse:
         trust_score=float(user.trust_score),
         profile_image=_build_profile_image_url(user.profile_image_key),
         created_at=user.created_at,
+        total_party_participations=total_party_participations,
+        active_party_count=active_party_count,
+        recommendation_count=recommendation_count,
+        recent_activities=recent_activities or [],
     )
 
+async def _get_total_party_participations(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    stmt = (
+        select(func.count(distinct(PartyMember.party_id)))
+        .where(PartyMember.user_id == user_id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar() or 0
+
+
+async def _get_active_party_count(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    stmt = (
+        select(func.count(distinct(PartyMember.party_id)))
+        .where(
+            PartyMember.user_id == user_id,
+            PartyMember.status == "active",
+        )
+    )
+    result = await db.execute(stmt)
+    return result.scalar() or 0
+
+async def _get_recommendation_count(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    stmt = (
+        select(func.count(User.id))
+        .where(User.referrer_id == user_id)
+    )
+    result = await db.execute(stmt)
+    return result.scalar() or 0
+
+async def _get_recent_activities(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    limit: int = 5,
+) -> list[RecentActivityItem]:
+    stmt = (
+        select(ActivityLog)
+        .where(ActivityLog.actor_user_id == user_id)
+        .order_by(ActivityLog.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    activities = result.scalars().all()
+    return [_to_recent_activity_item(activity) for activity in activities]
 
 async def get_my_profile_service(
     db: AsyncSession,
     current_user: User,
 ) -> MyPageProfileResponse:
-    return _to_profile_response(current_user)
+    total_party_participations = await _get_total_party_participations(
+        db=db,
+        user_id=current_user.id,
+    )
+    active_party_count = await _get_active_party_count(
+        db=db,
+        user_id=current_user.id,
+    )
+    recommendation_count = await _get_recommendation_count(
+        db=db,
+        user_id=current_user.id,
+    )
+    recent_activities = await _get_recent_activities(
+        db=db,
+        user_id=current_user.id,
+        limit=5,
+    )
+
+    return _to_profile_response(
+        user=current_user,
+        total_party_participations=total_party_participations,
+        active_party_count=active_party_count,
+        recommendation_count=recommendation_count,
+        recent_activities=recent_activities,
+    )
 
 # 프로필 수정
 async def update_my_profile_service(
@@ -168,7 +276,31 @@ async def update_my_profile_service(
     await db.commit()
     await db.refresh(current_user)
 
+    total_party_participations = await _get_total_party_participations(
+        db=db,
+        user_id=current_user.id,
+    )
+    active_party_count = await _get_active_party_count(
+        db=db,
+        user_id=current_user.id,
+    )
+    recommendation_count = await _get_recommendation_count(
+        db=db,
+        user_id=current_user.id,
+    )
+    recent_activities = await _get_recent_activities(
+        db=db,
+        user_id=current_user.id,
+        limit=5,
+    )
+
     return UpdateMyPageProfileResponse(
         message="프로필이 수정되었습니다.",
-        user=_to_profile_response(current_user),
+        user=_to_profile_response(
+            user=current_user,
+            total_party_participations=total_party_participations,
+            active_party_count=active_party_count,
+            recommendation_count=recommendation_count,
+            recent_activities=recent_activities,
+        ),
     )

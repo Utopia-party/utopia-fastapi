@@ -1,7 +1,7 @@
 import random
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, Response, Cookie, Request
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
@@ -15,6 +15,7 @@ from core.redis_client import redis_client
 from models.user import User
 from models.refresh_token import RefreshToken
 from models.mypage.trust_score import TrustScore
+from models.admin import ActivityLog
 from schemas.auth import (
     UserCreate,
     UserResponse,
@@ -92,6 +93,42 @@ def build_initial_trust_score_history(user_id, trust_score_value: float) -> Trus
         reference_id=None,
         created_by=user_id,
     )
+
+
+def _safe_metadata(metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return metadata or {}
+
+
+async def create_activity_log(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    action: str,
+    description: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    target_id: Optional[uuid.UUID] = None,
+    ip_address: Optional[str] = None,
+    user_agent: Optional[str] = None,
+) -> None:
+    """
+    최근 활동 내역용 공통 로그 적재
+    profile_service.py 기준 필드명:
+    - actor_user_id
+    - action_type
+    - description
+    - extra_metadata
+    - target_id
+    """
+    log = ActivityLog(
+        actor_user_id=user_id,
+        action_type=action,
+        description=description,
+        extra_metadata=_safe_metadata(metadata),
+        target_id=target_id,
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    db.add(log)
+    await db.commit()
 
 
 @router.post("/refresh")
@@ -207,6 +244,15 @@ async def logout(
             token_row.revoke_reason = "logout"
             await db.commit()
 
+            await create_activity_log(
+                db=db,
+                user_id=token_row.user_id,
+                action="LOGOUT",
+                description="로그아웃",
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+            )
+
     clear_access_token_cookie(response)
     clear_refresh_token_cookie(response)
     return {"message": "로그아웃 되었습니다."}
@@ -235,7 +281,7 @@ def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
 
 
 @router.post("/auth/login")
-async def social_login(data: SocialLoginBody, response: Response, db: AsyncSession = Depends(get_db)):
+async def social_login(data: SocialLoginBody, response: Response, request: Request, db: AsyncSession = Depends(get_db)):
     oauth = data.oauth.lower().strip()
     code = data.code
     state = data.state
@@ -247,11 +293,24 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
     if user:
         if not user.is_active:
             raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
-        if not (user.name or "").strip():
-            user.name = (name or user.nickname or "").strip() or None
-            await db.commit()
-            await db.refresh(user)
-        await issue_tokens_and_save(response, db, user)
+
+        await issue_tokens_and_save(
+            response=response,
+            db=db,
+            user=user,
+            user_agent=request.headers.get("user-agent"),
+            ip_address=request.client.host if request.client else None,
+        )
+
+        await create_activity_log(
+            db=db,
+            user_id=user.id,
+            action="LOGIN",
+            description="로그인",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+
         return {
             "status": "LOGIN_SUCCESS",
             "message": "소셜 로그인에 성공했습니다.",
@@ -264,13 +323,31 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
         if email_user:
             if email_user.provider not in ("local", oauth) and email_user.provider_id:
                 raise HTTPException(status_code=400, detail="이미 다른 소셜 계정에 연결된 이메일입니다.")
+
             email_user.provider = oauth
             email_user.provider_id = oauth_id
             if not (email_user.name or "").strip():
                 email_user.name = (name or email_user.nickname or "").strip() or None
             await db.commit()
             await db.refresh(email_user)
-            await issue_tokens_and_save(response, db, email_user)
+
+            await issue_tokens_and_save(
+                response=response,
+                db=db,
+                user=email_user,
+                user_agent=request.headers.get("user-agent"),
+                ip_address=request.client.host if request.client else None,
+            )
+
+            await create_activity_log(
+                db=db,
+                user_id=email_user.id,
+                action="LOGIN",
+                description="로그인",
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+            )
+
             return {
                 "status": "LOGIN_SUCCESS",
                 "message": "기존 계정과 소셜 로그인이 연동되었습니다.",
@@ -287,7 +364,7 @@ async def social_login(data: SocialLoginBody, response: Response, db: AsyncSessi
 
 
 @router.post("/auth/social/signup")
-async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSession = Depends(get_db)):
+async def social_signup(data: SocialSignupBody, response: Response, request: Request, db: AsyncSession = Depends(get_db)):
     oauth = data.oauth.lower().strip()
     oauth_id = data.oauth_id
     email = data.email
@@ -298,7 +375,23 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     existing = result.scalar_one_or_none()
     if existing:
-        await issue_tokens_and_save(response, db, existing)
+        await issue_tokens_and_save(
+            response=response,
+            db=db,
+            user=existing,
+            user_agent=request.headers.get("user-agent"),
+            ip_address=request.client.host if request.client else None,
+        )
+
+        await create_activity_log(
+            db=db,
+            user_id=existing.id,
+            action="LOGIN",
+            description="로그인",
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+
         return {
             "status": "LOGIN_SUCCESS",
             "message": "이미 가입된 소셜 계정입니다.",
@@ -336,7 +429,23 @@ async def social_signup(data: SocialSignupBody, response: Response, db: AsyncSes
 
     await db.commit()
     await db.refresh(user)
-    await issue_tokens_and_save(response, db, user)
+
+    await issue_tokens_and_save(
+        response=response,
+        db=db,
+        user=user,
+        user_agent=request.headers.get("user-agent"),
+        ip_address=request.client.host if request.client else None,
+    )
+
+    await create_activity_log(
+        db=db,
+        user_id=user.id,
+        action="LOGIN",
+        description="로그인",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
 
     return {
         "status": "SIGNUP_SUCCESS",
@@ -400,6 +509,15 @@ async def signup(
         user=new_user,
         user_agent=request.headers.get("user-agent"),
         ip_address=request.client.host if request.client else None,
+    )
+
+    await create_activity_log(
+        db=db,
+        user_id=new_user.id,
+        action="LOGIN",
+        description="로그인",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
     )
 
     return new_user
@@ -590,6 +708,15 @@ async def login(
         user=user,
         user_agent=request.headers.get("user-agent"),
         ip_address=request.client.host if request.client else None,
+    )
+
+    await create_activity_log(
+        db=db,
+        user_id=user.id,
+        action="LOGIN",
+        description="로그인",
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
     )
 
     return {
