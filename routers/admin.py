@@ -8,7 +8,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from core.config import settings
 from core.database import get_db
+from core.redis_client import redis_client
 from core.minio_assets import build_minio_asset_url
 from core.security import require_user
 from models.admin import (
@@ -2608,3 +2610,130 @@ async def get_user_status_logs(
             )
         )
     return result
+
+# ── LSTM Shadow Mode 토글 ──────────────────────────────
+
+@router.get("/captcha/shadow", tags=["admin-captcha"])
+async def get_shadow_mode(current_user: User = Depends(require_user)):
+    """현재 LSTM Shadow Mode 상태 조회"""
+    return {
+        "shadow_mode": settings.LSTM_SHADOW_MODE,
+        "lstm_weight": settings.LSTM_WEIGHT,
+        "score_formula": (
+            "rule × {r:.0%} + KNN × {k:.0%} + LSTM × {l:.0%}".format(
+                r=1.0 - settings.LSTM_WEIGHT - 0.2,
+                k=0.2,
+                l=settings.LSTM_WEIGHT,
+            )
+            if not settings.LSTM_SHADOW_MODE
+            else "rule × (1-knn_w) + KNN × knn_w  (LSTM 로그만)"
+        ),
+    }
+
+
+@router.put("/captcha/shadow", tags=["admin-captcha"])
+async def toggle_shadow_mode(current_user: User = Depends(require_user)):
+    """LSTM Shadow Mode ON/OFF 토글 (런타임 변경)"""
+    settings.LSTM_SHADOW_MODE = not settings.LSTM_SHADOW_MODE
+    new_state = settings.LSTM_SHADOW_MODE
+
+    return {
+        "shadow_mode": new_state,
+        "message": (
+            "LSTM Shadow ON — LSTM은 로그만 기록, final_score에 미반영"
+            if new_state
+            else "LSTM Shadow OFF — LSTM이 final_score에 반영됨 "
+                 f"(rule×{1.0 - settings.LSTM_WEIGHT - 0.2:.0%} + KNN×20% + LSTM×{settings.LSTM_WEIGHT:.0%})"
+        ),
+    }
+
+
+# ── IP 제재 관리 ──────────────────────────────────────
+
+_CAPTCHA_KEY_PREFIXES = [
+    "captcha:lock:",
+    "captcha:lock-count:",
+    "captcha:ban:",
+    "captcha:wait:",
+    "captcha:force-challenge:",
+]
+
+
+@router.get("/captcha/blocked-ips", tags=["admin-captcha"])
+async def list_blocked_ips(current_user: User = Depends(require_user)):
+    """현재 잠금/밴 상태인 IP 목록 조회"""
+    blocked: dict[str, dict] = {}
+
+    for prefix in _CAPTCHA_KEY_PREFIXES:
+        cursor = 0
+        while True:
+            cursor, keys = await redis_client.scan(cursor, match=f"{prefix}*", count=100)
+            for key in keys:
+                key_str = key if isinstance(key, str) else key.decode()
+                ip = key_str.replace(prefix, "")
+                if ip not in blocked:
+                    blocked[ip] = {"ip": ip, "lock": False, "ban": False, "wait": False, "lock_count": 0, "ttl": {}}
+
+                ttl = await redis_client.ttl(key_str)
+
+                if prefix == "captcha:lock:":
+                    blocked[ip]["lock"] = True
+                    blocked[ip]["ttl"]["lock"] = ttl
+                elif prefix == "captcha:ban:":
+                    blocked[ip]["ban"] = True
+                    blocked[ip]["ttl"]["ban"] = ttl
+                elif prefix == "captcha:wait:":
+                    blocked[ip]["wait"] = True
+                    blocked[ip]["ttl"]["wait"] = ttl
+                elif prefix == "captcha:lock-count:":
+                    val = await redis_client.get(key_str)
+                    blocked[ip]["lock_count"] = int(val) if val else 0
+
+            if cursor == 0:
+                break
+
+    # ban > lock > wait 우선순위로 정렬
+    items = sorted(
+        blocked.values(),
+        key=lambda x: (x["ban"], x["lock"], x["wait"]),
+        reverse=True,
+    )
+    return {"blocked_ips": items, "total": len(items)}
+
+
+@router.delete("/captcha/blocked-ips/{ip}", tags=["admin-captcha"])
+async def unblock_ip(ip: str, current_user: User = Depends(require_user)):
+    """특정 IP의 모든 캡챠 제재 해제"""
+    deleted_keys = []
+    for prefix in _CAPTCHA_KEY_PREFIXES:
+        key = f"{prefix}{ip}"
+        result = await redis_client.delete(key)
+        if result:
+            deleted_keys.append(key)
+
+    return {
+        "ip": ip,
+        "unblocked": len(deleted_keys) > 0,
+        "deleted_keys": deleted_keys,
+        "message": f"{ip} 제재 해제 완료" if deleted_keys else f"{ip}에 대한 제재가 없습니다",
+    }
+
+
+@router.delete("/captcha/blocked-ips", tags=["admin-captcha"])
+async def unblock_all_ips(current_user: User = Depends(require_user)):
+    """모든 IP의 캡챠 제재 해제 (FLUSHDB 대신 캡챠 키만 삭제)"""
+    total_deleted = 0
+    for prefix in _CAPTCHA_KEY_PREFIXES:
+        cursor = 0
+        while True:
+            cursor, keys = await redis_client.scan(cursor, match=f"{prefix}*", count=100)
+            if keys:
+                await redis_client.delete(*keys)
+                total_deleted += len(keys)
+            if cursor == 0:
+                break
+
+    return {
+        "total_deleted": total_deleted,
+        "message": f"캡챠 제재 {total_deleted}건 전체 해제 완료",
+    }
