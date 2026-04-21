@@ -665,8 +665,8 @@ async def _calculate_scores(
     sample_size = len(similar)
 
     if not is_shadow and lstm_available:
-        # LSTM 활성 모드: rule 30% + KNN 20% + LSTM 50%
-        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.5)
+        # LSTM 활성 모드: rule 10% + KNN 20% + LSTM 70%
+        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.7)
         # KNN Cold Start 보호: 데이터 부족 시 KNN 비중을 rule로 이전
         if sample_size >= 5:
             knn_weight = 0.2
@@ -680,6 +680,31 @@ async def _calculate_scores(
             + (vector_score * knn_weight)
             + (lstm_score * lstm_weight)
         )
+
+        # ── 다중 신호 합의 기반 안전장치 ──
+        # 각 신호를 "사람(True) / 봇(False)"으로 판정
+        HUMAN_RULE_TH = 0.6     # rule >= 0.6 이면 사람
+        HUMAN_VECTOR_TH = 0.6   # vector >= 0.6 이면 사람
+        HUMAN_LSTM_TH = 0.4     # lstm >= 0.4 이면 사람
+        vote_rule = rule_score >= HUMAN_RULE_TH
+        vote_vector = vector_score >= HUMAN_VECTOR_TH if sample_size >= 3 else None  # 데이터 부족 시 기권
+        vote_lstm = lstm_score >= HUMAN_LSTM_TH
+
+        votes = [v for v in (vote_rule, vote_vector, vote_lstm) if v is not None]
+        human_votes = sum(1 for v in votes if v)
+        bot_votes = sum(1 for v in votes if not v)
+
+        # 2개 이상이 "사람"인데 final이 block 영역이면 → challenge로 올림
+        if human_votes >= 2 and final_score <= CAPTCHA_CHALLENGE_THRESHOLD:
+            old_final = final_score
+            final_score = CAPTCHA_CHALLENGE_THRESHOLD + 0.01  # block 영역 바로 위
+            logger.info(
+                f"[consensus.override] {human_votes}:{bot_votes} 사람 우세 → "
+                f"block 방지 (final {old_final:.2f} → {final_score:.2f}) "
+                f"votes: rule={'H' if vote_rule else 'B'} "
+                f"vector={'H' if vote_vector else ('B' if vote_vector is not None else '-')} "
+                f"lstm={'H' if vote_lstm else 'B'}"
+            )
     else:
         # Shadow 모드 또는 LSTM 미사용: 기존 rule + KNN만
         if sample_size >= 5:
@@ -1099,6 +1124,8 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
             client_ip, fp_hash, user_agent,
             "immediate_block_env_or_header", rule_score, final_score,
         ))
+        # 환경 차단도 점진적 잠금 적용 (1회 5분 → 2회 10분 → 3회 24h BAN)
+        await _mark_lock(client_ip)
         return CaptchaInitResponse(
             status="block",
             message="비정상적인 브라우저 환경이 감지되었습니다.",
@@ -1144,6 +1171,8 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
             client_ip, fp_hash, user_agent,
             "low_score_block", rule_score, final_score,
         ))
+        # 점수 기반 차단도 점진적 잠금 적용 (1회 5분 → 2회 10분 → 3회 24h BAN)
+        await _mark_lock(client_ip)
         return CaptchaInitResponse(
             status="block",
             message="보안 정책에 따라 접근이 제한되었습니다.",
