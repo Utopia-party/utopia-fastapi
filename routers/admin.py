@@ -27,8 +27,13 @@ from models.user import User
 from schemas.admin import (
     AdminDashboardOut,
     AdminPartyActionIn,
+    AdminPartyMemberKickIn,
+    AdminPartyMemberOut,
+    AdminPartyMemberRoleIn,
     AdminPartyRecordOut,
     AdminPermissionOut,
+    ChatModerationLogOut,
+    ChatModerationStatsOut,
     DashboardChartOut,
     DashboardRecentActivityOut,
     AdminRoleRecordOut,
@@ -45,6 +50,7 @@ from schemas.admin import (
     ReportRecordOut,
     SettlementRecordOut,
     SystemLogRecordOut,
+    UserStatusLogOut,
 )
 from services.notifications.report_notification_service import (
     notify_report_result_to_reporter,
@@ -336,15 +342,20 @@ async def _append_activity_log(
     path: str | None = None,
     ip_address: str | None = None,
     target_id: Any | None = None,
+    reason: str | None = None,
 ) -> None:
-    metadata = {"path": path} if path else None
+    metadata: dict = {}
+    if path:
+        metadata["path"] = path
+    if reason:
+        metadata["reason"] = reason
     db.add(
         ActivityLog(
             actor_user_id=actor_user_id,
             action_type=action_type,
             description=description,
             ip_address=ip_address,
-            extra_metadata=metadata,
+            extra_metadata=metadata or None,
             target_id=target_id,
         )
     )
@@ -611,6 +622,12 @@ async def require_admin_log_permission(
     admin: AdminContext = Depends(require_admin_context),
 ) -> AdminContext:
     return _assert_admin_permission(admin, "can_view_logs", "시스템 로그 조회 권한이 없습니다.")
+
+
+async def require_admin_moderation_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_manage_moderation", "모더레이션 관리 권한이 없습니다.")
 
 
 async def require_admin_role_permission(
@@ -1250,6 +1267,7 @@ async def update_admin_user_status(
         description=f"{target_user.nickname} 상태를 {payload.status}로 변경",
         path=f"/api/admin/users/{user_id}/status",
         target_id=target_user.id,
+        reason=payload.reason,
     )
     await _append_system_log(
         db,
@@ -1839,3 +1857,457 @@ async def get_admin_logs(
         return filtered[:200]
 
     return logs[:200]
+
+@router.get("/parties/{party_id}/members", response_model=list[AdminPartyMemberOut])
+async def get_admin_party_members(
+    party_id: str,
+    _: AdminContext = Depends(require_admin_party_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """파티 상세 - 멤버 목록 (활성 + 퇴장 포함)"""
+    try:
+        party_uuid = __import__("uuid").UUID(party_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 파티 ID입니다.")
+
+    party = await db.get(Party, party_uuid)
+    if not party:
+        raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+
+    rows = (
+        await db.execute(
+            select(PartyMember, User)
+            .join(User, PartyMember.user_id == User.id)
+            .where(PartyMember.party_id == party_uuid)
+            .order_by(PartyMember.joined_at.asc())
+        )
+    ).all()
+
+    result: list[AdminPartyMemberOut] = []
+    for member, user in rows:
+        # 파티장 여부: party.leader_id 또는 role == "leader"
+        effective_role = "leader" if user.id == party.leader_id or member.role == "leader" else member.role
+        result.append(
+            AdminPartyMemberOut(
+                memberId=str(member.id),
+                userId=str(user.id),
+                nickname=user.nickname,
+                name=user.name,
+                role=effective_role,
+                status=member.status,
+                trustScore=float(user.trust_score) if user.trust_score is not None else 36.5,
+                joinedAt=_format_datetime(member.joined_at),
+                leftAt=_format_datetime(member.left_at) if member.left_at else None,
+            )
+        )
+    return result
+
+
+@router.post("/parties/{party_id}/members/{user_id}/kick", response_model=AdminPartyMemberOut)
+async def kick_admin_party_member(
+    party_id: str,
+    user_id: str,
+    payload: AdminPartyMemberKickIn,
+    admin: AdminContext = Depends(require_admin_party_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """파티 멤버 강퇴 (파티장 강퇴 시 다음 멤버를 파티장으로 승격)"""
+    try:
+        import uuid as _uuid
+        party_uuid = _uuid.UUID(party_id)
+        target_uuid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 ID입니다.")
+
+    party = await db.get(Party, party_uuid)
+    if not party:
+        raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+
+    member_row = (
+        await db.execute(
+            select(PartyMember)
+            .where(PartyMember.party_id == party_uuid, PartyMember.user_id == target_uuid, PartyMember.status == "active")
+        )
+    ).scalar_one_or_none()
+    if not member_row:
+        raise HTTPException(status_code=404, detail="활성 멤버가 아닙니다.")
+
+    target_user = await db.get(User, target_uuid)
+
+    was_leader = (party.leader_id == target_uuid)
+
+    # 멤버 강퇴 처리
+    member_row.status = "kicked"
+    member_row.left_at = datetime.now(timezone.utc)
+    if party.current_members and party.current_members > 0:
+        party.current_members -= 1
+
+    # 파티장 강퇴 시 → 가장 오래된 active 멤버를 새 파티장으로 승격
+    new_leader_user: User | None = None
+    if was_leader:
+        next_member_row = (
+            await db.execute(
+                select(PartyMember, User)
+                .join(User, PartyMember.user_id == User.id)
+                .where(
+                    PartyMember.party_id == party_uuid,
+                    PartyMember.status == "active",
+                    PartyMember.user_id != target_uuid,
+                )
+                .order_by(PartyMember.joined_at.asc())
+                .limit(1)
+            )
+        ).first()
+
+        if next_member_row:
+            next_member, next_user = next_member_row
+            next_member.role = "leader"
+            party.leader_id = next_user.id
+            new_leader_user = next_user
+            db.add(
+                Notification(
+                    user_id=next_user.id,
+                    type="PARTY",
+                    title="파티장 승계 안내",
+                    message=f"관리자 조치로 이전 파티장이 강퇴되어 회원님이 '{party.title}' 파티의 새 파티장이 되었습니다.",
+                    reference_type="party",
+                    reference_id=party.id,
+                )
+            )
+        else:
+            # 멤버가 없으면 파티 종료
+            party.status = "ended"
+            party.end_date = datetime.now(timezone.utc).date()
+
+    # 강퇴 알림
+    if target_user:
+        db.add(
+            Notification(
+                user_id=target_uuid,
+                type="PARTY",
+                title="파티 강퇴 안내",
+                message=f"관리자에 의해 '{party.title}' 파티에서 강퇴되었습니다. 사유: {payload.reason or '운영 정책 위반'}",
+                reference_type="party",
+                reference_id=party.id,
+            )
+        )
+
+    desc_extra = f" (신규 파티장: {new_leader_user.nickname})" if new_leader_user else ""
+    await _append_activity_log(
+        db,
+        actor_user_id=admin.user.id,
+        action_type="party_member_kicked",
+        description=f"{target_user.nickname if target_user else user_id} 파티 강퇴 ({party.title}){desc_extra}",
+        path=f"/api/admin/parties/{party_id}/members/{user_id}/kick",
+        target_id=target_uuid,
+        reason=payload.reason,
+    )
+    await db.commit()
+    await db.refresh(member_row)
+
+    return AdminPartyMemberOut(
+        memberId=str(member_row.id),
+        userId=str(target_uuid),
+        nickname=target_user.nickname if target_user else str(target_uuid),
+        name=target_user.name if target_user else None,
+        role="leader" if was_leader else member_row.role,
+        status=member_row.status,
+        trustScore=float(target_user.trust_score) if target_user and target_user.trust_score is not None else 36.5,
+        joinedAt=_format_datetime(member_row.joined_at),
+        leftAt=_format_datetime(member_row.left_at),
+    )
+
+
+@router.patch("/parties/{party_id}/members/{user_id}/role", response_model=AdminPartyMemberOut)
+async def change_admin_party_member_role(
+    party_id: str,
+    user_id: str,
+    payload: AdminPartyMemberRoleIn,
+    admin: AdminContext = Depends(require_admin_party_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """파티 멤버 역할 변경 (파티장 ↔ 멤버). 파티장 변경 시 기존 파티장은 member로 강등."""
+    if payload.role not in {"leader", "member"}:
+        raise HTTPException(status_code=400, detail="role은 'leader' 또는 'member'만 허용됩니다.")
+
+    try:
+        import uuid as _uuid
+        party_uuid = _uuid.UUID(party_id)
+        target_uuid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 ID입니다.")
+
+    party = await db.get(Party, party_uuid)
+    if not party:
+        raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
+
+    member_row = (
+        await db.execute(
+            select(PartyMember)
+            .where(PartyMember.party_id == party_uuid, PartyMember.user_id == target_uuid, PartyMember.status == "active")
+        )
+    ).scalar_one_or_none()
+    if not member_row:
+        raise HTTPException(status_code=404, detail="활성 멤버가 아닙니다.")
+
+    target_user = await db.get(User, target_uuid)
+
+    if payload.role == "leader" and party.leader_id != target_uuid:
+        # 기존 파티장 member로 강등
+        old_leader_row = (
+            await db.execute(
+                select(PartyMember)
+                .where(PartyMember.party_id == party_uuid, PartyMember.user_id == party.leader_id, PartyMember.status == "active")
+            )
+        ).scalar_one_or_none()
+        if old_leader_row:
+            old_leader_row.role = "member"
+
+        old_leader_user = await db.get(User, party.leader_id)
+        if old_leader_user:
+            db.add(
+                Notification(
+                    user_id=old_leader_user.id,
+                    type="PARTY",
+                    title="파티장 변경 안내",
+                    message=f"관리자 조치로 '{party.title}' 파티의 파티장이 변경되었습니다.",
+                    reference_type="party",
+                    reference_id=party.id,
+                )
+            )
+
+        party.leader_id = target_uuid
+        member_row.role = "leader"
+
+        if target_user:
+            db.add(
+                Notification(
+                    user_id=target_uuid,
+                    type="PARTY",
+                    title="파티장 임명 안내",
+                    message=f"관리자에 의해 '{party.title}' 파티의 파티장으로 임명되었습니다.",
+                    reference_type="party",
+                    reference_id=party.id,
+                )
+            )
+    else:
+        member_row.role = payload.role
+
+    await _append_activity_log(
+        db,
+        actor_user_id=admin.user.id,
+        action_type="party_member_role_changed",
+        description=f"{target_user.nickname if target_user else user_id} 역할 변경 → {payload.role} ({party.title})",
+        path=f"/api/admin/parties/{party_id}/members/{user_id}/role",
+        target_id=target_uuid,
+    )
+    await db.commit()
+    await db.refresh(member_row)
+
+    return AdminPartyMemberOut(
+        memberId=str(member_row.id),
+        userId=str(target_uuid),
+        nickname=target_user.nickname if target_user else str(target_uuid),
+        name=target_user.name if target_user else None,
+        role=member_row.role,
+        status=member_row.status,
+        trustScore=float(target_user.trust_score) if target_user and target_user.trust_score is not None else 36.5,
+        joinedAt=_format_datetime(member_row.joined_at),
+        leftAt=None,
+    )
+
+@router.get("/moderation/chat-logs", response_model=list[ChatModerationLogOut])
+async def get_chat_moderation_logs(
+    _: AdminContext = Depends(require_admin_moderation_permission),
+    db: AsyncSession = Depends(get_db),
+    party_id: str | None = Query(default=None),
+    moderation_status: str | None = Query(default=None),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    keyword: str = Query(default=""),
+    limit: int = Query(default=200, le=500),
+):
+    """탐지된 채팅 메시지 로그 (is_flagged=True)"""
+    stmt = (
+        select(PartyChat, Party, User)
+        .join(Party, PartyChat.party_id == Party.id)
+        .outerjoin(User, PartyChat.sender_id == User.id)
+        .where(PartyChat.is_flagged == True)
+        .order_by(PartyChat.created_at.desc())
+        .limit(limit)
+    )
+
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+    if dt_from:
+        stmt = stmt.where(PartyChat.created_at >= dt_from)
+    if dt_to:
+        stmt = stmt.where(PartyChat.created_at < dt_to)
+    if party_id:
+        try:
+            import uuid as _uuid
+            stmt = stmt.where(PartyChat.party_id == _uuid.UUID(party_id))
+        except ValueError:
+            pass
+    if moderation_status:
+        stmt = stmt.where(PartyChat.moderation_status == moderation_status)
+
+    rows = (await db.execute(stmt)).all()
+    q = keyword.lower().strip()
+
+    result: list[ChatModerationLogOut] = []
+    for chat, party, sender in rows:
+        if q and q not in chat.message.lower() and q not in (sender.nickname if sender else "").lower():
+            continue
+        result.append(
+            ChatModerationLogOut(
+                id=str(chat.id),
+                partyId=str(chat.party_id),
+                partyTitle=party.title,
+                senderId=str(chat.sender_id) if chat.sender_id else "-",
+                senderNickname=sender.nickname if sender else "탈퇴/알 수 없음",
+                message=chat.message,
+                flagReason=chat.flag_reason,
+                flagConfidence=chat.flag_confidence,
+                moderationStatus=chat.moderation_status or "pending",
+                isDeleted=chat.is_deleted,
+                createdAt=_format_datetime(chat.created_at),
+            )
+        )
+    return result
+
+
+@router.get("/moderation/chat-stats", response_model=ChatModerationStatsOut)
+async def get_chat_moderation_stats(
+    _: AdminContext = Depends(require_admin_moderation_permission),
+    db: AsyncSession = Depends(get_db),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+):
+    """채팅 모더레이션 통계"""
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+
+    base_flagged = select(func.count()).select_from(PartyChat).where(PartyChat.is_flagged == True)
+    base_total = select(func.count()).select_from(PartyChat)
+
+    if dt_from:
+        base_flagged = base_flagged.where(PartyChat.created_at >= dt_from)
+        base_total = base_total.where(PartyChat.created_at >= dt_from)
+    if dt_to:
+        base_flagged = base_flagged.where(PartyChat.created_at < dt_to)
+        base_total = base_total.where(PartyChat.created_at < dt_to)
+
+    total_flagged = (await db.scalar(base_flagged)) or 0
+    total_messages = (await db.scalar(base_total)) or 0
+
+    def _count_status(status: str):
+        q = select(func.count()).select_from(PartyChat).where(
+            PartyChat.is_flagged == True,
+            PartyChat.moderation_status == status,
+        )
+        if dt_from:
+            q = q.where(PartyChat.created_at >= dt_from)
+        if dt_to:
+            q = q.where(PartyChat.created_at < dt_to)
+        return q
+
+    blocked = (await db.scalar(_count_status("blocked"))) or 0
+    warned = (await db.scalar(_count_status("warned"))) or 0
+    false_positive = (await db.scalar(_count_status("false_positive"))) or 0
+    pending = total_flagged - blocked - warned - false_positive
+
+    detection_rate = round(total_flagged / total_messages * 100, 2) if total_messages > 0 else 0.0
+
+    return ChatModerationStatsOut(
+        totalFlagged=total_flagged,
+        blocked=blocked,
+        warned=warned,
+        falsePositive=false_positive,
+        pending=max(pending, 0),
+        detectionRate=detection_rate,
+    )
+
+
+@router.patch("/moderation/chat-logs/{chat_id}/status")
+async def update_chat_moderation_status(
+    chat_id: str,
+    status: str = Query(..., description="blocked / warned / false_positive / pending"),
+    admin: AdminContext = Depends(require_admin_moderation_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """탐지 오류 수정 (false_positive 마킹 등)"""
+    if status not in {"blocked", "warned", "false_positive", "pending"}:
+        raise HTTPException(status_code=400, detail="허용되지 않는 상태입니다.")
+    try:
+        import uuid as _uuid
+        chat_uuid = _uuid.UUID(chat_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 ID입니다.")
+
+    chat = await db.get(PartyChat, chat_uuid)
+    if not chat:
+        raise HTTPException(status_code=404, detail="채팅 메시지를 찾을 수 없습니다.")
+
+    chat.moderation_status = status
+    await _append_activity_log(
+        db,
+        actor_user_id=admin.user.id,
+        action_type="chat_moderation_status_updated",
+        description=f"채팅 모더레이션 상태 변경 → {status}",
+        target_id=chat_uuid,
+    )
+    await db.commit()
+    return {"id": chat_id, "moderationStatus": status}
+
+@router.get("/users/{user_id}/status-logs", response_model=list[UserStatusLogOut])
+async def get_user_status_logs(
+    user_id: str,
+    _: AdminContext = Depends(require_admin_user_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """특정 사용자의 상태변경(정상/주의/정지) 이력"""
+    try:
+        import uuid as _uuid
+        user_uuid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 사용자 ID입니다.")
+
+    STATUS_ACTIONS = {"STATUS_정상", "STATUS_주의", "STATUS_정지"}
+
+    rows = (
+        await db.execute(
+            select(ActivityLog, User)
+            .outerjoin(User, ActivityLog.actor_user_id == User.id)
+            .where(
+                ActivityLog.target_id == user_uuid,
+                ActivityLog.action_type.in_(STATUS_ACTIONS),
+            )
+            .order_by(ActivityLog.created_at.desc())
+            .limit(100)
+        )
+    ).all()
+
+    result: list[UserStatusLogOut] = []
+    for log, actor in rows:
+        to_status = log.action_type.replace("STATUS_", "")
+        meta = log.extra_metadata or {}
+        reason = meta.get("reason")
+
+        # trigger 분류: reason에 "신고" 포함이면 report, actor가 없으면 auto, 나머지는 manual
+        if not log.actor_user_id:
+            trigger = "auto"
+        elif reason and "신고" in reason:
+            trigger = "report"
+        else:
+            trigger = "manual"
+
+        result.append(
+            UserStatusLogOut(
+                id=str(log.id),
+                toStatus=to_status,
+                changedBy=_actor_display_name(actor),
+                reason=reason,
+                trigger=trigger,
+                createdAt=_format_datetime(log.created_at),
+            )
+        )
+    return result

@@ -215,3 +215,49 @@ class SystemLogRecordOut(BaseModel):
     type: str
     message: str
     actor: str
+
+class AdminPartyMemberOut(BaseModel):
+    memberId: str        
+    userId: str
+    nickname: str
+    name: str | None = None
+    role: str           
+    status: str          
+    trustScore: float
+    joinedAt: str
+    leftAt: str | None = None
+
+class AdminPartyMemberKickIn(BaseModel):
+    reason: str | None = None
+
+class AdminPartyMemberRoleIn(BaseModel):
+    role: str            
+
+class ChatModerationLogOut(BaseModel):
+    id: str
+    partyId: str
+    partyTitle: str
+    senderId: str
+    senderNickname: str
+    message: str
+    flagReason: str | None = None
+    flagConfidence: float | None = None
+    moderationStatus: str | None = None   
+    isDeleted: bool
+    createdAt: str
+
+class ChatModerationStatsOut(BaseModel):
+    totalFlagged: int
+    blocked: int
+    warned: int
+    falsePositive: int
+    pending: int
+    detectionRate: float   
+
+class UserStatusLogOut(BaseModel):
+    id: str
+    toStatus: str          
+    changedBy: str         
+    reason: str | None = None
+    trigger: str           
+    createdAt: str

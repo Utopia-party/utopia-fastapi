@@ -206,6 +206,41 @@ async def delete_message_from_db(party_id: str, user_id: str, content: str):
         print(f"[DB DELETE ERROR] {e}")
 
 
+async def _flag_chat_in_db(
+    party_id: str,
+    user_id: str,
+    content: str,
+    reason: str,
+    moderation_status: str,  # "blocked" | "warned"
+) -> None:
+    """탐지된 메시지를 DB에 is_flagged=True로 기록 (관리자 로그용)"""
+    try:
+        sender_uuid = uuid.UUID(user_id)
+        party_uuid = uuid.UUID(party_id)
+    except (ValueError, TypeError):
+        return
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(PartyChat)
+                .where(
+                    PartyChat.party_id == party_uuid,
+                    PartyChat.sender_id == sender_uuid,
+                    PartyChat.message == content,
+                )
+                .order_by(PartyChat.created_at.desc())
+                .limit(1)
+            )
+            chat = result.scalar_one_or_none()
+            if chat:
+                chat.is_flagged = True
+                chat.flag_reason = reason
+                chat.moderation_status = moderation_status
+                await db.commit()
+    except Exception as e:
+        print(f"[FLAG DB ERROR] {e}")
+
+
 async def moderate_in_background(party_id: str, user_id: str, content: str, ws: WebSocket):
     moderation = await check_message(content)
 
@@ -217,6 +252,9 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         await delete_message_from_redis(party_id, content)
         await delete_message_from_db(party_id, user_id, content)
 
+        # 관리자 로그용 flagging (삭제 후에도 is_flagged 기록)
+        await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "blocked")
+
         # 본인에게 차단 알림
         await manager.send_personal(ws, {
             "type": "error",
@@ -227,7 +265,7 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         # 전체에게 메시지 삭제 브로드캐스트 → 프론트에서 해당 메시지 제거
         await manager.broadcast(party_id, {
             "type": "message_deleted",
-            "content": content,  # 프론트에서 이 content로 해당 메시지 찾아서 제거
+            "content": content,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -241,6 +279,10 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         key = warn_key(party_id, user_id)
         warn_count = await redis_client.incr(key)
         await redis_client.expire(key, REDIS_TTL)
+
+        # 경고 메시지도 flagging
+        await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "warned")
+
         if warn_count >= 3:
             await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
             await manager.send_personal(ws, {
