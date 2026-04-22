@@ -148,13 +148,13 @@ def safe_int(value: Any):
         return int(value)
     except Exception:
         return None
-    
+
+
 CONFUSION_MAP = {
     "0": ["O"],
     "O": ["0"],
-    "1": ["I", "L"],
-    "I": ["1", "L"],
-    "L": ["1", "I"],
+    "1": ["I"],
+    "I": ["1"],
     "5": ["S"],
     "S": ["5"],
     "8": ["B"],
@@ -195,13 +195,11 @@ def resolve_text_match_with_confusions(
     if detected and detected == expected:
         return True, "exact", detected
 
-    # 1차: detected_text 자체의 혼동문자 변형 검사
     if detected:
         variants = generate_confusion_variants(detected)
         if expected in variants:
             return True, "confusion_detected_text", detected
 
-    # 2차: GPU가 준 후보군 각각의 혼동문자 변형 검사
     for candidate in (ocr_text_candidates or []):
         cand = str(candidate).strip().upper()
         if not cand:
@@ -1111,6 +1109,7 @@ async def verify_captcha(
                 "gpuServerUrl": GPU_SERVER_URL,
             }
         )
+
     detected_pose = gpu_result.get("detected_pose")
     pose_confidence = safe_float(gpu_result.get("pose_confidence"))
     detected_text = gpu_result.get("detected_text")
@@ -1118,7 +1117,12 @@ async def verify_captcha(
     ocr_low_confidence = gpu_result.get("ocr_low_confidence", False)
     ocr_text_candidates = gpu_result.get("ocr_text_candidates", [])
 
+    expected_text_normalized = (expected_text or "").strip().upper()
+    detected_text_normalized = (detected_text or "").strip().upper()
+
     pose_ok = detected_pose == expected_pose
+    raw_text_match = detected_text_normalized == expected_text_normalized
+
     text_ok, text_match_mode, matched_candidate = resolve_text_match_with_confusions(
         expected_text=expected_text,
         detected_text=detected_text,
@@ -1127,6 +1131,7 @@ async def verify_captcha(
 
     if isinstance(gpu_result, dict):
         inspection = gpu_result.get("inspection") or {}
+        inspection["api_raw_text_match"] = raw_text_match
         inspection["api_text_match_mode"] = text_match_mode
         inspection["api_matched_candidate"] = matched_candidate
         inspection["api_expected_text"] = expected_text
