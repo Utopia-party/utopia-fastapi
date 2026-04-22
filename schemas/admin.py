@@ -102,8 +102,8 @@ class AdminRoleRecordOut(BaseModel):
     canManageUsers: bool
     canManageParties: bool
     canManageReports: bool
-    canManageModeration: bool
-    canApproveReceipts: bool
+    canManageChatModeration: bool
+    canManageCaptcha: bool
     canApproveSettlements: bool
     canViewLogs: bool
     canManageAdmins: bool
@@ -115,8 +115,8 @@ class AdminRoleUpdateIn(BaseModel):
     canManageUsers: bool
     canManageParties: bool
     canManageReports: bool
-    canManageModeration: bool
-    canApproveReceipts: bool
+    canManageChatModeration: bool
+    canManageCaptcha: bool
     canApproveSettlements: bool
     canViewLogs: bool
     canManageAdmins: bool
@@ -126,8 +126,8 @@ class AdminPermissionOut(BaseModel):
     canManageUsers: bool
     canManageParties: bool
     canManageReports: bool
-    canManageModeration: bool
-    canApproveReceipts: bool
+    canManageChatModeration: bool
+    canManageCaptcha: bool
     canApproveSettlements: bool
     canViewLogs: bool
     canManageAdmins: bool
