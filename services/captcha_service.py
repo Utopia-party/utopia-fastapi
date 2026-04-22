@@ -665,13 +665,14 @@ async def _calculate_scores(
     sample_size = len(similar)
 
     if not is_shadow and lstm_available:
-        # LSTM 활성 모드: rule 20% + KNN 20% + LSTM 60%
-        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.6)
+        # LSTM 활성 모드: rule + KNN + LSTM (관리자 대시보드에서 조정 가능)
+        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.7)
+        knn_base = getattr(settings, "KNN_WEIGHT", 0.2)
         # KNN Cold Start 보호: 데이터 부족 시 KNN 비중을 rule로 이전
         if sample_size >= 5:
-            knn_weight = 0.2
+            knn_weight = knn_base
         elif sample_size >= 3:
-            knn_weight = 0.1
+            knn_weight = knn_base * 0.5
         else:
             knn_weight = 0.0  # KNN 데이터 없으면 rule에 의존
         rule_weight = 1.0 - lstm_weight - knn_weight
@@ -1065,8 +1066,14 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
 
     # 이번 수정: 잠금 해제 후 첫 재시도는 pass로 빠지지 않고 반드시 challenge를 다시 시작합니다.
     # 잠금이 해제된 직후 첫 시도는 행동 점수와 무관하게 반드시 이미지 캡챠로 다시 보냅니다.
-    if await redis_client.get(_force_challenge_key(client_ip)):
-        await redis_client.delete(_force_challenge_key(client_ip))
+    # 관리자 강제 챌린지: 특정 IP 키 또는 와일드카드(*) 키 확인
+    _fc_ip = await redis_client.get(_force_challenge_key(client_ip))
+    _fc_all = await redis_client.get("captcha:force-challenge:*")
+    if _fc_ip or _fc_all:
+        if _fc_ip:
+            await redis_client.delete(_force_challenge_key(client_ip))
+        if _fc_all:
+            await redis_client.delete("captcha:force-challenge:*")
 
         session_id = str(uuid.uuid4())
         session_payload = {
