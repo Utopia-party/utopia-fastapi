@@ -5,7 +5,7 @@ from typing import Optional, Any
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +27,15 @@ from schemas.party import (
     TransferLeaderRequest,
 )
 from schemas.user import MessageOut
+
+from services.notifications.party_notification_service import (
+    notify_party_join_approved,
+    notify_party_join_requested,
+    notify_party_join_request_rejected,
+    notify_party_join_request_submitted,
+    notify_party_member_joined_to_leader,
+    notify_party_member_kicked,
+)
 
 router = APIRouter(prefix="/parties", tags=["parties"])
 logger = logging.getLogger(__name__)
@@ -152,10 +161,18 @@ async def consume_captcha_pass_token(pass_token: str) -> None:
 
 @router.get("/services", response_model=list[ServiceOut])
 async def list_services(db: AsyncSession = Depends(get_db)):
+    category_order = case(
+        (Service.category == "OTT", 1),
+        (Service.category == "교육/도서", 2),
+        (Service.category == "음악/멤버십", 3),
+        (Service.category == "생산성/기타", 4),
+        else_=5,
+    )
+
     result = await db.execute(
         select(Service)
         .where(Service.is_active.is_(True))
-        .order_by(Service.category, Service.name)
+        .order_by(category_order, Service.name)
     )
     services = result.scalars().all()
 
@@ -174,7 +191,21 @@ async def list_services(db: AsyncSession = Depends(get_db)):
 
 @router.get("/categories", response_model=list[CategoryOut])
 async def list_categories(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Service.category).distinct())
+    category_order = case(
+        (Service.category == "OTT", 1),
+        (Service.category == "교육/도서", 2),
+        (Service.category == "음악/멤버십", 3),
+        (Service.category == "생산성/기타", 4),
+        else_=5,
+    )
+
+    result = await db.execute(
+        select(Service.category)
+        .where(Service.category.is_not(None))
+        .group_by(Service.category)
+        .order_by(category_order, Service.category)
+    )
+
     categories = result.scalars().all()
     return [{"name": cat} for cat in categories if cat]
 
@@ -421,6 +452,19 @@ async def apply_to_party(
             status_code=500,
             detail="파티 신청 처리 중 서버 오류가 발생했습니다.",
         )
+    
+    await notify_party_join_request_submitted(
+        db=db,
+        party=party,
+        applicant_user_id=current_user.id,
+    )
+
+    await notify_party_join_requested(
+        db=db,
+        party=party,
+        applicant_user_id=current_user.id,
+        applicant_nickname=current_user.nickname,
+    )
 
     return MessageOut(message="참여 신청이 완료되었습니다. 리더 승인을 기다려주세요.")
 
@@ -556,6 +600,12 @@ async def kick_member(
         await db.rollback()
         logger.error(f"Error kicking member: {e}")
         raise HTTPException(status_code=500, detail="강퇴 처리 중 오류가 발생했습니다.")
+    
+    await notify_party_member_kicked(
+        db=db,
+        party=party,
+        target_user_id=user_id,
+    )
 
     return MessageOut(message="멤버를 강퇴했습니다.")
 
@@ -678,6 +728,20 @@ async def approve_application(
         await db.rollback()
         logger.error(f"Error approving application: {e}")
         raise HTTPException(status_code=500, detail="승인 처리 중 오류가 발생했습니다.")
+    
+    await notify_party_join_approved(
+        db=db,
+        party=party,
+        member_user_id=user_id,
+    )
+
+    await notify_party_member_joined_to_leader(
+        db=db,
+        party=party,
+        member_user_id=user_id,
+        member_nickname=target.user.nickname if target.user else None,
+        join_type=target.join_type,
+    )
 
     return MessageOut(message="신청을 승인했습니다.")
 
@@ -710,5 +774,15 @@ async def reject_application(
         await db.rollback()
         logger.error(f"Error rejecting application: {e}")
         raise HTTPException(status_code=500, detail="거절 처리 중 오류가 발생했습니다.")
+    
+    await notify_party_join_request_rejected(
+        db=db,
+        party=party,
+        applicant_user_id=user_id,
+    )
 
     return MessageOut(message="신청을 거절했습니다.")
+
+
+
+# 파티 사용자 알림

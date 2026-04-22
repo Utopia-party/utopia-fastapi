@@ -48,9 +48,7 @@ async def notify_report_submitted(
         user_id=report.reporter_id,
         type="report",
         title="신고가 접수되었어요",
-        message=(
-            f"{report.target_snapshot_name or '대상'}에 대한 신고가 정상 접수되었습니다."
-        ),
+        message=f"{report.target_snapshot_name or '대상'}에 대한 신고가 접수되었어요.",
         reference_type="report",
         reference_id=report.id,
         metadata={
@@ -106,8 +104,8 @@ async def notify_report_warning_to_target(
         db=db,
         user_id=report.target_id,
         type="report",
-        title="운영 경고가 안내되었어요",
-        message=warning_message or "신고 검토 결과 운영 경고가 적용되었습니다.",
+        title="운영 경고가 적용되었어요",
+        message=warning_message or "신고 검토 결과 운영 경고가 적용되었어요.",
         reference_type="report",
         reference_id=report.id,
         metadata={
@@ -135,7 +133,7 @@ async def notify_report_penalty_to_target(
         user_id=report.target_id,
         type="report",
         title="이용 제재가 적용되었어요",
-        message=penalty_message or "운영 정책 위반으로 이용 제재가 적용되었습니다.",
+        message=penalty_message or "운영 정책 위반으로 이용 제재가 적용되었어요.",
         reference_type="report",
         reference_id=report.id,
         metadata={

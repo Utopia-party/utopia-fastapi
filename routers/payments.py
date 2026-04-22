@@ -13,6 +13,11 @@ from models.party import Party
 from models.user import User
 from services.auth_service import decode_access_token
 
+from services.notifications.settlement_notification_service import (
+    notify_settlement_requested_to_member,
+    notify_member_settlement_completed_to_leader,
+)
+
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 
@@ -202,6 +207,13 @@ async def card_confirm(
     await db.commit()
     await db.refresh(payment)
 
+    await notify_member_settlement_completed_to_leader(
+        db=db,
+        party=party,
+        member_user_id=current_user.id,
+        member_nickname=current_user.nickname,
+    )
+    
     print(f"[PAYMENT] 저장 완료: payment_id={payment.id}, status={payment.status}")
     return payment
 
@@ -253,6 +265,13 @@ async def transfer_register(
     await db.commit()
     await db.refresh(payment)
 
+    await notify_settlement_requested_to_member(
+        db=db,
+        party=party,
+        member_user_id=party.leader_id,
+        amount=body.amount,
+    )
+
     print(f"[PAYMENT] 저장 완료: payment_id={payment.id}, status={payment.status}")
     return payment
 
@@ -275,6 +294,15 @@ async def approve_transfer(
     payment.status = "approved"
     payment.paid_at = datetime.now(timezone.utc)
     await db.commit()
+
+    user = await db.get(User, payment.user_id)
+
+    await notify_member_settlement_completed_to_leader(
+        db=db,
+        party=await db.get(Party, payment.party_id),
+        member_user_id=payment.user_id,
+        member_nickname=user.nickname if user else None,
+    )
 
     print(f"[PAYMENT] 관리자 승인: payment_id={payment_id}")
     return {"message": "승인 완료", "payment_id": str(payment_id)}
