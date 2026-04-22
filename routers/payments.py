@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
 from models.payment import Payment
-from models.party import Party
+from models.party import Party, Service
 from models.user import User
 from services.auth_service import decode_access_token
 
@@ -19,6 +19,40 @@ from services.notifications.settlement_notification_service import (
 )
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+
+
+def _calc_payment(
+    base_amount: int,
+    party: Party,
+    service: Service | None,
+    is_leader: bool,
+    has_referrer: bool,
+) -> tuple[int, float, int, str | None]:
+    """
+    할인 적용 후 실결제금액·수수료 계산
+    returns: (amount, commission_rate, commission_amount, discount_reason)
+    """
+    discount_rate = 0.0
+    reasons: list[str] = []
+
+    if is_leader:
+        leader_disc = float(service.leader_discount_rate or 0) if service else 0.0
+        if leader_disc > 0:
+            discount_rate += leader_disc
+            reasons.append(f"방장 할인 {int(leader_disc * 100)}%")
+
+    if has_referrer:
+        ref_disc = float(service.referral_discount_rate or 0) if service else 0.0
+        if ref_disc > 0:
+            discount_rate += ref_disc
+            reasons.append(f"추천인 할인 {int(ref_disc * 100)}%")
+
+    discount_rate = min(discount_rate, 1.0)
+    amount = round(base_amount * (1 - discount_rate))
+    commission_rate = 0.10
+    commission_amount = int(amount * commission_rate)
+    discount_reason = " + ".join(reasons) if reasons else None
+    return amount, commission_rate, commission_amount, discount_reason
 
 
 async def get_current_user(
@@ -187,14 +221,21 @@ async def card_confirm(
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
 
-    commission_rate = 0.10
+    service = await db.get(Service, party.service_id) if party.service_id else None
+    is_leader = (party.leader_id == current_user.id)
+    has_referrer = (current_user.referrer_id is not None)
+    amount, commission_rate, commission_amount, discount_reason = _calc_payment(
+        body.amount, party, service, is_leader, has_referrer
+    )
+
     payment = Payment(
         user_id=current_user.id,
         party_id=body.party_id,
         base_price=body.amount,
         commission_rate=commission_rate,
-        commission_amount=int(body.amount * commission_rate),
-        amount=body.amount,
+        commission_amount=commission_amount,
+        discount_reason=discount_reason,
+        amount=amount,
         payment_method="card",
         status="approved",
         billing_month=billing_month,
@@ -245,14 +286,21 @@ async def transfer_register(
     if not party:
         raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
 
-    commission_rate = 0.10
+    service = await db.get(Service, party.service_id) if party.service_id else None
+    is_leader = (party.leader_id == current_user.id)
+    has_referrer = (current_user.referrer_id is not None)
+    amount, commission_rate, commission_amount, discount_reason = _calc_payment(
+        body.amount, party, service, is_leader, has_referrer
+    )
+
     payment = Payment(
         user_id=current_user.id,
         party_id=body.party_id,
         base_price=body.amount,
         commission_rate=commission_rate,
-        commission_amount=int(body.amount * commission_rate),
-        amount=body.amount,
+        commission_amount=commission_amount,
+        discount_reason=discount_reason,
+        amount=amount,
         payment_method="transfer",
         status="pending",
         billing_month=billing_month,
