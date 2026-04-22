@@ -2747,3 +2747,103 @@ async def unblock_all_ips(current_user: User = Depends(require_user)):
         "total_deleted": total_deleted,
         "message": f"캡챠 제재 {total_deleted}건 전체 해제 완료",
     }
+
+
+# ── 캡챠 수치 설정 (런타임) ──────────────────────────────
+
+@router.get("/captcha/config", tags=["admin-captcha"])
+async def get_captcha_config(current_user: User = Depends(require_user)):
+    """현재 캡챠 가중치 및 임계값 조회"""
+    lstm_w = getattr(settings, "LSTM_WEIGHT", 0.7)
+    knn_w = getattr(settings, "KNN_WEIGHT", 0.2)
+    rule_w = round(1.0 - lstm_w - knn_w, 4)
+    return {
+        "lstm_weight": lstm_w,
+        "knn_weight": knn_w,
+        "rule_weight": rule_w,
+        "pass_threshold": getattr(settings, "CAPTCHA_PASS_THRESHOLD", 0.7),
+        "challenge_threshold": getattr(settings, "CAPTCHA_CHALLENGE_THRESHOLD", 0.3),
+    }
+
+
+@router.put("/captcha/config", tags=["admin-captcha"])
+async def update_captcha_config(
+    body: dict,
+    current_user: User = Depends(require_user),
+):
+    """캡챠 가중치/임계값 런타임 변경
+
+    body 예시:
+      {"lstm_weight": 0.7, "knn_weight": 0.2,
+       "pass_threshold": 0.7, "challenge_threshold": 0.3}
+    """
+    import services.captcha_service as cs
+
+    updated: list[str] = []
+
+    # ── 가중치 변경 ──
+    if "lstm_weight" in body or "knn_weight" in body:
+        lstm_w = float(body.get("lstm_weight", settings.LSTM_WEIGHT))
+        knn_w = float(body.get("knn_weight", getattr(settings, "KNN_WEIGHT", 0.2)))
+        rule_w = 1.0 - lstm_w - knn_w
+
+        if rule_w < 0 or rule_w > 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"rule_weight({rule_w:.2f})가 0~1 범위를 벗어납니다. lstm+knn <= 1.0 이어야 합니다.",
+            )
+
+        settings.LSTM_WEIGHT = lstm_w
+        settings.KNN_WEIGHT = knn_w
+        updated.append(f"weights: rule={rule_w:.0%} KNN={knn_w:.0%} LSTM={lstm_w:.0%}")
+
+    # ── 임계값 변경 ──
+    if "pass_threshold" in body:
+        val = float(body["pass_threshold"])
+        settings.CAPTCHA_PASS_THRESHOLD = val
+        cs.CAPTCHA_PASS_THRESHOLD = val
+        updated.append(f"pass_threshold={val}")
+
+    if "challenge_threshold" in body:
+        val = float(body["challenge_threshold"])
+        settings.CAPTCHA_CHALLENGE_THRESHOLD = val
+        cs.CAPTCHA_CHALLENGE_THRESHOLD = val
+        updated.append(f"challenge_threshold={val}")
+
+    lstm_w = settings.LSTM_WEIGHT
+    knn_w = getattr(settings, "KNN_WEIGHT", 0.2)
+    rule_w = round(1.0 - lstm_w - knn_w, 4)
+
+    return {
+        "message": f"변경 완료: {', '.join(updated)}" if updated else "변경 사항 없음",
+        "lstm_weight": lstm_w,
+        "knn_weight": knn_w,
+        "rule_weight": rule_w,
+        "pass_threshold": settings.CAPTCHA_PASS_THRESHOLD,
+        "challenge_threshold": settings.CAPTCHA_CHALLENGE_THRESHOLD,
+    }
+
+
+# ── 챌린지 강제 발동 ──────────────────────────────────────
+
+@router.post("/captcha/force-challenge", tags=["admin-captcha"])
+async def force_challenge(
+    body: dict | None = None,
+    current_user: User = Depends(require_user),
+):
+    """특정 IP(또는 모든 IP)에 대해 다음 캡챠를 강제로 challenge로 만듦.
+
+    body 예시:
+      {"ip": "202.31.255.26"}   → 해당 IP만
+      {} 또는 body 없음          → 모든 활성 IP
+    """
+    target_ip = (body or {}).get("ip", "").strip()
+
+    if target_ip:
+        # 특정 IP만
+        await redis_client.setex(f"captcha:force-challenge:{target_ip}", 300, "1")
+        return {"message": f"{target_ip}에 챌린지 강제 발동 (5분간 유효)"}
+
+    # IP 미지정 시: 와일드카드 대신 잘 알려진 방법 → 0.0.0.0 플래그
+    await redis_client.setex("captcha:force-challenge:*", 300, "1")
+    return {"message": "모든 IP에 챌린지 강제 발동 (5분간 유효)"}
