@@ -5,7 +5,7 @@ from typing import Optional, Any
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -161,10 +161,18 @@ async def consume_captcha_pass_token(pass_token: str) -> None:
 
 @router.get("/services", response_model=list[ServiceOut])
 async def list_services(db: AsyncSession = Depends(get_db)):
+    category_order = case(
+        (Service.category == "OTT", 1),
+        (Service.category == "교육/도서", 2),
+        (Service.category == "음악/멤버십", 3),
+        (Service.category == "생산성/기타", 4),
+        else_=5,
+    )
+
     result = await db.execute(
         select(Service)
         .where(Service.is_active.is_(True))
-        .order_by(Service.category, Service.name)
+        .order_by(category_order, Service.name)
     )
     services = result.scalars().all()
 
@@ -183,7 +191,21 @@ async def list_services(db: AsyncSession = Depends(get_db)):
 
 @router.get("/categories", response_model=list[CategoryOut])
 async def list_categories(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Service.category).distinct())
+    category_order = case(
+        (Service.category == "OTT", 1),
+        (Service.category == "교육/도서", 2),
+        (Service.category == "음악/멤버십", 3),
+        (Service.category == "생산성/기타", 4),
+        else_=5,
+    )
+
+    result = await db.execute(
+        select(Service.category)
+        .where(Service.category.is_not(None))
+        .group_by(Service.category)
+        .order_by(category_order, Service.category)
+    )
+
     categories = result.scalars().all()
     return [{"name": cat} for cat in categories if cat]
 
