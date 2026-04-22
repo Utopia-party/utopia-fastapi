@@ -802,6 +802,14 @@ async def get_admin_dashboard(
         for payment in comparison_payments
         if (payment.status or "").lower() == "approved"
     )
+    current_commission = sum(
+        payment.commission_amount for payment in current_payments
+        if (payment.status or "").lower() == "approved"
+    )
+    comparison_commission = sum(
+        payment.commission_amount for payment in comparison_payments
+        if (payment.status or "").lower() == "approved"
+    )
     current_reports_count = len(current_reports)
     comparison_reports_count = len(comparison_reports)
     current_pending_settlements = sum(
@@ -978,6 +986,7 @@ async def get_admin_dashboard(
 
     signup_delta, signup_trend = _format_change(current_signups, comparison_signups)
     sales_delta, sales_trend = _format_change(current_sales, comparison_sales)
+    commission_delta, commission_trend = _format_change(current_commission, comparison_commission)
     report_delta, report_trend = _format_change(current_reports_count, comparison_reports_count)
     settlement_delta, settlement_trend = _format_change(
         current_pending_settlements,
@@ -1011,6 +1020,14 @@ async def get_admin_dashboard(
                 "helper": "승인된 결제 기준 매출 합계",
                 "delta": sales_delta,
                 "trend": sales_trend,
+            },
+            {
+                "id": "commission",
+                "label": "수수료 수익",
+                "value": f"₩ {int(current_commission):,}",
+                "helper": "승인된 결제 기준 수수료 합계 (10%)",
+                "delta": commission_delta,
+                "trend": commission_trend,
             },
             {
                 "id": "reports",
@@ -2847,3 +2864,123 @@ async def force_challenge(
     # IP 미지정 시: 와일드카드 대신 잘 알려진 방법 → 0.0.0.0 플래그
     await redis_client.setex("captcha:force-challenge:*", 300, "1")
     return {"message": "모든 IP에 챌린지 강제 발동 (5분간 유효)"}
+
+# ─── 결제 내역 관리 ───────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+
+class AdminPaymentRecordOut(_BaseModel):
+    id: str
+    userId: str
+    userNickname: str
+    userName: str | None
+    partyId: str
+    partyTitle: str
+    serviceName: str | None
+    role: str
+    basePrice: int
+    amount: int
+    discountReason: str | None
+    commissionRate: float
+    commissionAmount: int
+    paymentMethod: str | None
+    status: str
+    billingMonth: str
+    pricingType: str | None
+    paidAt: str | None
+    createdAt: str
+
+    class Config:
+        from_attributes = True
+
+
+class AdminPaymentListOut(_BaseModel):
+    items: list[AdminPaymentRecordOut]
+    total: int
+    page: int
+    limit: int
+    totalPages: int
+
+
+@router.get("/payments", response_model=AdminPaymentListOut)
+async def get_admin_payments(
+    keyword: str = Query(""),
+    status_filter: str = Query("", alias="status"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """결제 내역 전체 목록 (관리자 전용, 페이지네이션)"""
+    stmt = (
+        select(Payment, User, Party, Service)
+        .join(User, Payment.user_id == User.id)
+        .join(Party, Payment.party_id == Party.id)
+        .outerjoin(Service, Party.service_id == Service.id)
+        .order_by(Payment.created_at.desc())
+    )
+
+    if status_filter:
+        stmt = stmt.where(func.lower(Payment.status) == status_filter.lower())
+    if date_from:
+        stmt = stmt.where(func.date(Payment.created_at) >= date_from)
+    if date_to:
+        stmt = stmt.where(func.date(Payment.created_at) <= date_to)
+
+    rows = (await db.execute(stmt)).all()
+
+    # 키워드 필터 (Python-side)
+    filtered = []
+    for payment, user, party, service in rows:
+        if keyword:
+            kw = keyword.lower()
+            hit = (
+                kw in (user.nickname or "").lower()
+                or kw in (user.name or "").lower()
+                or kw in (party.title or "").lower()
+                or kw in (service.name if service else "").lower()
+            )
+            if not hit:
+                continue
+        filtered.append((payment, user, party, service))
+
+    total = len(filtered)
+    total_pages = max(1, (total + limit - 1) // limit)
+    paginated = filtered[(page - 1) * limit : page * limit]
+
+    items = []
+    for payment, user, party, service in paginated:
+        role = "방장" if party.leader_id == user.id else "멤버"
+        items.append(
+            AdminPaymentRecordOut(
+                id=str(payment.id),
+                userId=str(user.id),
+                userNickname=user.nickname,
+                userName=user.name,
+                partyId=str(party.id),
+                partyTitle=party.title,
+                serviceName=service.name if service else None,
+                role=role,
+                basePrice=payment.base_price or payment.amount,
+                amount=payment.amount,
+                discountReason=payment.discount_reason,
+                commissionRate=float(payment.commission_rate or 0.10),
+                commissionAmount=payment.commission_amount,
+                paymentMethod=payment.payment_method,
+                status=payment.status,
+                billingMonth=payment.billing_month,
+                pricingType=payment.pricing_type,
+                paidAt=payment.paid_at.isoformat() if payment.paid_at else None,
+                createdAt=payment.created_at.isoformat(),
+            )
+        )
+
+    return AdminPaymentListOut(
+        items=items,
+        total=total,
+        page=page,
+        limit=limit,
+        totalPages=total_pages,
+    )
