@@ -5,10 +5,16 @@ import random
 import json
 import traceback
 import logging
+import asyncio
+import hashlib
+from datetime import datetime
+from io import BytesIO
 from typing import Any, Optional
 
 import redis.asyncio as redis
 import asyncpg
+from PIL import Image
+from minio import Minio
 
 from core.config import settings
 
@@ -34,6 +40,16 @@ MAX_ATTEMPTS = 5
 
 DATABASE_URL = settings.DATABASE_URL
 _db_pool: Optional[asyncpg.Pool] = None
+
+minio_client = Minio(
+    settings.MINIO_ENDPOINT,
+    access_key=settings.MINIO_ACCESS_KEY,
+    secret_key=settings.MINIO_SECRET_KEY,
+    secure=settings.MINIO_SECURE,
+)
+
+PHOTO_BUCKET = settings.MINIO_PHOTO_BUCKET
+_photo_bucket_ready = False
 
 
 # ─────────────────────────────────────────────
@@ -132,6 +148,149 @@ def safe_int(value: Any):
         return int(value)
     except Exception:
         return None
+
+
+def guess_image_ext(upload: UploadFile) -> str:
+    filename = (upload.filename or "").lower()
+    content_type = (upload.content_type or "").lower()
+
+    if filename.endswith(".png") or content_type == "image/png":
+        return ".png"
+    if filename.endswith(".webp") or content_type == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+
+def guess_content_type(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").strip().lower()
+    if content_type:
+        return content_type
+
+    ext = guess_image_ext(upload)
+    if ext == ".png":
+        return "image/png"
+    if ext == ".webp":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def extract_image_size(image_bytes: bytes) -> tuple[Optional[int], Optional[int]]:
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            return img.width, img.height
+    except Exception:
+        return None, None
+
+
+def ensure_photo_bucket() -> None:
+    global _photo_bucket_ready
+
+    if _photo_bucket_ready:
+        return
+
+    if not minio_client.bucket_exists(PHOTO_BUCKET):
+        minio_client.make_bucket(PHOTO_BUCKET)
+
+    _photo_bucket_ready = True
+
+
+def upload_original_image_to_minio(upload: UploadFile, image_bytes: bytes) -> dict:
+    ensure_photo_bucket()
+
+    sha256 = hashlib.sha256(image_bytes).hexdigest()
+    width, height = extract_image_size(image_bytes)
+    ext = guess_image_ext(upload)
+    content_type = guess_content_type(upload)
+
+    now = datetime.utcnow()
+    object_key = (
+        f"handocr/original/"
+        f"{now:%Y/%m/%d}/"
+        f"{sha256[:2]}/"
+        f"{uuid.uuid4().hex}{ext}"
+    )
+
+    minio_client.put_object(
+        PHOTO_BUCKET,
+        object_key,
+        BytesIO(image_bytes),
+        length=len(image_bytes),
+        content_type=content_type,
+    )
+
+    return {
+        "image_key": object_key,
+        "image_sha256": sha256,
+        "image_width": width,
+        "image_height": height,
+    }
+
+
+def normalize_text_region_bbox(text_region_bbox: Optional[dict], image_width: int, image_height: int) -> Optional[dict]:
+    if not text_region_bbox:
+        return None
+
+    try:
+        x_min = max(int(text_region_bbox.get("x_min", 0)), 0)
+        y_min = max(int(text_region_bbox.get("y_min", 0)), 0)
+        x_max = min(int(text_region_bbox.get("x_max", 0)), image_width)
+        y_max = min(int(text_region_bbox.get("y_max", 0)), image_height)
+
+        if x_max <= x_min or y_max <= y_min:
+            return None
+
+        normalized = dict(text_region_bbox)
+        normalized["x_min"] = x_min
+        normalized["y_min"] = y_min
+        normalized["x_max"] = x_max
+        normalized["y_max"] = y_max
+        normalized["width"] = x_max - x_min
+        normalized["height"] = y_max - y_min
+        return normalized
+    except Exception:
+        return None
+
+
+def upload_text_crop_to_minio(image_bytes: bytes, text_region_bbox: dict) -> tuple[Optional[str], Optional[dict]]:
+    ensure_photo_bucket()
+
+    with Image.open(BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+        image_width, image_height = rgb.size
+
+        normalized_bbox = normalize_text_region_bbox(text_region_bbox, image_width, image_height)
+        if not normalized_bbox:
+            return None, None
+
+        crop = rgb.crop((
+            normalized_bbox["x_min"],
+            normalized_bbox["y_min"],
+            normalized_bbox["x_max"],
+            normalized_bbox["y_max"],
+        ))
+
+        buffer = BytesIO()
+        crop.save(buffer, format="PNG")
+        crop_bytes = buffer.getvalue()
+
+    crop_sha256 = hashlib.sha256(crop_bytes).hexdigest()
+    now = datetime.utcnow()
+    object_key = (
+        f"handocr/text-crop/"
+        f"{now:%Y/%m/%d}/"
+        f"{crop_sha256[:2]}/"
+        f"{uuid.uuid4().hex}.png"
+    )
+
+    minio_client.put_object(
+        PHOTO_BUCKET,
+        object_key,
+        BytesIO(crop_bytes),
+        length=len(crop_bytes),
+        content_type="image/png",
+    )
+
+    return object_key, normalized_bbox
 
 
 # ─────────────────────────────────────────────
@@ -312,6 +471,12 @@ async def save_hand_pose_sample(
     pose_match: Optional[bool],
     text_match: Optional[bool],
     gpu_result: Optional[dict],
+    image_key: Optional[str] = None,
+    image_sha256: Optional[str] = None,
+    image_width: Optional[int] = None,
+    image_height: Optional[int] = None,
+    text_region_bbox: Optional[dict] = None,
+    text_crop_key: Optional[str] = None,
 ):
     pool = await get_db_pool()
 
@@ -383,13 +548,20 @@ async def save_hand_pose_sample(
         verify_success,
         pose_match,
         text_match,
+        image_key,
+        image_sha256,
+        image_width,
+        image_height,
+        text_region_bbox,
+        text_crop_key,
         created_at
     )
     VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8,
         $9::jsonb, $10::jsonb, $11, $12, $13, $14,
         $15::jsonb, $16::jsonb, $17::jsonb,
-        $18, $19, $20, $21, $22, $23, $24, $25, NOW()
+        $18, $19, $20, $21, $22, $23, $24, $25,
+        $26, $27, $28, $29, $30::jsonb, $31, NOW()
     )
     """
 
@@ -421,6 +593,12 @@ async def save_hand_pose_sample(
             verify_success,
             pose_match,
             text_match,
+            image_key,
+            image_sha256,
+            image_width,
+            image_height,
+            json.dumps(text_region_bbox, ensure_ascii=False) if text_region_bbox is not None else None,
+            text_crop_key,
         )
 
 
@@ -449,7 +627,6 @@ async def start_captcha(request: Request):
     active_session_key = f"captcha:active_session:{ip}"
     existing_session_id = await redis_client.get(active_session_key)
 
-    # 기존 진행 중 세션이 있으면 재사용하지 않고 폐기
     if existing_session_id:
         await redis_client.delete(f"captcha:{existing_session_id}")
         await redis_client.delete(active_session_key)
@@ -554,9 +731,27 @@ async def verify_captcha(
             }
         )
 
+    image_meta = {
+        "image_key": None,
+        "image_sha256": None,
+        "image_width": None,
+        "image_height": None,
+    }
+
+    try:
+        image_meta = await asyncio.to_thread(
+            upload_original_image_to_minio,
+            image,
+            image_bytes,
+        )
+    except Exception:
+        logger.exception("failed to upload original image to minio")
+
     gpu_result = None
     gpu_status_code = None
     gpu_raw_text = None
+    text_region_bbox = None
+    text_crop_key = None
 
     timeout = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0)
 
@@ -585,6 +780,20 @@ async def verify_captcha(
 
             try:
                 gpu_result = response.json()
+
+                if isinstance(gpu_result, dict):
+                    text_region_bbox = gpu_result.get("text_region_bbox")
+
+                    if text_region_bbox:
+                        try:
+                            text_crop_key, text_region_bbox = await asyncio.to_thread(
+                                upload_text_crop_to_minio,
+                                image_bytes,
+                                text_region_bbox,
+                            )
+                        except Exception:
+                            logger.exception("failed to upload text crop to minio")
+
             except Exception as json_error:
                 logger.exception("GPU json parse failed")
 
@@ -602,6 +811,12 @@ async def verify_captcha(
                             "message": "AI 서버 응답을 해석하지 못했습니다.",
                             "detail": repr(json_error),
                         },
+                        image_key=image_meta.get("image_key"),
+                        image_sha256=image_meta.get("image_sha256"),
+                        image_width=image_meta.get("image_width"),
+                        image_height=image_meta.get("image_height"),
+                        text_region_bbox=None,
+                        text_crop_key=None,
                     )
                 except Exception:
                     logger.exception("failed to save failed hand pose sample")
@@ -798,6 +1013,12 @@ async def verify_captcha(
                 pose_match=None,
                 text_match=None,
                 gpu_result=gpu_result,
+                image_key=image_meta.get("image_key"),
+                image_sha256=image_meta.get("image_sha256"),
+                image_width=image_meta.get("image_width"),
+                image_height=image_meta.get("image_height"),
+                text_region_bbox=text_region_bbox,
+                text_crop_key=text_crop_key,
             )
         except Exception:
             logger.exception("failed to save failed hand pose sample")
@@ -842,6 +1063,12 @@ async def verify_captcha(
             pose_match=pose_ok,
             text_match=text_ok,
             gpu_result=gpu_result,
+            image_key=image_meta.get("image_key"),
+            image_sha256=image_meta.get("image_sha256"),
+            image_width=image_meta.get("image_width"),
+            image_height=image_meta.get("image_height"),
+            text_region_bbox=text_region_bbox,
+            text_crop_key=text_crop_key,
         )
     except Exception:
         logger.exception("failed to save hand pose sample")

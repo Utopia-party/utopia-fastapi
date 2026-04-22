@@ -665,8 +665,8 @@ async def _calculate_scores(
     sample_size = len(similar)
 
     if not is_shadow and lstm_available:
-        # LSTM 활성 모드: rule 10% + KNN 20% + LSTM 70%
-        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.7)
+        # LSTM 활성 모드: rule 20% + KNN 20% + LSTM 60%
+        lstm_weight = getattr(settings, "LSTM_WEIGHT", 0.6)
         # KNN Cold Start 보호: 데이터 부족 시 KNN 비중을 rule로 이전
         if sample_size >= 5:
             knn_weight = 0.2
