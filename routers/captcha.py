@@ -148,6 +148,73 @@ def safe_int(value: Any):
         return int(value)
     except Exception:
         return None
+    
+CONFUSION_MAP = {
+    "0": ["O"],
+    "O": ["0"],
+    "1": ["I", "L"],
+    "I": ["1", "L"],
+    "L": ["1", "I"],
+    "5": ["S"],
+    "S": ["5"],
+    "8": ["B"],
+    "B": ["8"],
+    "2": ["Z"],
+    "Z": ["2"],
+}
+
+
+def generate_confusion_variants(text: str, max_variants: int = 50) -> list[str]:
+    text = (text or "").strip().upper()
+    if not text:
+        return []
+
+    variants = {text}
+
+    for i, ch in enumerate(text):
+        if ch in CONFUSION_MAP:
+            new_variants = set()
+            for base in variants:
+                for repl in CONFUSION_MAP[ch]:
+                    new_variants.add(base[:i] + repl + base[i + 1 :])
+            variants |= new_variants
+            if len(variants) >= max_variants:
+                break
+
+    return list(variants)[:max_variants]
+
+
+def resolve_text_match_with_confusions(
+    expected_text: str,
+    detected_text: Optional[str],
+    ocr_text_candidates: Optional[list],
+) -> tuple[bool, str, Optional[str]]:
+    expected = (expected_text or "").strip().upper()
+    detected = (detected_text or "").strip().upper()
+
+    if detected and detected == expected:
+        return True, "exact", detected
+
+    # 1차: detected_text 자체의 혼동문자 변형 검사
+    if detected:
+        variants = generate_confusion_variants(detected)
+        if expected in variants:
+            return True, "confusion_detected_text", detected
+
+    # 2차: GPU가 준 후보군 각각의 혼동문자 변형 검사
+    for candidate in (ocr_text_candidates or []):
+        cand = str(candidate).strip().upper()
+        if not cand:
+            continue
+
+        if cand == expected:
+            return True, "candidate_exact", cand
+
+        variants = generate_confusion_variants(cand)
+        if expected in variants:
+            return True, "confusion_candidate", cand
+
+    return False, "no_match", detected or None
 
 
 def guess_image_ext(upload: UploadFile) -> str:
@@ -1044,15 +1111,27 @@ async def verify_captcha(
                 "gpuServerUrl": GPU_SERVER_URL,
             }
         )
-
     detected_pose = gpu_result.get("detected_pose")
     pose_confidence = safe_float(gpu_result.get("pose_confidence"))
     detected_text = gpu_result.get("detected_text")
     ocr_confidence = safe_float(gpu_result.get("ocr_confidence"))
     ocr_low_confidence = gpu_result.get("ocr_low_confidence", False)
+    ocr_text_candidates = gpu_result.get("ocr_text_candidates", [])
 
     pose_ok = detected_pose == expected_pose
-    text_ok = detected_text == expected_text
+    text_ok, text_match_mode, matched_candidate = resolve_text_match_with_confusions(
+        expected_text=expected_text,
+        detected_text=detected_text,
+        ocr_text_candidates=ocr_text_candidates,
+    )
+
+    if isinstance(gpu_result, dict):
+        inspection = gpu_result.get("inspection") or {}
+        inspection["api_text_match_mode"] = text_match_mode
+        inspection["api_matched_candidate"] = matched_candidate
+        inspection["api_expected_text"] = expected_text
+        inspection["api_detected_text"] = detected_text
+        gpu_result["inspection"] = inspection
 
     try:
         await save_hand_pose_sample(
@@ -1086,7 +1165,10 @@ async def verify_captcha(
                     f"(요구: {expected_text} / 인식: {detected_text}, OCR 신뢰도: {ocr_confidence:.2f})"
                 )
             else:
-                reasons.append(f"문자열 불일치 (요구: {expected_text} / 인식: {detected_text})")
+                reasons.append(
+                    f"문자열 불일치 (요구: {expected_text} / 인식: {detected_text}, "
+                    f"매칭 방식: {text_match_mode})"
+                )
 
         message = "AI 검사에 실패했습니다.\n" + "\n".join(reasons)
 
