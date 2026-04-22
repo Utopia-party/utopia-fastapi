@@ -25,6 +25,7 @@ from models.report import Report
 
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
+from models.payment import Payment
 from models.quick_match.request import QuickMatchRequest
 from models.refresh_token import RefreshToken
 from models.mypage.trust_score import TrustScore
@@ -709,14 +710,19 @@ async def get_admin_dashboard(
             select(User).where(User.created_at >= comparison_from, User.created_at < comparison_to)
         )
     ).scalars().all()
-    current_receipts = (
+    payment_event_at = func.coalesce(Payment.paid_at, Payment.created_at)
+
+    current_payments = (
         await db.execute(
-            select(Receipt).where(Receipt.created_at >= current_from, Receipt.created_at < current_to)
+            select(Payment).where(payment_event_at >= current_from, payment_event_at < current_to)
         )
     ).scalars().all()
-    comparison_receipts = (
+    comparison_payments = (
         await db.execute(
-            select(Receipt).where(Receipt.created_at >= comparison_from, Receipt.created_at < comparison_to)
+            select(Payment).where(
+                payment_event_at >= comparison_from,
+                payment_event_at < comparison_to,
+            )
         )
     ).scalars().all()
     current_reports = (
@@ -789,10 +795,12 @@ async def get_admin_dashboard(
     current_signups = len(current_users)
     comparison_signups = len(comparison_users)
     current_sales = sum(
-        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "approved"
+        payment.amount for payment in current_payments if (payment.status or "").lower() == "approved"
     )
     comparison_sales = sum(
-        receipt.ocr_amount for receipt in comparison_receipts if (receipt.status or "").lower() == "approved"
+        payment.amount
+        for payment in comparison_payments
+        if (payment.status or "").lower() == "approved"
     )
     current_reports_count = len(current_reports)
     comparison_reports_count = len(comparison_reports)
@@ -812,17 +820,17 @@ async def get_admin_dashboard(
 
     approved_amount = current_sales
     pending_amount = sum(
-        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "pending"
+        payment.amount for payment in current_payments if (payment.status or "").lower() == "pending"
     )
     rejected_amount = sum(
-        receipt.ocr_amount for receipt in current_receipts if (receipt.status or "").lower() == "rejected"
+        payment.amount for payment in current_payments if (payment.status or "").lower() == "rejected"
     )
 
     bucket_starts, bucket_mode = _bucket_labels(start_day, end_day)
     bucket_index = {bucket: idx for idx, bucket in enumerate(bucket_starts)}
 
     chart_seed = [
-        ("sales", "승인 매출", "승인된 영수증 금액 기준 비교 그래프", "currency"),
+        ("sales", "승인 매출", "승인된 결제 금액 기준 비교 그래프", "currency"),
         ("members", "신규 가입", "선택 기간 신규 가입 수 비교 그래프", "count"),
         ("reports", "신고 접수", "선택 기간 신고 접수 건수 비교 그래프", "count"),
         ("settlements", "정산 대기", "선택 기간 생성된 대기 정산 비교 그래프", "count"),
@@ -925,22 +933,24 @@ async def get_admin_dashboard(
         if bucket in bucket_index:
             chart_buckets["quick_match"][bucket_index[bucket]].comparison += 1
 
-    for receipt in current_receipts:
-        if (receipt.status or "").lower() != "approved":
+    for payment in current_payments:
+        if (payment.status or "").lower() != "approved":
             continue
-        bucket = _current_bucket(receipt.created_at.astimezone(timezone.utc).date())
+        payment_at = (payment.paid_at or payment.created_at).astimezone(timezone.utc).date()
+        bucket = _current_bucket(payment_at)
         if bucket in bucket_index:
-            chart_buckets["sales"][bucket_index[bucket]].current += receipt.ocr_amount
+            chart_buckets["sales"][bucket_index[bucket]].current += payment.amount
 
-    for receipt in comparison_receipts:
-        if (receipt.status or "").lower() != "approved":
+    for payment in comparison_payments:
+        if (payment.status or "").lower() != "approved":
             continue
+        payment_at = (payment.paid_at or payment.created_at).astimezone(timezone.utc).date()
         bucket = _align_bucket(
-            receipt.created_at.astimezone(timezone.utc).date(),
+            payment_at,
             comparison_start_day,
         )
         if bucket in bucket_index:
-            chart_buckets["sales"][bucket_index[bucket]].comparison += receipt.ocr_amount
+            chart_buckets["sales"][bucket_index[bucket]].comparison += payment.amount
 
     chart_groups = [
         DashboardChartOut(
@@ -998,7 +1008,7 @@ async def get_admin_dashboard(
                 "id": "sales",
                 "label": "승인 매출",
                 "value": f"₩ {int(current_sales):,}",
-                "helper": "승인된 영수증 기준 매출 합계",
+                "helper": "승인된 결제 기준 매출 합계",
                 "delta": sales_delta,
                 "trend": sales_trend,
             },
