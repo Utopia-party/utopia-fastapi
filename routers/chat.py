@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
+from transformers import pipeline
 from core.config import settings
 from core.database import get_db, AsyncSessionLocal
 from models.party import Party, PartyMember, PartyChat, Service
@@ -22,6 +23,13 @@ redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
 REDIS_TTL = 60 * 60 * 24 * 3
 OLLAMA_URL = settings.OLLAMA_URL
 OLLAMA_MODEL = settings.OLLAMA_MODEL
+
+# smilegate ML 모델 - 서버 시작 시 1회 로드
+hate_classifier = pipeline(
+    "text-classification",
+    model="smilegate-ai/kor-hate-speech-detection",
+    device=0  # CPU면 -1
+)
 
 
 def warn_key(party_id: str, user_id: str) -> str:
@@ -96,11 +104,64 @@ def _serialize_member(
     }
 
 
+# ── 3단계 탐지 파이프라인 ────────────────────────────────────
+
 async def check_message(content: str) -> dict:
-    prompt = f"""채팅 메시지에 욕설, 비속어, 혐오 표현이 있는지 판단하세요.
+    from routers.admin_moderation_config import get_config
+    config = await get_config()
+
+    stripped = content.strip()
+
+    # 1단계: 규칙 기반
+    if config.get("stage1_enabled", True):
+        if stripped in config.get("whitelist", []):
+            return {"violation": False, "severe": False, "reason": ""}
+        if stripped in config.get("blacklist", []):
+            return {"violation": True, "severe": True, "reason": "욕설 축약어"}
+
+    # 2단계: smilegate ML
+    if config.get("stage2_enabled", True):
+        try:
+            ml_result = hate_classifier(stripped)[0]
+            label = ml_result["label"]
+            score = ml_result["score"]
+            pass_t = config.get("stage2_pass_threshold", 0.75)
+            block_t = config.get("stage2_block_threshold", 0.92)
+
+            if label == "none" or score < pass_t:
+                return {"violation": False, "severe": False, "reason": ""}
+            if score >= block_t:
+                return {"violation": True, "severe": label == "hate", "reason": label}
+        except Exception:
+            pass
+
+    # 3단계: Ollama Exaone
+    if config.get("stage3_enabled", True):
+        return await _check_message_ollama(content, config)
+
+    return {"violation": False, "severe": False, "reason": ""}
+
+
+async def _check_message_ollama(content: str, config: dict) -> dict:
+    examples = config.get("ollama_prompt_examples", [])
+    none_ex = [e["text"] for e in examples if e["label"] == "none"]
+    offensive_ex = [e["text"] for e in examples if e["label"] == "offensive"]
+
+    none_str = ", ".join(f'"{t}"' for t in none_ex) if none_ex else '"ㅇㅇ", "ㅎㅇ"'
+    off_str = ", ".join(f'"{t}"' for t in offensive_ex) if offensive_ex else '"ㅅㅂ", "존나"'
+
+    prompt = f"""당신은 한국어 채팅 욕설 탐지 전문가입니다.
+아래 예시를 참고해 판단하세요.
+
+[위반 아님 - none]: {none_str}
+[경고 수준 - offensive]: {off_str}
+[즉시 차단 - hate]: 특정 대상 혐오, 심한 욕설 조합
+
 메시지: "{content}"
-JSON으로만 응답하세요:
-{{"violation": true/false, "severe": true/false, "reason": "이유"}}"""
+
+JSON만 응답, 다른 텍스트 금지:
+{{"violation": true/false, "severe": true/false, "reason": "한 줄 이유"}}"""
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
@@ -159,16 +220,13 @@ manager = ConnectionManager()
 
 
 async def delete_message_from_redis(party_id: str, content: str) -> bool:
-    """Redis에서 content가 일치하는 마지막 메시지를 정확히 삭제"""
     key = redis_msg_key(party_id)
     messages = await redis_client.lrange(key, 0, -1)
 
-    # 뒤에서부터 탐색해서 해당 content의 메시지 찾아서 삭제
     for raw in reversed(messages):
         try:
             parsed = json.loads(raw)
             if parsed.get("content") == content and parsed.get("type") == "message":
-                # LREM으로 정확히 해당 메시지만 삭제 (count=-1: 뒤에서부터 1개)
                 await redis_client.lrem(key, -1, raw)
                 return True
         except Exception:
@@ -177,7 +235,6 @@ async def delete_message_from_redis(party_id: str, content: str) -> bool:
 
 
 async def delete_message_from_db(party_id: str, user_id: str, content: str):
-    """DB에서 해당 메시지를 is_deleted=True로 마킹"""
     try:
         sender_uuid = uuid.UUID(user_id)
         party_uuid = uuid.UUID(party_id)
@@ -186,7 +243,6 @@ async def delete_message_from_db(party_id: str, user_id: str, content: str):
 
     try:
         async with AsyncSessionLocal() as db:
-            # 해당 유저가 보낸 메시지 중 content 일치하는 가장 최근 것 삭제 처리
             result = await db.execute(
                 select(PartyChat)
                 .where(
@@ -211,9 +267,8 @@ async def _flag_chat_in_db(
     user_id: str,
     content: str,
     reason: str,
-    moderation_status: str,  # "blocked" | "warned"
+    moderation_status: str,
 ) -> None:
-    """탐지된 메시지를 DB에 is_flagged=True로 기록 (관리자 로그용)"""
     try:
         sender_uuid = uuid.UUID(user_id)
         party_uuid = uuid.UUID(party_id)
@@ -241,28 +296,44 @@ async def _flag_chat_in_db(
         print(f"[FLAG DB ERROR] {e}")
 
 
+async def _ban_user_in_db(party_id: str, user_id: str) -> None:
+    try:
+        party_uuid = uuid.UUID(party_id)
+        user_uuid = uuid.UUID(user_id)
+    except (ValueError, TypeError):
+        return
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(PartyMember)
+                .where(
+                    PartyMember.party_id == party_uuid,
+                    PartyMember.user_id == user_uuid,
+                )
+                .values(status="banned")
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"[BAN DB ERROR] {e}")
+
+
 async def moderate_in_background(party_id: str, user_id: str, content: str, ws: WebSocket):
     moderation = await check_message(content)
 
     if moderation["severe"]:
-        # 차단 처리
         await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
 
-        # Redis + DB에서 메시지 정확히 삭제
         await delete_message_from_redis(party_id, content)
         await delete_message_from_db(party_id, user_id, content)
-
-        # 관리자 로그용 flagging (삭제 후에도 is_flagged 기록)
+        await _ban_user_in_db(party_id, user_id)
         await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "blocked")
 
-        # 본인에게 차단 알림
         await manager.send_personal(ws, {
             "type": "error",
-            "content": f"🚫 심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
+            "content": f"심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
-        # 전체에게 메시지 삭제 브로드캐스트 → 프론트에서 해당 메시지 제거
         await manager.broadcast(party_id, {
             "type": "message_deleted",
             "content": content,
@@ -280,20 +351,20 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         warn_count = await redis_client.incr(key)
         await redis_client.expire(key, REDIS_TTL)
 
-        # 경고 메시지도 flagging
         await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "warned")
 
         if warn_count >= 3:
             await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
+            await _ban_user_in_db(party_id, user_id)
             await manager.send_personal(ws, {
                 "type": "error",
-                "content": "🚫 경고 3회 누적으로 채팅이 차단되었습니다.",
+                "content": "경고 3회 누적으로 채팅이 차단되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         else:
             await manager.send_personal(ws, {
                 "type": "warning",
-                "content": f"⚠️ 경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다.",
+                "content": f"경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
 
