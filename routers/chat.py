@@ -2,7 +2,7 @@ import json
 import asyncio
 import uuid
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -12,6 +12,7 @@ from core.config import settings
 from core.database import get_db, AsyncSessionLocal
 from models.party import Party, PartyMember, PartyChat, Service
 from models.user import User
+from models.refresh_token import RefreshToken
 from services.mypage.profile_service import _build_profile_image_url
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -31,8 +32,9 @@ def warn_key(party_id: str, user_id: str) -> str:
 def redis_msg_key(party_id: str) -> str:
     return f"chat:party:{party_id}:messages"
 
-def blocked_key(party_id: str, user_id: str) -> str:
-    return f"blocked:{party_id}:{user_id}"
+# 전역 차단 키 — party_id 없이 유저 단위로 모든 채팅방 차단
+def blocked_key(user_id: str) -> str:
+    return f"blocked:user:{user_id}"
 
 
 def _party_max_members(party: Party, service: Service | None) -> int | None:
@@ -292,6 +294,7 @@ async def _flag_chat_in_db(
 
 
 async def _ban_user_in_db(party_id: str, user_id: str) -> None:
+    """PartyMember 상태를 banned로 변경"""
     try:
         party_uuid = uuid.UUID(party_id)
         user_uuid = uuid.UUID(user_id)
@@ -312,29 +315,133 @@ async def _ban_user_in_db(party_id: str, user_id: str) -> None:
         print(f"[BAN DB ERROR] {e}")
 
 
+async def _apply_trust_penalty(user_id: str, delta: float, reason: str) -> float:
+    """신뢰도 감점 적용 후 새 점수 반환"""
+    try:
+        from models.mypage.trust_score import TrustScore
+        user_uuid = uuid.UUID(user_id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_uuid))
+            user = result.scalar_one_or_none()
+            if not user:
+                return 36.5
+            previous = float(user.trust_score) if user.trust_score is not None else 36.5
+            new_score = max(0.0, round(previous + delta, 1))
+            user.trust_score = new_score
+            db.add(TrustScore(
+                user_id=user_uuid,
+                previous_score=previous,
+                new_score=new_score,
+                change_amount=round(new_score - previous, 1),
+                reason=reason,
+                created_by=user_uuid,
+            ))
+            await db.commit()
+            return new_score
+    except Exception as e:
+        print(f"[TRUST PENALTY ERROR] {e}")
+        return 36.5
+
+
+async def _apply_status_by_score(user_id: str, score: float, warn_count: int) -> None:
+    """
+    점수 구간 및 경고 누적에 따라 User 상태 자동 처리
+      0점 또는 경고 4회 이상  → 영구 추방 (is_active=False, banned_until=None)
+      점수 10 미만 또는 경고 3회 → 30일 정지 (is_active=False, banned_until=30일)
+      점수 10~20              → 경고 누적 (banned_until=72시간, is_active 유지)
+      점수 20~30              → 1차 경고 (상태 변경 없음)
+    """
+    try:
+        user_uuid = uuid.UUID(user_id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_uuid))
+            user = result.scalar_one_or_none()
+            if not user:
+                return
+
+            if score <= 0 or warn_count >= 4:
+                # 영구 추방
+                user.is_active = False
+                user.banned_until = None
+            elif score < 10 or warn_count >= 3:
+                # 30일 서비스 정지
+                user.is_active = False
+                user.banned_until = datetime.now(timezone.utc) + timedelta(days=30)
+            elif score < 20:
+                # 경고 누적 구간 — 신규 파티 참여 제한 (banned_until 72시간)
+                user.banned_until = datetime.now(timezone.utc) + timedelta(hours=72)
+            # 20~30 구간은 주의 문구만, DB 상태 변경 없음
+
+            await db.commit()
+    except Exception as e:
+        print(f"[STATUS BY SCORE ERROR] {e}")
+
+
+async def _ban_user_ip(user_id: str) -> None:
+    """RefreshToken에서 최근 IP 조회 후 채팅 전용 IP 벤 적용"""
+    try:
+        user_uuid = uuid.UUID(user_id)
+        async with AsyncSessionLocal() as db:
+            ip_result = await db.execute(
+                select(RefreshToken.ip_address)
+                .where(
+                    RefreshToken.user_id == user_uuid,
+                    RefreshToken.ip_address != None,
+                )
+                .order_by(RefreshToken.created_at.desc())
+                .limit(1)
+            )
+            ip = ip_result.scalar_one_or_none()
+            if ip:
+                await redis_client.set(f"ip:banned:{ip}", "1", ex=60 * 60 * 24 * 30)
+    except Exception as e:
+        print(f"[BAN IP ERROR] {e}")
+
+
+# ── 모더레이션 메인 함수 ────────────────────────────────────
+
 async def moderate_in_background(party_id: str, user_id: str, content: str, ws: WebSocket):
     moderation = await check_message(content)
 
     if moderation["severe"]:
-        await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
+        # 1. 전역 Redis 차단
+        await redis_client.set(blocked_key(user_id), "1", ex=REDIS_TTL)
 
+        # 2. 메시지 삭제
         await delete_message_from_redis(party_id, content)
         await delete_message_from_db(party_id, user_id, content)
+
+        # 3. PartyMember banned
         await _ban_user_in_db(party_id, user_id)
+
+        # 4. 플래그
         await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "blocked")
 
+        # 5. 신뢰도 -5
+        new_score = await _apply_trust_penalty(user_id, -5.0, f"심한 욕설 감지: {moderation['reason']}")
+
+        # 6. 경고 카운트 누적
+        wk = warn_key(party_id, user_id)
+        warn_count = int(await redis_client.incr(wk))
+        await redis_client.expire(wk, REDIS_TTL)
+
+        # 7. 점수/경고 기반 User 상태 변경
+        await _apply_status_by_score(user_id, new_score, warn_count)
+
+        # 8. IP 벤
+        await _ban_user_ip(user_id)
+
+        # 9. 웹소켓 알림
         await manager.send_personal(ws, {
             "type": "error",
             "content": f"심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-
         await manager.broadcast(party_id, {
             "type": "message_deleted",
             "content": content,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-
         await manager.broadcast(party_id, {
             "type": "system",
             "content": "부적절한 메시지가 삭제되었습니다.",
@@ -342,24 +449,34 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         })
 
     elif moderation["violation"]:
-        key = warn_key(party_id, user_id)
-        warn_count = await redis_client.incr(key)
-        await redis_client.expire(key, REDIS_TTL)
+        # 1. 경고 카운트 누적
+        wk = warn_key(party_id, user_id)
+        warn_count = int(await redis_client.incr(wk))
+        await redis_client.expire(wk, REDIS_TTL)
 
+        # 2. 신뢰도 -1
+        new_score = await _apply_trust_penalty(user_id, -1.0, f"욕설 감지: {moderation['reason']}")
+
+        # 3. 플래그
         await _flag_chat_in_db(party_id, user_id, content, moderation["reason"], "warned")
 
+        # 4. 점수/경고 기반 User 상태 변경
+        await _apply_status_by_score(user_id, new_score, warn_count)
+
         if warn_count >= 3:
-            await redis_client.set(blocked_key(party_id, user_id), "1", ex=REDIS_TTL)
+            # 경고 3회 누적 → 전역 차단 + IP 벤
+            await redis_client.set(blocked_key(user_id), "1", ex=REDIS_TTL)
             await _ban_user_in_db(party_id, user_id)
+            await _ban_user_ip(user_id)
             await manager.send_personal(ws, {
                 "type": "error",
-                "content": "경고 3회 누적으로 채팅이 차단되었습니다.",
+                "content": f"경고 {warn_count}회 누적으로 채팅이 차단되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         else:
             await manager.send_personal(ws, {
                 "type": "warning",
-                "content": f"경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다.",
+                "content": f"경고 {warn_count}/3회: 부적절한 표현이 감지되었습니다. (신뢰도 -1점)",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
 
@@ -471,7 +588,8 @@ async def websocket_chat(
         while True:
             data = await ws.receive_text()
 
-            is_blocked = await redis_client.get(blocked_key(party_id, safe_user_id))
+            # 전역 차단 체크 — party_id 무관하게 유저 단위로 확인
+            is_blocked = await redis_client.get(blocked_key(safe_user_id))
             if is_blocked:
                 await manager.send_personal(ws, {
                     "type": "error",

@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -8,6 +9,7 @@ from typing import Optional
 from core.database import get_db, AsyncSessionLocal
 from core.config import settings
 from models.party import PartyChat
+from models.user import User
 import redis.asyncio as aioredis
 
 router = APIRouter(prefix="/admin/moderation", tags=["admin-moderation"])
@@ -143,3 +145,47 @@ async def get_finetune_stats(db: AsyncSession = Depends(get_db)):
         "ready": ready,
         "min_required": 500,
     }
+
+
+# ── 채팅 차단 해제 ──
+
+@router.post("/unblock/user/{user_id}")
+async def unblock_chat_user(user_id: str):
+    """채팅 욕설로 차단된 유저 해제 — Redis 차단 삭제 + is_active 복구 + banned_until 초기화"""
+    # Redis 채팅 차단 해제
+    await redis_client.delete(f"blocked:user:{user_id}")
+
+    try:
+        user_uuid = uuid.UUID(user_id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_uuid))
+            user = result.scalar_one_or_none()
+            if user:
+                user.is_active = True
+                user.banned_until = None
+                await db.commit()
+    except Exception as e:
+        print(f"[UNBLOCK USER ERROR] {e}")
+
+    return {"unblocked": True, "user_id": user_id}
+
+
+# ── 채팅 IP 벤 목록 조회 / 해제 ──
+
+@router.get("/chat-bans")
+async def list_chat_bans():
+    """채팅 욕설로 IP 벤된 목록 (ip:banned:* 키 기준)"""
+    keys = await redis_client.keys("ip:banned:*")
+    result = []
+    for key in keys:
+        ip = key.replace("ip:banned:", "")
+        ttl = await redis_client.ttl(key)
+        result.append({"ip": ip, "ttl": ttl})
+    return result
+
+
+@router.delete("/unblock/ip/{ip}")
+async def unblock_ip_ban(ip: str):
+    """채팅 IP 벤 해제"""
+    await redis_client.delete(f"ip:banned:{ip}")
+    return {"unblocked": True, "ip": ip}
