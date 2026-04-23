@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from io import BytesIO
+from math import ceil
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 import json
@@ -161,7 +162,8 @@ async def get_admin_handocr_records(
     error_code: Optional[str] = Query(default=None),
     pose: Optional[str] = Query(default=None),
     status_tab: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=300),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
     pool = await get_db_pool()
 
@@ -169,81 +171,128 @@ async def get_admin_handocr_records(
     values: list[Any] = []
 
     if keyword:
-        idx = len(values) + 1
-        like = f"%{keyword}%"
-        conditions.append(
-            f"""(
-                session_id::text ILIKE ${idx}
-                OR COALESCE(request_id::text, '') ILIKE ${idx}
-                OR expected_text ILIKE ${idx}
-                OR COALESCE(detected_text, '') ILIKE ${idx}
-            )"""
-        )
-        values.append(like)
+      idx = len(values) + 1
+      like = f"%{keyword}%"
+      conditions.append(
+          f"""(
+              session_id::text ILIKE ${idx}
+              OR COALESCE(request_id::text, '') ILIKE ${idx}
+              OR expected_text ILIKE ${idx}
+              OR COALESCE(detected_text, '') ILIKE ${idx}
+          )"""
+      )
+      values.append(like)
 
     if date_from:
-        idx = len(values) + 1
-        conditions.append(f"created_at >= ${idx}")
-        values.append(datetime.combine(date_from, datetime.min.time()))
+      idx = len(values) + 1
+      conditions.append(f"created_at >= ${idx}")
+      values.append(datetime.combine(date_from, datetime.min.time()))
 
     if date_to:
-        idx = len(values) + 1
-        conditions.append(f"created_at < ${idx}")
-        values.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
+      idx = len(values) + 1
+      conditions.append(f"created_at < ${idx}")
+      values.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
 
     if error_code:
-        idx = len(values) + 1
-        conditions.append(f"ai_error_code = ${idx}")
-        values.append(error_code)
+      idx = len(values) + 1
+      conditions.append(f"ai_error_code = ${idx}")
+      values.append(error_code)
 
     if pose:
-        idx = len(values) + 1
-        conditions.append(f"(expected_pose = ${idx} OR detected_pose = ${idx})")
-        values.append(pose)
+      idx = len(values) + 1
+      conditions.append(f"(expected_pose = ${idx} OR detected_pose = ${idx})")
+      values.append(pose)
 
     apply_status_tab_conditions(status_tab, conditions)
 
     where_clause = ""
     if conditions:
-        where_clause = "WHERE " + " AND ".join(conditions)
+      where_clause = "WHERE " + " AND ".join(conditions)
 
-    limit_idx = len(values) + 1
-    values.append(limit)
+    count_query = f"""
+      SELECT COUNT(*) AS total_count
+      FROM hand_pose_samples
+      {where_clause}
+    """
 
-    query = f"""
+    summary_query = f"""
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE verify_success = TRUE) AS success,
+        COUNT(*) FILTER (WHERE verify_success = FALSE) AS failed,
+        COUNT(*) FILTER (WHERE ocr_low_confidence = TRUE) AS low_confidence,
+        COUNT(*) FILTER (WHERE pose_match = FALSE) AS pose_mismatch,
+        COUNT(*) FILTER (
+          WHERE ai_error_code LIKE 'GPU_%'
+             OR ai_error_code IN ('HAND_LANDMARKER_FAILED', 'MODEL_PREDICTION_FAILED')
+        ) AS gpu_error
+      FROM hand_pose_samples
+      {where_clause}
+    """
+
+    async with pool.acquire() as conn:
+      count_row = await conn.fetchrow(count_query, *values)
+      summary_row = await conn.fetchrow(summary_query, *values)
+
+      total_count = int(count_row["total_count"]) if count_row else 0
+      total_pages = max(1, ceil(total_count / page_size)) if total_count > 0 else 1
+      current_page = min(page, total_pages)
+      offset = (current_page - 1) * page_size
+
+      list_values = [*values, page_size, offset]
+      limit_idx = len(values) + 1
+      offset_idx = len(values) + 2
+
+      list_query = f"""
         SELECT
-            session_id,
-            request_id,
-            created_at,
-            verify_success,
-            expected_pose,
-            detected_pose,
-            expected_text,
-            detected_text,
-            pose_confidence,
-            ocr_confidence,
-            ocr_low_confidence,
-            pose_match,
-            text_match,
-            ai_error_code,
-            ai_message,
-            ai_guide,
-            image_key,
-            text_crop_key,
-            ocr_best_attempt,
-            ocr_text_candidates,
-            text_region_bbox,
-            inspection
+          session_id,
+          request_id,
+          created_at,
+          verify_success,
+          expected_pose,
+          detected_pose,
+          expected_text,
+          detected_text,
+          pose_confidence,
+          ocr_confidence,
+          ocr_low_confidence,
+          pose_match,
+          text_match,
+          ai_error_code,
+          ai_message,
+          ai_guide,
+          image_key,
+          text_crop_key,
+          ocr_best_attempt,
+          ocr_text_candidates,
+          text_region_bbox,
+          inspection
         FROM hand_pose_samples
         {where_clause}
         ORDER BY created_at DESC
         LIMIT ${limit_idx}
-    """
+        OFFSET ${offset_idx}
+      """
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, *values)
+      rows = await conn.fetch(list_query, *list_values)
 
-    return {"items": [row_to_record(row) for row in rows]}
+    summary = {
+      "total": int(summary_row["total"]) if summary_row and summary_row["total"] is not None else 0,
+      "success": int(summary_row["success"]) if summary_row and summary_row["success"] is not None else 0,
+      "failed": int(summary_row["failed"]) if summary_row and summary_row["failed"] is not None else 0,
+      "low_confidence": int(summary_row["low_confidence"]) if summary_row and summary_row["low_confidence"] is not None else 0,
+      "pose_mismatch": int(summary_row["pose_mismatch"]) if summary_row and summary_row["pose_mismatch"] is not None else 0,
+      "gpu_error": int(summary_row["gpu_error"]) if summary_row and summary_row["gpu_error"] is not None else 0,
+    }
+
+    return {
+      "items": [row_to_record(row) for row in rows],
+      "total_count": total_count,
+      "page": current_page,
+      "page_size": page_size,
+      "total_pages": total_pages,
+      "summary": summary,
+    }
 
 
 @router.get("/health")
