@@ -322,6 +322,12 @@ async def _ban_user_in_db(party_id: str, user_id: str) -> None:
                 )
                 .values(status="banned")
             )
+            party_result = await db.execute(
+                select(Party).where(Party.id == party_uuid)
+            )
+            party = party_result.scalar_one_or_none()
+            if party and party.current_members:
+                party.current_members = max(0, party.current_members - 1)
             await db.commit()
     except Exception as e:
         print(f"[BAN DB ERROR] {e}")
@@ -439,6 +445,11 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
             "content": f"심각한 욕설이 감지되어 차단되었습니다. ({moderation['reason']})",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
+        await manager.send_personal(ws, {
+            "type": "force_logout",
+            "content": "심각한 위반으로 계정이 정지되었습니다.",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
         await manager.broadcast(party_id, {
             "type": "message_deleted",
             "content": content,
@@ -469,6 +480,11 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
             await manager.send_personal(ws, {
                 "type": "error",
                 "content": f"경고 {party_warn}회 누적으로 채팅이 차단되었습니다.",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            await manager.send_personal(ws, {
+                "type": "force_logout",
+                "content": "경고 누적으로 계정이 정지되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         else:
@@ -579,6 +595,37 @@ async def websocket_chat(
     safe_user_id = user_id
     if user_id == "undefined" or not user_id:
         safe_user_id = "guest"
+
+    # 멤버 검증
+    if safe_user_id != "guest":
+        try:
+            party_uuid = uuid.UUID(party_id)
+            user_uuid = uuid.UUID(safe_user_id)
+            async with AsyncSessionLocal() as db:
+                party_result = await db.execute(
+                    select(Party).where(Party.id == party_uuid)
+                )
+                party = party_result.scalar_one_or_none()
+                if not party:
+                    await ws.close(code=4004)
+                    return
+
+                is_leader = party.leader_id == user_uuid
+                if not is_leader:
+                    member_result = await db.execute(
+                        select(PartyMember).where(
+                            PartyMember.party_id == party_uuid,
+                            PartyMember.user_id == user_uuid,
+                            PartyMember.status == "active",
+                        )
+                    )
+                    if not member_result.scalar_one_or_none():
+                        await ws.close(code=4003)
+                        return
+        except Exception as e:
+            print(f"[WS AUTH ERROR] {e}")
+            await ws.close(code=4000)
+            return
 
     await manager.connect(party_id, ws)
 
