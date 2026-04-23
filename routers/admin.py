@@ -3374,8 +3374,8 @@ async def get_chat_moderation_trend(
     if end_date:
         e_date = date_type.fromisoformat(end_date)
 
-    start_dt = datetime(s_date.year, s_date.month, s_date.day, tzinfo=timezone.utc)
-    end_dt = datetime(e_date.year, e_date.month, e_date.day, tzinfo=timezone.utc) + timedelta(days=1)
+    start_dt = datetime(s_date.year, s_date.month, s_date.day)
+    end_dt = datetime(e_date.year, e_date.month, e_date.day) + timedelta(days=1)
 
     if period == "daily":
         trunc = "day"
