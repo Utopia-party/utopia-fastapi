@@ -213,6 +213,9 @@ async def me(
     if not user:
         return {"is_logged_in": False, "user": None}
 
+    if not user.is_active:
+        return {"is_logged_in": False, "user": None}
+
     return {
         "is_logged_in": True,
         "user": {
