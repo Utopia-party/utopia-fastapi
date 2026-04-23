@@ -299,9 +299,11 @@ class ChatModerationLogOut(BaseModel):
     message: str
     flagReason: str | None = None
     flagConfidence: float | None = None
-    moderationStatus: str | None = None   
+    flagStage: int | None = None
+    moderationStatus: str | None = None
     isDeleted: bool
     createdAt: str
+    warnCount: int | None = None
 
 class ChatModerationStatsOut(BaseModel):
     totalFlagged: int

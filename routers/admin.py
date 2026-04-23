@@ -2514,9 +2514,11 @@ async def get_chat_moderation_logs(
                 message=chat.message,
                 flagReason=chat.flag_reason,
                 flagConfidence=chat.flag_confidence,
+                flagStage=chat.flag_stage,
                 moderationStatus=chat.moderation_status or "pending",
                 isDeleted=chat.is_deleted,
                 createdAt=_format_datetime(chat.created_at),
+                warnCount=sender.chat_warn_count if sender else None,
             )
         )
     return result

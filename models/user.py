@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import String, DateTime, Boolean, Numeric, ForeignKey, func, text
+from sqlalchemy import String, DateTime, Boolean, Numeric, ForeignKey, Integer, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database import Base
@@ -23,6 +23,7 @@ class User(Base):
 
     role: Mapped[str] = mapped_column(String(20), nullable=False, server_default="USER")
     trust_score: Mapped[float] = mapped_column(Numeric, nullable=False, server_default="36.5")
+    chat_warn_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     referrer_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -40,7 +41,7 @@ class User(Base):
     party_members: Mapped[list["PartyMember"]] = relationship("PartyMember", back_populates="user")  # noqa
     notifications: Mapped[list["Notification"]] = relationship(
         "Notification",
-        foreign_keys="Notification.user_id",  # ← 핵심 수정
+        foreign_keys="Notification.user_id",
         back_populates="user"
     )  # noqa
 
@@ -49,4 +50,3 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
-    
