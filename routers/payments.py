@@ -21,9 +21,33 @@ from services.notifications.settlement_notification_service import (
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 
+def _resolve_total_price(
+    requested_amount: int,
+    party: Party,
+    service: Service | None,
+) -> int:
+    if service and service.monthly_price:
+        return int(service.monthly_price)
+    if party.monthly_per_person and party.max_members:
+        return int(party.monthly_per_person * party.max_members)
+    return int(requested_amount)
+
+
+def _resolve_per_person_price(
+    requested_amount: int,
+    party: Party,
+    service: Service | None,
+) -> int:
+    max_members = int(party.max_members or 0)
+    if service and service.monthly_price and max_members > 0:
+        return max(1, round(service.monthly_price / max_members))
+    if party.monthly_per_person:
+        return int(party.monthly_per_person)
+    return int(requested_amount)
+
+
 def _calc_payment(
     base_amount: int,
-    party: Party,
     service: Service | None,
     is_leader: bool,
     has_referrer: bool,
@@ -224,14 +248,16 @@ async def card_confirm(
     service = await db.get(Service, party.service_id) if party.service_id else None
     is_leader = (party.leader_id == current_user.id)
     has_referrer = (current_user.referrer_id is not None)
+    total_price = _resolve_total_price(body.amount, party, service)
+    per_person_price = _resolve_per_person_price(body.amount, party, service)
     amount, commission_rate, commission_amount, discount_reason = _calc_payment(
-        body.amount, party, service, is_leader, has_referrer
+        per_person_price, service, is_leader, has_referrer
     )
 
     payment = Payment(
         user_id=current_user.id,
         party_id=body.party_id,
-        base_price=body.amount,
+        base_price=total_price,
         commission_rate=commission_rate,
         commission_amount=commission_amount,
         discount_reason=discount_reason,
@@ -289,14 +315,16 @@ async def transfer_register(
     service = await db.get(Service, party.service_id) if party.service_id else None
     is_leader = (party.leader_id == current_user.id)
     has_referrer = (current_user.referrer_id is not None)
+    total_price = _resolve_total_price(body.amount, party, service)
+    per_person_price = _resolve_per_person_price(body.amount, party, service)
     amount, commission_rate, commission_amount, discount_reason = _calc_payment(
-        body.amount, party, service, is_leader, has_referrer
+        per_person_price, service, is_leader, has_referrer
     )
 
     payment = Payment(
         user_id=current_user.id,
         party_id=body.party_id,
-        base_price=body.amount,
+        base_price=total_price,
         commission_rate=commission_rate,
         commission_amount=commission_amount,
         discount_reason=discount_reason,
@@ -317,7 +345,7 @@ async def transfer_register(
         db=db,
         party=party,
         member_user_id=party.leader_id,
-        amount=body.amount,
+        amount=amount,
     )
 
     print(f"[PAYMENT] 저장 완료: payment_id={payment.id}, status={payment.status}")

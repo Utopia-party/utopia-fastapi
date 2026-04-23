@@ -59,6 +59,40 @@ async def lifespan(app: FastAPI):
 
                     EXECUTE 'UPDATE services SET original_price = COALESCE(original_price, monthly_price) WHERE original_price IS NULL';
 
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'admin_roles'
+                          AND column_name = 'can_manage_payments'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE admin_roles ADD COLUMN can_manage_payments BOOLEAN NOT NULL DEFAULT false';
+                    END IF;
+
+                    EXECUTE '
+                        UPDATE admin_roles
+                        SET can_manage_payments = true
+                        WHERE can_manage_admins = true
+                           OR can_approve_settlements = true
+                    ';
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'admin_roles'
+                          AND column_name = 'can_manage_handocr'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE admin_roles ADD COLUMN can_manage_handocr BOOLEAN NOT NULL DEFAULT false';
+                    END IF;
+
+                    EXECUTE '
+                        UPDATE admin_roles
+                        SET can_manage_handocr = true
+                        WHERE can_manage_admins = true
+                           OR can_approve_receipts = true
+                    ';
+
                     IF EXISTS (
                         SELECT 1
                         FROM information_schema.columns

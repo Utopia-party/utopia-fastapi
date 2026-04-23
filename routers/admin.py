@@ -81,6 +81,8 @@ class AdminContext:
 def _format_datetime(value: datetime | None) -> str:
     if not value:
         return "-"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
@@ -88,6 +90,8 @@ def _format_relative(value: datetime | None) -> str:
     if not value:
         return "-"
 
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
     delta = datetime.now(timezone.utc) - value.astimezone(timezone.utc)
     seconds = int(delta.total_seconds())
     if seconds < 60:
@@ -108,7 +112,7 @@ def _to_int(value: Decimal | int | float | None) -> int:
 
 
 def _utc_day_start(value: date) -> datetime:
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    return datetime(value.year, value.month, value.day)
 
 
 def _date_range_bounds(
@@ -228,6 +232,8 @@ def _admin_permissions_for_role(role: str) -> dict[str, Any]:
             "can_manage_moderation": True,
             "can_approve_receipts": True,
             "can_approve_settlements": True,
+            "can_manage_payments": True,
+            "can_manage_handocr": True,
             "can_view_logs": True,
             "can_manage_admins": True,
         }
@@ -238,6 +244,8 @@ def _admin_permissions_for_role(role: str) -> dict[str, Any]:
         "can_manage_moderation": True,
         "can_approve_receipts": True,
         "can_approve_settlements": True,
+        "can_manage_payments": True,
+        "can_manage_handocr": True,
         "can_view_logs": True,
         "can_manage_admins": False,
     }
@@ -426,6 +434,8 @@ def _admin_permissions_payload(payload: AdminRoleUpdateIn) -> dict[str, bool]:
         "can_manage_moderation": payload.canManageChatModeration,
         "can_approve_receipts": payload.canManageCaptcha,
         "can_approve_settlements": payload.canApproveSettlements,
+        "can_manage_payments": payload.canManagePayments,
+        "can_manage_handocr": payload.canManageHandOcr,
         "can_view_logs": payload.canViewLogs,
         "can_manage_admins": payload.canManageAdmins,
     }
@@ -443,6 +453,8 @@ def _serialize_admin_permissions(role: AdminRole) -> AdminPermissionOut:
         canManageChatModeration=role.can_manage_moderation,
         canManageCaptcha=role.can_approve_receipts,
         canApproveSettlements=role.can_approve_settlements,
+        canManagePayments=role.can_manage_payments,
+        canManageHandOcr=role.can_manage_handocr,
         canViewLogs=role.can_view_logs,
         canManageAdmins=role.can_manage_admins,
     )
@@ -459,6 +471,8 @@ def _serialize_admin_role(role: AdminRole, user: User, created_by: User | None) 
         canManageChatModeration=role.can_manage_moderation,
         canManageCaptcha=role.can_approve_receipts,
         canApproveSettlements=role.can_approve_settlements,
+        canManagePayments=role.can_manage_payments,
+        canManageHandOcr=role.can_manage_handocr,
         canViewLogs=role.can_view_logs,
         canManageAdmins=role.can_manage_admins,
         lastUpdated=_format_datetime(role.updated_at),
@@ -654,6 +668,18 @@ async def require_admin_settlement_permission(
     return _assert_admin_permission(admin, "can_approve_settlements", "정산 승인 권한이 없습니다.")
 
 
+async def require_admin_payment_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_manage_payments", "수익내역 관리 권한이 없습니다.")
+
+
+async def require_admin_handocr_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_manage_handocr", "HandOCR CAPTCHA 관리 권한이 없습니다.")
+
+
 async def require_admin_log_permission(
     admin: AdminContext = Depends(require_admin_context),
 ) -> AdminContext:
@@ -781,19 +807,13 @@ async def get_admin_dashboard(
         )
     ).scalars().all()
 
-    total_users = await db.scalar(select(func.count()).select_from(User)) or 0
-    active_users = await db.scalar(
-        select(func.count()).select_from(User).where(User.is_active.is_(True))
-    ) or 0
-    suspended_users = await db.scalar(
-        select(func.count()).select_from(User).where(User.is_active.is_(False))
-    ) or 0
-    admin_users = await db.scalar(
-        select(func.count()).select_from(User).where(func.lower(User.role) == "admin")
-    ) or 0
-
     current_signups = len(current_users)
     comparison_signups = len(comparison_users)
+    current_active_users = sum(1 for user in current_users if user.is_active)
+    current_suspended_users = sum(1 for user in current_users if not user.is_active)
+    current_admin_users = sum(
+        1 for user in current_users if (user.role or "").lower() == "admin"
+    )
     current_sales = sum(
         payment.amount for payment in current_payments if (payment.status or "").lower() == "approved"
     )
@@ -824,7 +844,7 @@ async def get_admin_dashboard(
     comparison_parties_count = len(comparison_parties)
     current_quick_match_count = len(current_quick_match_requests)
     comparison_quick_match_count = len(comparison_quick_match_requests)
-    suspended_users_count = int(suspended_users)
+    suspended_users_count = int(current_suspended_users)
 
     approved_amount = current_sales
     pending_amount = sum(
@@ -1063,10 +1083,10 @@ async def get_admin_dashboard(
             },
         ],
         member_stats=[
-            {"label": "전체 회원", "value": f"{total_users:,}"},
-            {"label": "활성 사용자", "value": f"{active_users:,}"},
-            {"label": "정지 사용자", "value": f"{suspended_users:,}"},
-            {"label": "관리자 계정", "value": f"{admin_users:,}"},
+            {"label": "선택 기간 가입", "value": f"{current_signups:,}"},
+            {"label": "활성 사용자", "value": f"{current_active_users:,}"},
+            {"label": "정지 사용자", "value": f"{current_suspended_users:,}"},
+            {"label": "관리자 계정", "value": f"{current_admin_users:,}"},
         ],
         sales_stats=[
             {"label": "승인 금액", "value": f"₩ {int(approved_amount):,}"},
@@ -2902,6 +2922,54 @@ class AdminPaymentListOut(_BaseModel):
     totalPages: int
 
 
+def _admin_payment_total_price(
+    payment: Payment,
+    party: Party,
+    service: Service | None,
+) -> int:
+    if service and service.monthly_price:
+        return int(service.monthly_price)
+    if payment.base_price:
+        return int(payment.base_price)
+    if party.monthly_per_person and party.max_members:
+        return int(party.monthly_per_person * party.max_members)
+    return int(payment.amount)
+
+
+def _admin_payment_per_person_price(
+    payment: Payment,
+    party: Party,
+    service: Service | None,
+) -> int:
+    total_price = _admin_payment_total_price(payment, party, service)
+    max_members = int(party.max_members or 0)
+    if max_members > 0:
+        return max(1, round(total_price / max_members))
+    if party.monthly_per_person:
+        return int(party.monthly_per_person)
+    return int(payment.amount)
+
+
+def _admin_payment_display_amount(
+    payment: Payment,
+    user: User,
+    party: Party,
+    service: Service | None,
+) -> tuple[int, int]:
+    per_person_price = _admin_payment_per_person_price(payment, party, service)
+    discount_rate = 0.0
+
+    if party.leader_id == user.id and service and service.leader_discount_rate:
+        discount_rate += float(service.leader_discount_rate or 0.0)
+
+    if user.referrer_id and service and service.referral_discount_rate:
+        discount_rate += float(service.referral_discount_rate or 0.0)
+
+    discount_rate = min(discount_rate, 1.0)
+    actual_amount = round(per_person_price * (1 - discount_rate))
+    return per_person_price, actual_amount
+
+
 @router.get("/payments", response_model=AdminPaymentListOut)
 async def get_admin_payments(
     keyword: str = Query(""),
@@ -2910,7 +2978,7 @@ async def get_admin_payments(
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    current_user: User = Depends(require_user),
+    _: AdminContext = Depends(require_admin_payment_permission),
     db: AsyncSession = Depends(get_db),
 ):
     """결제 내역 전체 목록 (관리자 전용, 페이지네이션)"""
@@ -2953,6 +3021,9 @@ async def get_admin_payments(
     items = []
     for payment, user, party, service in paginated:
         role = "방장" if party.leader_id == user.id else "멤버"
+        base_price, actual_amount = _admin_payment_display_amount(
+            payment, user, party, service
+        )
         items.append(
             AdminPaymentRecordOut(
                 id=str(payment.id),
@@ -2963,11 +3034,13 @@ async def get_admin_payments(
                 partyTitle=party.title,
                 serviceName=service.name if service else None,
                 role=role,
-                basePrice=payment.base_price or payment.amount,
-                amount=payment.amount,
+                basePrice=base_price,
+                amount=actual_amount,
                 discountReason=payment.discount_reason,
                 commissionRate=float(payment.commission_rate or 0.10),
-                commissionAmount=payment.commission_amount,
+                commissionAmount=round(
+                    actual_amount * float(payment.commission_rate or 0.10)
+                ),
                 paymentMethod=payment.payment_method,
                 status=payment.status,
                 billingMonth=payment.billing_month,

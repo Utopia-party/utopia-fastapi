@@ -105,6 +105,8 @@ class AdminRoleRecordOut(BaseModel):
     canManageChatModeration: bool
     canManageCaptcha: bool
     canApproveSettlements: bool
+    canManagePayments: bool
+    canManageHandOcr: bool
     canViewLogs: bool
     canManageAdmins: bool
     lastUpdated: str
@@ -118,6 +120,8 @@ class AdminRoleUpdateIn(BaseModel):
     canManageChatModeration: bool
     canManageCaptcha: bool
     canApproveSettlements: bool
+    canManagePayments: bool
+    canManageHandOcr: bool
     canViewLogs: bool
     canManageAdmins: bool
 
@@ -129,6 +133,8 @@ class AdminPermissionOut(BaseModel):
     canManageChatModeration: bool
     canManageCaptcha: bool
     canApproveSettlements: bool
+    canManagePayments: bool
+    canManageHandOcr: bool
     canViewLogs: bool
     canManageAdmins: bool
 

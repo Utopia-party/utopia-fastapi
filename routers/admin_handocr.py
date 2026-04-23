@@ -8,12 +8,17 @@ import json
 import asyncpg
 import httpx
 import redis.asyncio as redis
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from minio import Minio
 
 from core.config import settings
+from routers.admin import require_admin_handocr_permission
 
-router = APIRouter(prefix="/admin/handocr", tags=["Admin HandOCR"])
+router = APIRouter(
+    prefix="/admin/handocr",
+    tags=["Admin HandOCR"],
+    dependencies=[Depends(require_admin_handocr_permission)],
+)
 
 DATABASE_URL = settings.DATABASE_URL
 REDIS_URL = settings.REDIS_URL

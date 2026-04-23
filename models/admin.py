@@ -29,6 +29,12 @@ class AdminRole(Base):
     can_approve_settlements: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
     )
+    can_manage_payments: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    can_manage_handocr: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     can_view_logs: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     can_manage_admins: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_by: Mapped[uuid.UUID | None] = mapped_column(
