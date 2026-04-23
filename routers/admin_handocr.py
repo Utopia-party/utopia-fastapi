@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from io import BytesIO
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 import json
@@ -8,8 +9,14 @@ import json
 import asyncpg
 import httpx
 import redis.asyncio as redis
+<<<<<<< Updated upstream
 from fastapi import APIRouter, Depends, HTTPException, Query
+=======
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
+>>>>>>> Stashed changes
 from minio import Minio
+from minio.error import S3Error
 
 from core.config import settings
 from routers.admin import require_admin_handocr_permission
@@ -58,10 +65,6 @@ async def get_db_pool() -> asyncpg.Pool:
 
 
 def build_gpu_health_url(raw_url: str) -> str:
-    """
-    settings.GPU_SERVER_URL 이 /ai/predict/mission 또는 /ai/predict/pose 로 끝나면
-    같은 호스트의 /health 로 변환합니다.
-    """
     parsed = urlparse(raw_url)
     path = parsed.path or ""
 
@@ -261,20 +264,40 @@ async def get_admin_handocr_health():
         raise HTTPException(status_code=502, detail=f"GPU health 조회 실패: {repr(e)}")
 
 
-@router.get("/image-url")
-async def get_admin_handocr_image_url(
+@router.get("/image")
+async def get_admin_handocr_image(
     key: str = Query(..., min_length=1),
-    expires_seconds: int = Query(default=3600, ge=60, le=86400),
 ):
     try:
-        url = minio_client.presigned_get_object(
-            PHOTO_BUCKET,
-            key,
-            expires=timedelta(seconds=expires_seconds),
+        obj = minio_client.get_object(PHOTO_BUCKET, key)
+        try:
+            data = obj.read()
+            content_type = obj.headers.get(
+                "Content-Type",
+                "application/octet-stream",
+            )
+        finally:
+            obj.close()
+            obj.release_conn()
+
+        return StreamingResponse(
+            BytesIO(data),
+            media_type=content_type,
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "Content-Disposition": f'inline; filename=\"{key.split("/")[-1]}\"',
+            },
         )
-        return {"url": url}
+    except S3Error as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"이미지를 찾을 수 없습니다: {e.code}",
+        )
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"이미지 URL 생성 실패: {repr(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"이미지 조회 실패: {repr(e)}",
+        )
 
 
 @router.get("/blocks")
