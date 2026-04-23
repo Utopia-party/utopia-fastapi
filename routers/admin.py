@@ -3386,7 +3386,7 @@ async def get_chat_moderation_trend(
 
     result = await db.execute(text(f"""
         SELECT
-            DATE_TRUNC('{trunc}', created_at)::date AS label,
+            DATE_TRUNC('{trunc}', created_at + INTERVAL '9 hours')::date AS label,
             COUNT(*) FILTER (WHERE moderation_status = 'blocked') AS blocked,
             COUNT(*) FILTER (WHERE moderation_status = 'warned') AS warned,
             COUNT(*) FILTER (WHERE moderation_status = 'false_positive') AS false_positive,
