@@ -2984,20 +2984,22 @@ async def get_admin_payments(
     db: AsyncSession = Depends(get_db),
 ):
     """결제 내역 전체 목록 (관리자 전용, 페이지네이션)"""
+    payment_event_at = func.coalesce(Payment.paid_at, Payment.created_at)
+
     stmt = (
         select(Payment, User, Party, Service)
         .join(User, Payment.user_id == User.id)
         .join(Party, Payment.party_id == Party.id)
         .outerjoin(Service, Party.service_id == Service.id)
-        .order_by(Payment.created_at.desc())
+        .order_by(payment_event_at.desc())
     )
 
     if status_filter:
         stmt = stmt.where(func.lower(Payment.status) == status_filter.lower())
     if date_from:
-        stmt = stmt.where(func.date(Payment.created_at) >= date_from)
+        stmt = stmt.where(func.date(payment_event_at) >= date_from)
     if date_to:
-        stmt = stmt.where(func.date(Payment.created_at) <= date_to)
+        stmt = stmt.where(func.date(payment_event_at) <= date_to)
 
     rows = (await db.execute(stmt)).all()
 
