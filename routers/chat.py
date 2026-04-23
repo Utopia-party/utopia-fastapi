@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
-from transformers import pipeline
 from core.config import settings
 from core.database import get_db, AsyncSessionLocal
 from models.party import Party, PartyMember, PartyChat, Service
@@ -23,13 +22,7 @@ redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
 REDIS_TTL = 60 * 60 * 24 * 3
 OLLAMA_URL = settings.OLLAMA_URL
 OLLAMA_MODEL = settings.OLLAMA_MODEL
-
-# smilegate ML 모델 - 서버 시작 시 1회 로드
-hate_classifier = pipeline(
-    "text-classification",
-    model="smilegate-ai/kor-hate-speech-detection",
-    device=0  # CPU면 -1
-)
+ML_SERVER_URL = settings.ML_SERVER_URL
 
 
 def warn_key(party_id: str, user_id: str) -> str:
@@ -119,19 +112,21 @@ async def check_message(content: str) -> dict:
         if stripped in config.get("blacklist", []):
             return {"violation": True, "severe": True, "reason": "욕설 축약어"}
 
-    # 2단계: smilegate ML
-    if config.get("stage2_enabled", True):
+    # 2단계: GPU 서버 ML
+    if config.get("stage2_enabled", True) and ML_SERVER_URL:
         try:
-            ml_result = hate_classifier(stripped)[0]
-            label = ml_result["label"]
-            score = ml_result["score"]
-            pass_t = config.get("stage2_pass_threshold", 0.75)
-            block_t = config.get("stage2_block_threshold", 0.92)
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.post(ML_SERVER_URL, json={"content": stripped})
+                ml = resp.json()
+                label = ml["label"]
+                score = ml["score"]
+                pass_t = config.get("stage2_pass_threshold", 0.75)
+                block_t = config.get("stage2_block_threshold", 0.92)
 
-            if label == "none" or score < pass_t:
-                return {"violation": False, "severe": False, "reason": ""}
-            if score >= block_t:
-                return {"violation": True, "severe": label == "hate", "reason": label}
+                if label == "none" or score < pass_t:
+                    return {"violation": False, "severe": False, "reason": ""}
+                if score >= block_t:
+                    return {"violation": True, "severe": label == "hate", "reason": label}
         except Exception:
             pass
 
