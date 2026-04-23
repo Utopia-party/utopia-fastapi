@@ -170,6 +170,13 @@ async def refresh_token_api(
             detail="만료된 refresh token입니다.",
         )
 
+    # 채팅 IP 벤 체크
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
+        if is_ip_banned:
+            raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
+
     new_access_token = create_access_token(data={"sub": str(token_row.user_id)})
 
     new_refresh_token = await rotate_refresh_token(
@@ -291,6 +298,12 @@ async def social_login(data: SocialLoginBody, response: Response, request: Reque
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     user = result.scalar_one_or_none()
     if user:
+        # 채팅 IP 벤 체크
+        client_ip = request.client.host if request.client else None
+        if client_ip:
+            is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
+            if is_ip_banned:
+                raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
         if not user.is_active:
             raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
 
@@ -365,6 +378,12 @@ async def social_login(data: SocialLoginBody, response: Response, request: Reque
 
 @router.post("/auth/social/signup")
 async def social_signup(data: SocialSignupBody, response: Response, request: Request, db: AsyncSession = Depends(get_db)):
+    # 채팅 IP 벤 체크
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
+        if is_ip_banned:
+            raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
     oauth = data.oauth.lower().strip()
     oauth_id = data.oauth_id
     email = data.email
@@ -461,6 +480,12 @@ async def signup(
     user: UserCreate,
     db: AsyncSession = Depends(get_db),
 ):
+    # 채팅 IP 벤 체크
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
+        if is_ip_banned:
+            raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
     result = await db.execute(select(User).where(User.email == user.email))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="이미 등록된 이메일입니다.")
@@ -699,6 +724,12 @@ async def login(
         raise HTTPException(status_code=400, detail="소셜 로그인으로 가입한 계정입니다.")
     if not verify_password(user_credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 일치하지 않습니다.")
+    # 채팅 IP 벤 체크
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
+        if is_ip_banned:
+            raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
 
