@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     # 포트원
     PORTONE_API_SECRET: str = ""
 
+    ML_SERVER_URL: str = ""
+
     class Config:
         env_file = ".env"
 
