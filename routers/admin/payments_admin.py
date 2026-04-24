@@ -9,87 +9,6 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-
-class AdminPaymentRecordOut(_BaseModel):
-    id: str
-    userId: str
-    userNickname: str
-    userName: str | None
-    partyId: str
-    partyTitle: str
-    serviceName: str | None
-    role: str
-    basePrice: int
-    amount: int
-    discountReason: str | None
-    commissionRate: float
-    commissionAmount: int
-    paymentMethod: str | None
-    status: str
-    billingMonth: str
-    pricingType: str | None
-    paidAt: str | None
-    createdAt: str
-
-    class Config:
-        from_attributes = True
-
-
-class AdminPaymentListOut(_BaseModel):
-    items: list[AdminPaymentRecordOut]
-    total: int
-    page: int
-    limit: int
-    totalPages: int
-
-
-def _admin_payment_total_price(
-    payment: Payment,
-    party: Party,
-    service: Service | None,
-) -> int:
-    if service and service.monthly_price:
-        return int(service.monthly_price)
-    if payment.base_price:
-        return int(payment.base_price)
-    if party.monthly_per_person and party.max_members:
-        return int(party.monthly_per_person * party.max_members)
-    return int(payment.amount)
-
-
-def _admin_payment_per_person_price(
-    payment: Payment,
-    party: Party,
-    service: Service | None,
-) -> int:
-    total_price = _admin_payment_total_price(payment, party, service)
-    max_members = int(party.max_members or 0)
-    if max_members > 0:
-        return max(1, round(total_price / max_members))
-    if party.monthly_per_person:
-        return int(party.monthly_per_person)
-    return int(payment.amount)
-
-
-def _admin_payment_display_amount(
-    payment: Payment,
-    user: User,
-    party: Party,
-    service: Service | None,
-) -> tuple[int, int]:
-    per_person_price = _admin_payment_per_person_price(payment, party, service)
-    discount_rate = 0.0
-
-    if party.leader_id == user.id and service and service.leader_discount_rate:
-        discount_rate += float(service.leader_discount_rate or 0.0)
-
-    if user.referrer_id and service and service.referral_discount_rate:
-        discount_rate += float(service.referral_discount_rate or 0.0)
-
-    discount_rate = min(discount_rate, 1.0)
-    actual_amount = round(per_person_price * (1 - discount_rate))
-    return per_person_price, actual_amount
-
 from core.config import settings
 from core.database import get_db
 from core.redis_client import redis_client
@@ -185,6 +104,87 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+class AdminPaymentRecordOut(_BaseModel):
+    id: str
+    userId: str
+    userNickname: str
+    userName: str | None
+    partyId: str
+    partyTitle: str
+    serviceName: str | None
+    role: str
+    basePrice: int
+    amount: int
+    discountReason: str | None
+    commissionRate: float
+    commissionAmount: int
+    paymentMethod: str | None
+    status: str
+    billingMonth: str
+    pricingType: str | None
+    paidAt: str | None
+    createdAt: str
+
+    class Config:
+        from_attributes = True
+
+
+class AdminPaymentListOut(_BaseModel):
+    items: list[AdminPaymentRecordOut]
+    total: int
+    page: int
+    limit: int
+    totalPages: int
+
+
+def _admin_payment_total_price(
+    payment: Payment,
+    party: Party,
+    service: Service | None,
+) -> int:
+    if service and service.monthly_price:
+        return int(service.monthly_price)
+    if payment.base_price:
+        return int(payment.base_price)
+    if party.monthly_per_person and party.max_members:
+        return int(party.monthly_per_person * party.max_members)
+    return int(payment.amount)
+
+
+def _admin_payment_per_person_price(
+    payment: Payment,
+    party: Party,
+    service: Service | None,
+) -> int:
+    total_price = _admin_payment_total_price(payment, party, service)
+    max_members = int(party.max_members or 0)
+    if max_members > 0:
+        return max(1, round(total_price / max_members))
+    if party.monthly_per_person:
+        return int(party.monthly_per_person)
+    return int(payment.amount)
+
+
+def _admin_payment_display_amount(
+    payment: Payment,
+    user: User,
+    party: Party,
+    service: Service | None,
+) -> tuple[int, int]:
+    per_person_price = _admin_payment_per_person_price(payment, party, service)
+    discount_rate = 0.0
+
+    if party.leader_id == user.id and service and service.leader_discount_rate:
+        discount_rate += float(service.leader_discount_rate or 0.0)
+
+    if user.referrer_id and service and service.referral_discount_rate:
+        discount_rate += float(service.referral_discount_rate or 0.0)
+
+    discount_rate = min(discount_rate, 1.0)
+    actual_amount = round(per_person_price * (1 - discount_rate))
+    return per_person_price, actual_amount
+
+
 @router.get("/payments", response_model=AdminPaymentListOut)
 async def get_admin_payments(
     keyword: str = Query(""),
@@ -274,3 +274,5 @@ async def get_admin_payments(
         limit=limit,
         totalPages=total_pages,
     )
+
+# ── 캡챠 통계 (대시보드) ──────────────────────────────────────
