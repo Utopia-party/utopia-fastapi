@@ -63,9 +63,13 @@ async def get_cloud_summary(_: object = Depends(require_admin_context)):
     for metric_name, label in [
         ("cpu_usage", "cpu"),
         ("mem_usage", "mem"),
+        ("mem_used",  "mem_used"),
+        ("mem_total", "mem_total"),
         ("network_rx_bytes_persec", "net_in"),
         ("network_tx_bytes_persec", "net_out"),
         ("disk_used_percent", "disk"),
+        ("disk_used",  "disk_used"),
+        ("disk_total", "disk_total"),
     ]:
         try:
             result = await _query_metric(metric_name)
@@ -128,3 +132,12 @@ async def get_lb_metrics(_: object = Depends(require_admin_context)):
             metrics[label] = []
 
     return {"metrics": metrics}
+
+
+@router.get("/debug/labels")
+async def debug_metric_labels(_: object = Depends(require_admin_context)):
+    """실제 메트릭 레이블 키 확인용 (인스턴스명 문제 디버깅)"""
+    result = await _query_metric("cpu_usage")
+    raw = result.get("data", {}).get("result", [])
+    labels = [r.get("metric", {}) for r in raw[:5]]
+    return {"labels": labels, "count": len(raw)}
