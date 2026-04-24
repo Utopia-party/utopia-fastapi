@@ -100,14 +100,15 @@ async def get_metric_range(
     end: str,
     step: str = "60",
     service_type: str = "server",
+    instance_id: str = "",
     _: object = Depends(require_admin_context),
 ):
     """
     특정 메트릭 시계열 데이터 조회
-    - metric: cpu_usage / mem_usage / network_rx_bytes_persec / network_tx_bytes_persec / disk_used_percent
+    - metric: cpu_usage / mem_usage / network_rx_bytes_persec 등
     - start/end: Unix timestamp (초)
-    - step: 집계 간격(초), 기본 60
-    - service_type: server / lb / kubernetes
+    - step: 집계 간격(초)
+    - instance_id: 특정 서버 UUID (없으면 전체 합산)
     """
     ALLOWED_METRICS = {
         "cpu_usage", "cpu_usage_user", "cpu_usage_system",
@@ -118,8 +119,14 @@ async def get_metric_range(
     if metric not in ALLOWED_METRICS:
         raise HTTPException(status_code=400, detail=f"허용되지 않는 메트릭입니다: {metric}")
 
+    # 서버 필터: instance_id가 있으면 PromQL에 레이블 필터 추가
+    if instance_id:
+        query = f'{metric}{{instance_id="{instance_id}"}}'
+    else:
+        query = metric
+
     try:
-        result = await _query_range(metric, start, end, step, service_type)
+        result = await _query_range(query, start, end, step, service_type)
         return {"result": _extract_values(result)}
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=f"카카오클라우드 API 오류: {e.response.text}")
@@ -153,3 +160,17 @@ async def debug_metric_labels(_: object = Depends(require_admin_context)):
     raw = result.get("data", {}).get("result", [])
     labels = [r.get("metric", {}) for r in raw[:5]]
     return {"labels": labels, "count": len(raw)}
+
+
+@router.get("/debug/raw")
+async def debug_raw_values(_: object = Depends(require_admin_context)):
+    """disk_used, disk_total, mem_used, mem_total 실제 값 확인"""
+    result = {}
+    for m in ["disk_used", "disk_total", "mem_used", "mem_total"]:
+        try:
+            r = await _query_metric(m)
+            vals = _extract_values(r)
+            result[m] = [{"metric": v.get("metric", {}), "value": v.get("value", [])} for v in vals[:2]]
+        except Exception as e:
+            result[m] = str(e)
+    return result
