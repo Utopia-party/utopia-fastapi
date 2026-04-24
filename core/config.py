@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     KAKAO_CLOUD_PROJECT_ID: str = ""
     KAKAO_CLOUD_CREDENTIAL_ID: str = ""
     KAKAO_CLOUD_CREDENTIAL_SECRET: str = ""
-    KAKAO_CLOUD_REGION: str = "
+    KAKAO_CLOUD_REGION: str = ""
 
     class Config:
         env_file = ".env"
