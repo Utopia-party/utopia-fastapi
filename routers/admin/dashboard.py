@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -525,6 +527,3 @@ async def get_admin_dashboard(
             for row in recent_activity_rows
         ],
     )
-
-
-@router.get("/me", response_model=AdminPermissionOut)
