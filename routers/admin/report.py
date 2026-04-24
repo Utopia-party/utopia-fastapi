@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID
@@ -48,8 +48,8 @@ STATUS_TO_API = {
 ACTION_RESULT_BY_STATUS = {
     "PENDING": "NONE",
     "IN_REVIEW": "NONE",
-    "APPROVED": "NO_ACTION",
-    "REJECTED": "NO_ACTION",
+    "APPROVED": "NONE",
+    "REJECTED": "NONE",
 }
 
 
@@ -104,13 +104,6 @@ def build_admin_report_response(report: Report) -> dict[str, Any]:
 
 
 async def ensure_admin_can_manage_reports(current_user: User) -> None:
-    """
-    TODO:
-    기존 프로젝트의 관리자 권한 dependency가 있으면 이 함수 대신 그걸 연결하는 게 가장 좋습니다.
-
-    현재는 User.role == "admin" 또는 User.is_admin == True 기준으로 검사합니다.
-    프로젝트의 실제 관리자 권한 구조가 admin_roles.can_manage_reports라면 이 부분은 교체해야 합니다.
-    """
     role = getattr(current_user, "role", None)
     is_admin = getattr(current_user, "is_admin", False)
 
@@ -210,10 +203,8 @@ async def update_admin_report_status(
 
     report.status = next_status
     report.reviewed_by = current_user.id
-    report.reviewed_at = datetime.now()
-
-    if next_status in ACTION_RESULT_BY_STATUS:
-        report.action_result_code = ACTION_RESULT_BY_STATUS[next_status]
+    report.reviewed_at = datetime.now(timezone.utc)
+    report.action_result_code = ACTION_RESULT_BY_STATUS[next_status]
 
     await db.commit()
 
