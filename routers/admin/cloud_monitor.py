@@ -174,3 +174,17 @@ async def debug_raw_values(_: object = Depends(require_admin_context)):
         except Exception as e:
             result[m] = str(e)
     return result
+
+
+@router.get("/debug/disk-unit")
+async def debug_disk_unit(_: object = Depends(require_admin_context)):
+    """disk_used, disk_total 실제 raw 값 확인 (단위 파악용)"""
+    out = {}
+    for m in ["disk_used", "disk_total", "mem_used", "mem_total"]:
+        try:
+            r = await _query_metric(m)
+            vals = _extract_values(r)
+            out[m] = [{"instance_id": v.get("metric", {}).get("instance_id"), "value": v.get("value", [None, None])[1]} for v in vals]
+        except Exception as e:
+            out[m] = str(e)
+    return out
