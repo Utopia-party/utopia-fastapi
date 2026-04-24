@@ -1,5 +1,10 @@
+import asyncio
+import logging
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 from core.config import settings
 from routers.admin.deps import require_admin_context
 
@@ -56,27 +61,34 @@ def _extract_values(prom_result: dict) -> list:
 
 @router.get("/summary")
 async def get_cloud_summary(_: object = Depends(require_admin_context)):
-    """서버별 CPU / 메모리 / 네트워크 현재값 요약"""
-    metrics = {}
-    errors = []
-
-    for metric_name, label in [
-        ("cpu_usage", "cpu"),
-        ("mem_usage", "mem"),
-        ("mem_used",  "mem_used"),
-        ("mem_total", "mem_total"),
+    """서버별 CPU / 메모리 / 네트워크 현재값 요약 (병렬 요청)"""
+    METRIC_LABELS = [
+        ("cpu_usage",               "cpu"),
+        ("mem_usage",               "mem"),
+        ("mem_used",                "mem_used"),
+        ("mem_total",               "mem_total"),
         ("network_rx_bytes_persec", "net_in"),
         ("network_tx_bytes_persec", "net_out"),
-        ("disk_used_percent", "disk"),
-        ("disk_used",  "disk_used"),
-        ("disk_total", "disk_total"),
-    ]:
+        ("disk_used_percent",       "disk"),
+        ("disk_used",               "disk_used"),
+        ("disk_total",              "disk_total"),
+    ]
+
+    async def _fetch(metric_name: str, label: str):
         try:
             result = await _query_metric(metric_name)
-            metrics[label] = _extract_values(result)
+            return label, _extract_values(result), None
         except Exception as e:
-            errors.append(f"{metric_name}: {str(e)}")
-            metrics[label] = []
+            return label, [], f"{metric_name}: {str(e)}"
+
+    results = await asyncio.gather(*[_fetch(m, l) for m, l in METRIC_LABELS])
+
+    metrics = {}
+    errors = []
+    for label, values, err in results:
+        metrics[label] = values
+        if err:
+            errors.append(err)
 
     return {"metrics": metrics, "errors": errors}
 
