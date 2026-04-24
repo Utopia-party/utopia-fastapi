@@ -15,7 +15,7 @@ from core.config import settings
 from core.database import AsyncSessionLocal, Base, engine
 from models.admin import ActivityLog
 
-from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report, ws_notifications, payments, admin_handocr, admin_report
+from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report, ws_notifications, payments, admin_handocr
 
 from routers.mypage import profile, trust_history
 from routers.mypage import parties as mypage_parties
@@ -118,12 +118,17 @@ async def lifespan(app: FastAPI):
         )
     yield
 
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
 app = FastAPI(
     title="Party-Up API",
     description="파티업 백엔드 API",
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# 리버스 프록시(Nginx) 뒤에서 실제 클라이언트 IP를 읽기 위해 ProxyHeaders 미들웨어 등록
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 
 # 상원: 관리자 접근 로그를 남기기 전에 쿠키 access token에서 사용자 식별자를 안전하게 읽습니다.
@@ -239,9 +244,6 @@ app.include_router(admin_mod_config_router, prefix="/api")
 app.include_router(admin_cloud_monitor_router, prefix="/api")
 # admin handocr
 app.include_router(admin_handocr.router, prefix="/api")
-
-# admin report
-app.include_router(admin_report.router, prefix="/api")
 
 @app.get("/api/health")
 async def health():
