@@ -16,7 +16,7 @@ from minio import Minio
 from minio.error import S3Error
 
 from core.config import settings
-from routers.admin import require_admin_handocr_permission
+from routers.admin.deps import require_admin_handocr_permission
 
 router = APIRouter(
     prefix="/admin/handocr",
