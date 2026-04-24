@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/captcha/shadow", tags=["admin-captcha"])
 async def get_shadow_mode(current_user: User = Depends(require_user)):
     """현재 LSTM Shadow Mode 상태 조회"""
     return {
@@ -410,7 +413,7 @@ def _admin_payment_display_amount(
     return per_person_price, actual_amount
 
 
-@router.get("/payments", response_model=AdminPaymentListOut)
+@router.get("/captcha/stats", tags=["admin-captcha"])
 async def get_captcha_stats(
     period: str = Query(default="daily", pattern="^(daily|weekly|monthly)$"),
     start_date: str | None = Query(default=None, description="시작일 (YYYY-MM-DD)"),
@@ -699,5 +702,3 @@ async def list_captcha_sessions(
                 "total_pages": 0,
             }
         raise
-
-@router.get("/moderation/chat-trend", response_model=list[dict])
