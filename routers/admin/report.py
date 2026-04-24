@@ -103,17 +103,13 @@ def build_admin_report_response(report: Report) -> dict[str, Any]:
     }
 
 
-async def ensure_admin_can_manage_reports(
-    current_user: User,
-):
+async def ensure_admin_can_manage_reports(current_user: User) -> None:
     """
-    프로젝트에 이미 관리자 권한 dependency가 있으면 이 함수 대신 그걸 쓰세요.
+    TODO:
+    기존 프로젝트의 관리자 권한 dependency가 있으면 이 함수 대신 그걸 연결하는 게 가장 좋습니다.
 
-    예:
-    current_admin: User = Depends(require_admin_permission("can_manage_reports"))
-
-    현재 User 모델의 관리자 권한 필드 구조를 정확히 알 수 없어서,
-    여기서는 최소한의 placeholder로 둡니다.
+    현재는 User.role == "admin" 또는 User.is_admin == True 기준으로 검사합니다.
+    프로젝트의 실제 관리자 권한 구조가 admin_roles.can_manage_reports라면 이 부분은 교체해야 합니다.
     """
     role = getattr(current_user, "role", None)
     is_admin = getattr(current_user, "is_admin", False)
@@ -121,8 +117,6 @@ async def ensure_admin_can_manage_reports(
     if role == "admin" or is_admin:
         return
 
-    # 기존 프로젝트에서 admin router가 쿠키 인증만으로 별도 권한 체크를 하고 있다면
-    # 이 부분은 기존 방식에 맞게 교체해야 합니다.
     raise HTTPException(
         status_code=403,
         detail="관리자 권한이 필요합니다.",
