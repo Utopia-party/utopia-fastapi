@@ -9,7 +9,7 @@ from fastapi import HTTPException, UploadFile
 from minio.error import S3Error
 
 from core.config import settings
-from core.minio import minio_client
+from core.minio_assets import build_minio_client
 
 
 REPORT_BUCKET = settings.MINIO_REPORT_BUCKET
@@ -26,12 +26,12 @@ ALLOWED_REPORT_CONTENT_TYPES = {
 
 
 def ensure_report_bucket_exists() -> None:
-    """
-    신고 증빙 파일용 MinIO bucket이 없으면 생성합니다.
-    """
     try:
-        if not minio_client.bucket_exists(REPORT_BUCKET):
-            minio_client.make_bucket(REPORT_BUCKET)
+        client = build_minio_client()
+
+        if not client.bucket_exists(REPORT_BUCKET):
+            client.make_bucket(REPORT_BUCKET)
+
     except S3Error as e:
         raise HTTPException(
             status_code=500,
@@ -40,10 +40,6 @@ def ensure_report_bucket_exists() -> None:
 
 
 async def upload_report_file(file: UploadFile, report_id: str) -> dict:
-    """
-    신고 증빙 파일을 MinIO에 업로드하고,
-    DB에 저장할 메타데이터를 반환합니다.
-    """
     if not file.filename:
         raise HTTPException(
             status_code=400,
@@ -77,9 +73,10 @@ async def upload_report_file(file: UploadFile, report_id: str) -> dict:
         )
 
     try:
+        client = build_minio_client()
         ensure_report_bucket_exists()
 
-        minio_client.put_object(
+        client.put_object(
             bucket_name=REPORT_BUCKET,
             object_name=object_key,
             data=BytesIO(content),
@@ -105,14 +102,11 @@ def get_report_file_presigned_url(
     object_key: str,
     expires_seconds: int = 300,
 ) -> str:
-    """
-    관리자 페이지에서 증빙 파일을 확인할 수 있도록
-    짧은 만료 시간을 가진 조회 URL을 발급합니다.
-    """
     try:
+        client = build_minio_client()
         ensure_report_bucket_exists()
 
-        return minio_client.presigned_get_object(
+        return client.presigned_get_object(
             bucket_name=REPORT_BUCKET,
             object_name=object_key,
             expires=timedelta(seconds=expires_seconds),
