@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/moderation/chat-logs", response_model=list[ChatModerationLogOut])
 async def get_chat_moderation_logs(
     _: AdminContext = Depends(require_admin_moderation_permission),
     db: AsyncSession = Depends(get_db),
@@ -300,7 +303,7 @@ async def get_user_status_logs(
 
 # ── LSTM Shadow Mode 토글 ──────────────────────────────
 
-@router.get("/captcha/shadow", tags=["admin-captcha"])
+@router.get("/moderation/chat-trend", response_model=list[dict])
 async def get_chat_moderation_trend(
     _: AdminContext = Depends(require_admin_moderation_permission),
     db: AsyncSession = Depends(get_db),

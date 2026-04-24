@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/users", response_model=list[AdminUserRecordOut])
 async def get_admin_users(
     _: AdminContext = Depends(require_admin_user_permission),
     db: AsyncSession = Depends(get_db),
@@ -529,6 +532,3 @@ async def update_admin_user_trust_score(
     await db.commit()
 
     return await get_admin_user_detail(user_id, admin, db)
-
-
-@router.get("/parties", response_model=list[AdminPartyRecordOut])

@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/parties", response_model=list[AdminPartyRecordOut])
 async def get_admin_parties(
     _: AdminContext = Depends(require_admin_party_permission),
     db: AsyncSession = Depends(get_db),
@@ -247,7 +250,7 @@ async def force_end_admin_party(
     )
 
 
-@router.get("/reports", response_model=list[ReportRecordOut])
+@router.get("/parties/{party_id}/members", response_model=list[AdminPartyMemberOut])
 async def get_admin_party_members(
     party_id: str,
     _: AdminContext = Depends(require_admin_party_permission),
@@ -504,5 +507,3 @@ async def change_admin_party_member_role(
         joinedAt=_format_datetime(member_row.joined_at),
         leftAt=None,
     )
-
-@router.get("/moderation/chat-logs", response_model=list[ChatModerationLogOut])

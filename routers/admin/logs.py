@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/logs", response_model=list[SystemLogRecordOut])
 async def get_admin_logs(
     _: AdminContext = Depends(require_admin_log_permission),
     db: AsyncSession = Depends(get_db),
@@ -211,5 +214,3 @@ async def get_admin_logs(
         return filtered[:200]
 
     return logs[:200]
-
-@router.get("/parties/{party_id}/members", response_model=list[AdminPartyMemberOut])

@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/me", response_model=AdminPermissionOut)
 async def get_admin_me(
     admin: AdminContext = Depends(require_admin_context),
 ):
@@ -188,6 +191,3 @@ async def update_admin_role(
     await db.refresh(role_row)
 
     return _serialize_admin_role(role_row, target_user, admin.user)
-
-
-@router.get("/users", response_model=list[AdminUserRecordOut])

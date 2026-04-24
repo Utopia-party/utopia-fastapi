@@ -22,6 +22,7 @@ from models.admin import (
     SystemLog,
 )
 from models.report import Report
+
 from models.notification import Notification
 from models.party import Party, PartyChat, PartyMember, Service
 from models.payment import Payment
@@ -67,6 +68,7 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -101,6 +103,7 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+@router.get("/payments", response_model=AdminPaymentListOut)
 async def get_admin_payments(
     keyword: str = Query(""),
     status_filter: str = Query("", alias="status"),
@@ -191,5 +194,3 @@ async def get_admin_payments(
     )
 
 # ── 캡챠 통계 (대시보드) ──────────────────────────────────────
-
-@router.get("/captcha/stats", tags=["admin-captcha"])
