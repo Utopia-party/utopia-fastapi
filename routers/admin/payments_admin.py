@@ -4,9 +4,43 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel as _BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
+
+
+class AdminPaymentRecordOut(_BaseModel):
+    id: str
+    userId: str
+    userNickname: str
+    userName: str | None
+    partyId: str
+    partyTitle: str
+    serviceName: str | None
+    role: str
+    basePrice: int
+    amount: int
+    discountReason: str | None
+    commissionRate: float
+    commissionAmount: int
+    paymentMethod: str | None
+    status: str
+    billingMonth: str
+    pricingType: str | None
+    paidAt: str | None
+    createdAt: str
+
+    class Config:
+        from_attributes = True
+
+
+class AdminPaymentListOut(_BaseModel):
+    items: list[AdminPaymentRecordOut]
+    total: int
+    page: int
+    limit: int
+    totalPages: int
 
 from core.config import settings
 from core.database import get_db
