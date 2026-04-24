@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from typing import Optional
 from core.database import get_db, AsyncSessionLocal
 from core.config import settings
-from models.party import PartyChat
+from models.party import PartyChat, PartyMember
 from models.user import User
 import redis.asyncio as aioredis
 
@@ -151,19 +151,31 @@ async def get_finetune_stats(db: AsyncSession = Depends(get_db)):
 
 @router.post("/unblock/user/{user_id}")
 async def unblock_chat_user(user_id: str):
-    """채팅 욕설로 차단된 유저 해제 — Redis 차단 삭제 + is_active 복구 + banned_until 초기화"""
-    # Redis 채팅 차단 해제
+    """채팅 욕설로 차단된 유저 완전 해제"""
+    # 1) Redis: 채팅 블럭 + warn 카운트 키 전부 삭제
     await redis_client.delete(f"blocked:user:{user_id}")
+    warn_keys = await redis_client.keys(f"warn:*:{user_id}")
+    if warn_keys:
+        await redis_client.delete(*warn_keys)
 
     try:
+        from sqlalchemy import update as sa_update
         user_uuid = uuid.UUID(user_id)
         async with AsyncSessionLocal() as db:
+            # 2) DB: is_active 복구, banned_until 초기화, chat_warn_count 리셋
             result = await db.execute(select(User).where(User.id == user_uuid))
             user = result.scalar_one_or_none()
             if user:
                 user.is_active = True
                 user.banned_until = None
-                await db.commit()
+                user.chat_warn_count = 0
+            # 3) DB: PartyMember banned → active 복구
+            await db.execute(
+                sa_update(PartyMember)
+                .where(PartyMember.user_id == user_uuid, PartyMember.status == "banned")
+                .values(status="active")
+            )
+            await db.commit()
     except Exception as e:
         print(f"[UNBLOCK USER ERROR] {e}")
 
