@@ -239,36 +239,6 @@ async def update_chat_moderation_status(
     prev_status = chat.moderation_status
     chat.moderation_status = status
 
-    # 오탐지(false_positive)로 변경 시 깎인 신뢰도 복구
-    if status == "false_positive" and prev_status in ("blocked", "warned") and chat.sender_id:
-        from sqlalchemy import update as sa_update, desc
-        sender = await db.get(User, chat.sender_id)
-        if sender:
-            # 해당 채팅 메시지 발생 이후 기록된 욕설 패널티 이력 중 가장 최근 1건 복구
-            penalty_result = await db.execute(
-                select(TrustScore)
-                .where(
-                    TrustScore.user_id == chat.sender_id,
-                    TrustScore.reason.like("%욕설%"),
-                )
-                .order_by(desc(TrustScore.created_at))
-                .limit(1)
-            )
-            penalty = penalty_result.scalar_one_or_none()
-            if penalty:
-                restore = round(abs(float(penalty.change_amount)), 1)
-                previous = float(sender.trust_score) if sender.trust_score is not None else 0.0
-                new_score = min(99.0, round(previous + restore, 1))
-                sender.trust_score = new_score
-                db.add(TrustScore(
-                    user_id=sender.id,
-                    previous_score=previous,
-                    new_score=new_score,
-                    change_amount=restore,
-                    reason="오탐지 처리 — 신뢰도 복구",
-                    created_by=admin.user.id,
-                ))
-
     await _append_activity_log(
         db,
         actor_user_id=admin.user.id,
