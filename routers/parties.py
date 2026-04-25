@@ -109,10 +109,6 @@ def _build_party_out(
         elif my_row_status:
             my_member_status = my_row_status
 
-    # [FIX] 계산 후 미사용 dead code 제거
-    # 기존: monthly_price 로컬 변수를 계산하고 PartyOut에는 party.monthly_per_person 그대로 사용
-    # party.monthly_per_person이 생성 시점에 이미 1인당 금액으로 저장되므로 직접 사용이 맞음
-
     return PartyOut(
         id=party.id,
         leader_id=party.leader_id,
