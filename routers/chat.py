@@ -609,11 +609,6 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 
 # ── 웹소켓 메인 핸들러 ────────────────────────────────────────
 
-# [FIX] user_id 쿼리 파라미터 제거 → JWT 쿠키 검증으로 대체
-# 기존: ?user_id=UUID 쿼리 파라미터를 그대로 신뢰하여 누구나 타인 ID로 채팅 가능
-# 수정: WebSocket 쿠키의 access_token을 JWT 검증 후 user_id 추출
-#       토큰 없는 비로그인 사용자는 "guest"로 처리 (읽기 전용 수준)
-# 프런트엔드 Chat.tsx에서 user_id 쿼리 파라미터 전달 제거 필요
 @router.websocket("/ws/{party_id}")
 async def websocket_chat(
     party_id: str,
