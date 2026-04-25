@@ -595,10 +595,6 @@ async def email_request(
         "expires_in": settings.EMAIL_AUTH_TTL_SECONDS,
     }
 
-
-# [FIX] type 파라미터 추가: reset-password일 때만 email-verify 성공 시 재설정 권한 부여
-# 기존: find-password 엔드포인트에서 DB 조회만으로 redis key 세팅 → 이메일 인증 우회 가능
-# 수정: 인증코드 검증 성공 후 이 함수에서 password_reset_verified 키를 세팅
 @router.post("/email-verify")
 async def email_verify(email: str, code: str, type: str = "signup"):
     redis_key = get_email_auth_key(email)
