@@ -165,7 +165,6 @@ async def refresh_token_api(
             detail="만료된 refresh token입니다.",
         )
 
-    # 채팅 IP 벤 체크
     client_ip = request.client.host if request.client else None
     if client_ip:
         is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
@@ -597,8 +596,11 @@ async def email_request(
     }
 
 
+# [FIX] type 파라미터 추가: reset-password일 때만 email-verify 성공 시 재설정 권한 부여
+# 기존: find-password 엔드포인트에서 DB 조회만으로 redis key 세팅 → 이메일 인증 우회 가능
+# 수정: 인증코드 검증 성공 후 이 함수에서 password_reset_verified 키를 세팅
 @router.post("/email-verify")
-async def email_verify(email: str, code: str):
+async def email_verify(email: str, code: str, type: str = "signup"):
     redis_key = get_email_auth_key(email)
     saved_code = await redis_client.get(redis_key)
     if not saved_code:
@@ -606,6 +608,14 @@ async def email_verify(email: str, code: str):
     if saved_code != code:
         raise HTTPException(status_code=400, detail="인증번호가 틀렸습니다.")
     await redis_client.delete(redis_key)
+
+    if type == "reset-password":
+        await redis_client.setex(
+            f"password_reset_verified:{email}",
+            600,
+            "true",
+        )
+
     return {"success": True, "message": "이메일 인증에 성공했습니다."}
 
 
@@ -634,23 +644,16 @@ async def find_id(
     return FindIdResponse(email=user.email)
 
 
+# [FIX] redis key 세팅 로직 제거 — /email-verify?type=reset-password 에서만 부여
+# 기존: 이메일 존재 여부만 확인하고 바로 password_reset_verified 키 세팅
+#       → 이메일 주소만 알면 인증 없이 비밀번호 재설정 가능한 보안 취약점
 @router.post("/users/find-password", response_model=FindPasswordResponse)
 async def find_password(
     payload: FindPasswordRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(User).where(User.email == payload.email)
-    )
-    user = result.scalar_one_or_none()
-
-    if user and user.provider == "local" and user.is_active:
-        await redis_client.setex(
-            f"password_reset_verified:{payload.email}",
-            600,
-            "true",
-        )
-
+    # 사용자 열거 공격(user enumeration) 방지를 위해 계정 존재 여부와 무관하게 동일 메시지 반환
+    # 실제 재설정 권한(password_reset_verified)은 /email-verify?type=reset-password 에서만 부여됩니다.
     return FindPasswordResponse(
         message="입력하신 이메일로 비밀번호 재설정 안내를 진행할 수 있습니다."
     )
