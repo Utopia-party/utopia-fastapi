@@ -57,7 +57,6 @@ def _get_extension(filename: Optional[str], content_type: Optional[str]) -> str:
     }
     return mapping.get(content_type or "", ".jpg")
 
-# 프로필 이미지 
 def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
     """
     내부 클라이언트로 Presigned URL 생성 후
@@ -75,11 +74,10 @@ def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
         expires=timedelta(hours=1),
     )
 
-    # http://10.10.0.10:9000/... → http://210.109.15.10/minio/...
     if settings.MINIO_PUBLIC_ENDPOINT:
         url = url.replace(
-            settings.MINIO_ENDPOINT,        # 10.10.0.10:9000
-            settings.MINIO_PUBLIC_ENDPOINT, # 210.109.15.10/minio
+            settings.MINIO_ENDPOINT,
+            settings.MINIO_PUBLIC_ENDPOINT,
         )
 
     return url

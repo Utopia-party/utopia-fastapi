@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Any
 
@@ -82,7 +83,7 @@ def _format_datetime(value: datetime | None) -> str:
         return "-"
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return value.astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M")
 
 
 def _format_relative(value: datetime | None) -> str:
@@ -497,7 +498,11 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
         createdBy=(created_by.nickname or created_by.email) if created_by else "-",
         createdAt=_format_datetime(service.created_at),
         updatedAt=_format_datetime(service.updated_at),
-        commissionRate=float(service.commission_rate or 0),
+        commissionRate=(
+            float(service.commission_rate)
+            if service.commission_rate is not None
+            else 0.30
+        ),
         leaderDiscountRate=float(service.leader_discount_rate or 0),
         referralDiscountRate=float(service.referral_discount_rate or 0),
     )

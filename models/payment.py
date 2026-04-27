@@ -19,7 +19,7 @@ class Payment(Base):
         UUID(as_uuid=True), ForeignKey("parties.id"), nullable=False
     )
     base_price: Mapped[int] = mapped_column(Integer, nullable=False)
-    commission_rate: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.10")
+    commission_rate: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.30")
     commission_amount: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     discount_reason: Mapped[str | None] = mapped_column(String(50))
     amount: Mapped[int] = mapped_column(Integer, nullable=False)

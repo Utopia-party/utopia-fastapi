@@ -327,12 +327,15 @@ async def update_admin_service(
     if not service:
         raise HTTPException(status_code=404, detail="서비스를 찾을 수 없습니다.")
 
+    next_commission_rate = payload.commissionRate
+    next_original_price = payload.originalPrice
+
     service.max_members = payload.maxMembers
-    service.monthly_price = payload.monthlyPrice
-    service.original_price = payload.originalPrice
+    service.original_price = next_original_price
+    service.monthly_price = round(next_original_price * (1 + next_commission_rate))
     service.logo_image_key = payload.logoImageKey
     service.is_active = payload.isActive
-    service.commission_rate = payload.commissionRate
+    service.commission_rate = next_commission_rate
     service.leader_discount_rate = payload.leaderDiscountRate
     service.referral_discount_rate = payload.referralDiscountRate
 

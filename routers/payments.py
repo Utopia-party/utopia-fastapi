@@ -85,7 +85,11 @@ def _calc_payment(
     discount_rate = min(discount_rate, 1.0)
     amount = round(base_amount * (1 - discount_rate))
 
-    commission_rate = float(service.commission_rate) if service and service.commission_rate else 0.0
+    commission_rate = (
+        float(service.commission_rate)
+        if service and service.commission_rate is not None
+        else 0.30
+    )
     commission_amount = round(amount * commission_rate / (1 + commission_rate)) if commission_rate > 0 else 0
 
     discount_reason = " + ".join(reasons) if reasons else None
