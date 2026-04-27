@@ -164,16 +164,16 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
         from models.mypage.trust_score import TrustScore
         user_uuid = uuid.UUID(user_id)
         async with AsyncSessionLocal() as db:
-            # 2) DB: is_active 복구, banned_until 초기화, chat_warn_count 리셋
             result = await db.execute(select(User).where(User.id == user_uuid))
             user = result.scalar_one_or_none()
             if user:
+
+                current_warn_count = user.chat_warn_count or 0
+
                 user.is_active = True
                 user.banned_until = None
                 user.chat_warn_count = 0
 
-                # 3) 채팅 욕설로 깎인 신뢰도 점수 복구
-                # 최근 욕설 감지 패널티 이력 합산 후 되돌리기
                 penalty_result = await db.execute(
                     select(TrustScore)
                     .where(
@@ -181,7 +181,7 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
                         TrustScore.reason.like("%욕설 감지%") | TrustScore.reason.like("%심한 욕설%"),
                     )
                     .order_by(desc(TrustScore.created_at))
-                    .limit(10)
+                    .limit(max(1, current_warn_count))
                 )
                 penalties = penalty_result.scalars().all()
                 restore_amount = round(sum(abs(float(p.change_amount)) for p in penalties), 1)
@@ -198,7 +198,6 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
                         created_by=user_uuid,
                     ))
 
-            # 4) DB: PartyMember banned → active 복구
             await db.execute(
                 sa_update(PartyMember)
                 .where(PartyMember.user_id == user_uuid, PartyMember.status == "banned")
@@ -209,9 +208,6 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
         print(f"[UNBLOCK USER ERROR] {e}")
 
     return {"unblocked": True, "user_id": user_id}
-
-
-# ── 채팅 IP 벤 목록 조회 / 해제 ──
 
 @router.get("/chat-bans")
 async def list_chat_bans(_: object = Depends(require_admin_moderation_permission)):
