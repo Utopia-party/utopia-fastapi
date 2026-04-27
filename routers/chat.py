@@ -11,6 +11,7 @@ import redis.asyncio as aioredis
 from jose import JWTError, jwt
 from core.config import settings
 from core.database import get_db, AsyncSessionLocal
+from core.security import get_current_user_optional
 from models.party import Party, PartyMember, PartyChat, Service
 from models.user import User
 from models.refresh_token import RefreshToken
@@ -541,7 +542,11 @@ async def get_messages(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/parties/{party_id}/info")
-async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_party_info(
+    party_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
+):
     party_result = await db.execute(
         select(Party)
         .options(selectinload(Party.host), selectinload(Party.service))
@@ -589,6 +594,17 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 
     service = party.service
 
+    # 현재 유저 기준 할인 여부 계산
+    is_leader = False
+    has_referrer_discount = False
+    if current_user:
+        is_leader = party.leader_id == current_user.id
+        if current_user.referrer_id is not None:
+            member_user_ids = {m["user_id"] for m in members}
+            has_referrer_discount = (
+                str(current_user.referrer_id) in member_user_ids
+            )
+
     return {
         "party_id": str(party.id),
         "title": party.title,
@@ -596,8 +612,11 @@ async def get_party_info(party_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         "max_members": _party_max_members(party, service),
         "member_count": _party_member_count(party, members),
         "monthly_price": _party_total_price(party, service),
-        "referral_discount_rate": float(service.referral_discount_rate) if service and service.referral_discount_rate is not None else None,
         "monthly_per_person": party.monthly_per_person,
+        "leader_discount_rate": float(service.leader_discount_rate) if service and service.leader_discount_rate is not None else None,
+        "referral_discount_rate": float(service.referral_discount_rate) if service and service.referral_discount_rate is not None else None,
+        "is_leader": is_leader,
+        "has_referrer_discount": has_referrer_discount,
         "start_date": party.start_date.isoformat() if party.start_date else None,
         "end_date": party.end_date.isoformat() if party.end_date else None,
         "category_name": service.category if service else None,
