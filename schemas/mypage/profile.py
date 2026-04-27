@@ -38,3 +38,12 @@ class MyPageProfileResponse(BaseModel):
 class UpdateMyPageProfileResponse(BaseModel):
     message: str = Field(default="프로필이 수정되었습니다.")
     user: MyPageProfileResponse
+
+
+# 회원탈퇴
+class DeleteMyAccountRequest(BaseModel):
+    password: Optional[str] = None
+
+
+class DeleteMyAccountResponse(BaseModel):
+    message: str

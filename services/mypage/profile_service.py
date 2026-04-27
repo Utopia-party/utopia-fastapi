@@ -1,24 +1,27 @@
 import io
 import os
 import uuid
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from typing import Optional,Any
 
 from fastapi import HTTPException, UploadFile
 from minio import Minio
 from minio.error import S3Error
 from sqlalchemy import select, func, distinct
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from models.user import User
 from models.party import PartyMember
+from models.refresh_token import RefreshToken
 from models.admin import ActivityLog
 from schemas.mypage.profile import (
     MyPageProfileResponse,
     UpdateMyPageProfileResponse,
     RecentActivityItem,
 )
+from services.auth_service import verify_password
 
 ALLOWED_IMAGE_CONTENT_TYPES = {
     "image/jpeg",
@@ -302,3 +305,71 @@ async def update_my_profile_service(
             recent_activities=recent_activities,
         ),
     )
+
+
+# 회원탈퇴
+async def delete_my_account_service(
+    db: AsyncSession,
+    current_user: User,
+    password: str | None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> dict:
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="이미 탈퇴한 회원입니다.")
+
+    # 일반 로그인 계정은 비밀번호 확인
+    if current_user.provider == "local":
+        if not password:
+            raise HTTPException(status_code=400, detail="비밀번호를 입력해주세요.")
+
+        if not current_user.password_hash:
+            raise HTTPException(status_code=400, detail="비밀번호 정보가 없습니다.")
+
+        if not verify_password(password, current_user.password_hash):
+            raise HTTPException(status_code=401, detail="비밀번호가 일치하지 않습니다.")
+
+    # 소프트 삭제
+    current_user.is_active = False
+
+    delete_suffix = uuid.uuid4().hex[:12]
+
+    current_user.email = f"deleted_{delete_suffix}@deleted.local"
+    current_user.nickname = f"deleted_{delete_suffix}"
+
+    # 개인정보 제거
+    current_user.name = None
+    current_user.phone = ""
+    current_user.profile_image_key = None
+    current_user.provider_id = None
+
+    now = datetime.now(timezone.utc)
+
+    # 모든 refresh token 무효화
+    await db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == current_user.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(
+            revoked_at=now,
+            revoke_reason="withdraw",
+        )
+    )
+
+    db.add(
+        ActivityLog(
+            actor_user_id=current_user.id,
+            action_type="WITHDRAW",
+            description="회원탈퇴",
+            extra_metadata={},
+            target_id=current_user.id,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+    )
+
+    await db.commit()
+
+    return {"message": "회원탈퇴가 완료되었습니다."}

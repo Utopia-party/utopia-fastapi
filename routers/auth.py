@@ -26,6 +26,8 @@ from schemas.auth import (
     FindPasswordResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    SocialLoginBody,
+    SocialSignupBody,
 )
 from services.auth_service import (
     get_password_hash,
@@ -62,22 +64,6 @@ conf = ConnectionConfig(
     MAIL_SSL_TLS=False,
     USE_CREDENTIALS=True,
 )
-
-
-class SocialLoginBody(BaseModel):
-    oauth: str
-    code: str
-    state: Optional[str] = None
-
-
-class SocialSignupBody(BaseModel):
-    oauth: str
-    oauth_id: str
-    email: Optional[str] = None
-    name: Optional[str] = None
-    nickname: str
-    phone: Optional[str] = None
-
 
 def get_email_auth_key(email: str) -> str:
     return f"email_auth:{email}"
@@ -265,7 +251,7 @@ async def logout(
 async def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     oauth = oauth.lower().strip()
     if oauth == "google":
-        token = await get_google_access_token(code)
+        token =  get_google_access_token(code)
         info = await get_google_user_info(token)
         return str(info.get("sub")), info.get("email"), info.get("name")
     elif oauth == "kakao":
@@ -277,7 +263,7 @@ async def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None
     elif oauth == "naver":
         if not state:
             raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
-        token = await get_naver_access_token(code, state)
+        token = get_naver_access_token(code, state)
         info = await get_naver_user_info(token)
         return str(info.get("id")), info.get("email"), info.get("name") or info.get("nickname")
     else:
@@ -425,7 +411,7 @@ async def social_signup(data: SocialSignupBody, response: Response, request: Req
 
     user = User(
         email=email,
-        name=name or nickname,
+        name=name,
         nickname=nickname,
         provider=oauth,
         provider_id=oauth_id,
