@@ -1219,7 +1219,11 @@ async def initiate_captcha(payload: CaptchaInitRequest, request: Request) -> Cap
 
 
 # ── 수정됨: get_challenge에 디버그 print 추가 ─────────────────
-async def get_challenge(session_id: str, request: Request) -> CaptchaChallengeResponse:
+async def get_challenge(
+    session_id: str,
+    request: Request,
+    force_refresh: bool = False,
+) -> CaptchaChallengeResponse:
     session = await _load_json(_session_key(session_id))
     if not session:
         raise HTTPException(
@@ -1247,7 +1251,7 @@ async def get_challenge(session_id: str, request: Request) -> CaptchaChallengeRe
 
     await _bind_active_session(client_ip, session_id)
 
-    if not session.get("emojis") or not session.get("photos"):
+    if force_refresh or not session.get("emojis") or not session.get("photos"):
         emojis, photos, answer_indices, captcha_set_id = await _build_new_challenge_payload(request)
         session["emojis"] = emojis
         session["photos"] = photos

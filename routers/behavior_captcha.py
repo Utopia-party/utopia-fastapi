@@ -37,10 +37,14 @@ async def captcha_init(payload: CaptchaInitRequest, request: Request):
 
 
 @router.get("/challenge", response_model=CaptchaChallengeResponse)  # 상원
-async def captcha_challenge(session_id: str, request: Request):
+async def captcha_challenge(
+    session_id: str,
+    request: Request,
+    force_refresh: bool = False,
+):
     # 상원: challenge 상태 세션의 3x3 이미지 문제를 내려줍니다.
     # 상원: 세션 검증과 문제 생성은 서비스 계층 함수 get_challenge가 처리합니다.
-    return await get_challenge(session_id, request)
+    return await get_challenge(session_id, request, force_refresh=force_refresh)
 
 
 @router.post("/verify", response_model=CaptchaVerifyResponse)  # 상원

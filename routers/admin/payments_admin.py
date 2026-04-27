@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -104,6 +105,29 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+DISPLAY_COMMISSION_RATE = 0.10
+
+
+def _extract_discount_rate(discount_reason: str | None, service: Service | None) -> float:
+    if not discount_reason:
+        return 0.0
+
+    total = 0.0
+
+    if "방장 할인" in discount_reason and service and service.leader_discount_rate is not None:
+        total += float(service.leader_discount_rate)
+
+    if "추천인 할인" in discount_reason and service and service.referral_discount_rate is not None:
+        total += float(service.referral_discount_rate)
+
+    if total > 0:
+        return min(total, 1.0)
+
+    matches = re.findall(r"(\d+)%", discount_reason)
+    if not matches:
+        return 0.0
+    return min(sum(int(match) for match in matches) / 100, 1.0)
+
 class AdminPaymentRecordOut(_BaseModel):
     id: str
     userId: str
@@ -191,13 +215,12 @@ async def get_admin_payments(
         role = "방장" if party.leader_id == user.id else "멤버"
 
         base_price = int(payment.base_price) if payment.base_price else int(payment.amount)
-        amount = int(payment.amount)
-        commission_rate = float(payment.commission_rate) if payment.commission_rate else 0.0
-        commission_amount = (
-            int(payment.commission_amount)
-            if payment.commission_amount
-            else round(amount * commission_rate / (1 + commission_rate)) if commission_rate > 0 else 0
-        )
+        discount_rate = _extract_discount_rate(payment.discount_reason, service)
+        expected_amount = round(base_price * (1 - discount_rate))
+        amount = expected_amount if discount_rate > 0 else int(payment.amount)
+
+        commission_rate = DISPLAY_COMMISSION_RATE
+        commission_amount = round(amount * commission_rate)
 
         items.append(
             AdminPaymentRecordOut(
