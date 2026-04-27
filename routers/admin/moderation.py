@@ -239,6 +239,25 @@ async def update_chat_moderation_status(
     prev_status = chat.moderation_status
     chat.moderation_status = status
 
+    if status == "false_positive" and prev_status in {"warned", "blocked"} and chat.sender_id:
+        sender = await db.get(User, chat.sender_id)
+        if sender:
+            if (sender.chat_warn_count or 0) > 0:
+                sender.chat_warn_count = sender.chat_warn_count - 1
+
+            restore = -5.0 if prev_status == "blocked" else -1.0
+            previous = float(sender.trust_score) if sender.trust_score is not None else 36.5
+            new_score = min(99.0, round(previous - restore, 1))
+            sender.trust_score = new_score
+            db.add(TrustScore(
+                user_id=sender.id,
+                previous_score=previous,
+                new_score=new_score,
+                change_amount=round(new_score - previous, 1),
+                reason="오탐지 처리 — 신뢰도 복구",
+                created_by=admin.user.id,
+            ))
+
     await _append_activity_log(
         db,
         actor_user_id=admin.user.id,
@@ -283,7 +302,6 @@ async def get_user_status_logs(
         meta = log.extra_metadata or {}
         reason = meta.get("reason")
 
-        # trigger 분류: reason에 "신고" 포함이면 report, actor가 없으면 auto, 나머지는 manual
         if not log.actor_user_id:
             trigger = "auto"
         elif reason and "신고" in reason:
