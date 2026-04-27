@@ -26,6 +26,8 @@ from schemas.auth import (
     FindPasswordResponse,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    SocialLoginBody,
+    SocialSignupBody,
 )
 from services.auth_service import (
     get_password_hash,
@@ -62,22 +64,6 @@ conf = ConnectionConfig(
     MAIL_SSL_TLS=False,
     USE_CREDENTIALS=True,
 )
-
-
-class SocialLoginBody(BaseModel):
-    oauth: str
-    code: str
-    state: Optional[str] = None
-
-
-class SocialSignupBody(BaseModel):
-    oauth: str
-    oauth_id: str
-    email: Optional[str] = None
-    name: Optional[str] = None
-    nickname: str
-    phone: Optional[str] = None
-
 
 def get_email_auth_key(email: str) -> str:
     return f"email_auth:{email}"
@@ -425,7 +411,7 @@ async def social_signup(data: SocialSignupBody, response: Response, request: Req
 
     user = User(
         email=email,
-        name=name or nickname,
+        name=name,
         nickname=nickname,
         provider=oauth,
         provider_id=oauth_id,

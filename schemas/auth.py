@@ -8,7 +8,7 @@ def normalize_phone(v: str) -> str:
     return re.sub(r"[^0-9]", "", v)
 
 
-# 회원가입
+# 일반 회원가입
 class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=100)
@@ -34,6 +34,10 @@ class UserCreate(BaseModel):
             raise ValueError("휴대폰 번호는 10~11자리 숫자여야 합니다.")
         return normalized
 
+# 일반 로그인
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
 
 class UserResponse(BaseModel):
     id: uuid.UUID
@@ -43,6 +47,49 @@ class UserResponse(BaseModel):
     phone: Optional[str] = None
     referrer: Optional[str] = None
     model_config = {"from_attributes": True}
+
+# 소셜 로그인
+class SocialLoginBody(BaseModel):
+    oauth: str = Field(..., min_length=1, max_length=20)
+    code: str = Field(..., min_length=1)
+    state: Optional[str] = None
+
+    @field_validator("oauth")
+    @classmethod
+    def validate_oauth(cls, v: str):
+        oauth = v.lower().strip()
+        if oauth not in {"google", "kakao", "naver"}:
+            raise ValueError("지원하지 않는 소셜 로그인입니다.")
+        return oauth
+
+
+class SocialSignupBody(BaseModel):
+    oauth: str = Field(..., min_length=1, max_length=20)
+    oauth_id: str = Field(..., min_length=1, max_length=255)
+    email: Optional[EmailStr] = None
+    name: Optional[str] = Field(default=None, max_length=50)
+    nickname: str = Field(..., min_length=2, max_length=50)
+    phone: Optional[str] = Field(min_length=10, max_length=13)
+
+    @field_validator("oauth")
+    @classmethod
+    def validate_oauth(cls, v: str):
+        oauth = v.lower().strip()
+        if oauth not in {"google", "kakao", "naver"}:
+            raise ValueError("지원하지 않는 소셜 로그인입니다.")
+        return oauth
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: Optional[str]):
+        if v is None or v == "":
+            return None
+
+        normalized = normalize_phone(v)
+        if len(normalized) not in (10, 11):
+            raise ValueError("휴대폰 번호는 10~11자리 숫자여야 합니다.")
+        return normalized
+
 
 
 # 이메일 찾기
@@ -88,9 +135,3 @@ class ResetPasswordRequest(BaseModel):
 
 class ResetPasswordResponse(BaseModel):
     message: str
-
-
-# 일반 로그인
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
