@@ -262,23 +262,23 @@ async def logout(
     return {"message": "로그아웃 되었습니다."}
 
 
-def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
+async def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     oauth = oauth.lower().strip()
     if oauth == "google":
-        token = get_google_access_token(code)
-        info = get_google_user_info(token)
+        token = await get_google_access_token(code)
+        info = await get_google_user_info(token)
         return str(info.get("sub")), info.get("email"), info.get("name")
     elif oauth == "kakao":
-        token = get_kakao_access_token(code)
-        info = get_kakao_user_info(token)
+        token = await get_kakao_access_token(code)
+        info = await get_kakao_user_info(token)
         account = info.get("kakao_account", {}) or {}
         profile = account.get("profile", {}) or {}
         return str(info.get("id")), account.get("email"), profile.get("nickname")
     elif oauth == "naver":
         if not state:
             raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
-        token = get_naver_access_token(code, state)
-        info = get_naver_user_info(token)
+        token = await get_naver_access_token(code, state)
+        info = await get_naver_user_info(token)
         return str(info.get("id")), info.get("email"), info.get("name") or info.get("nickname")
     else:
         raise HTTPException(status_code=400, detail="지원하지 않는 소셜 로그인입니다.")
@@ -290,7 +290,7 @@ async def social_login(data: SocialLoginBody, response: Response, request: Reque
     code = data.code
     state = data.state
 
-    oauth_id, email, name = get_oauth_user_info(oauth, code, state)
+    oauth_id, email, name = await get_oauth_user_info(oauth, code, state)
 
     result = await db.execute(select(User).where(User.provider == oauth, User.provider_id == oauth_id))
     user = result.scalar_one_or_none()
