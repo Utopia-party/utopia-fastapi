@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     "stage2_enabled": True,
     "stage3_enabled": True,
     "stage2_pass_threshold": 0.75,
-    "stage2_block_threshold": 0.92,
+    "stage2_block_threshold": 0.97,
     "ollama_prompt_examples": [
         {"text": "ㅇㅇ", "label": "none"},
         {"text": "ㅎㅇ", "label": "none"},
@@ -160,7 +160,7 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
         await redis_client.delete(*warn_keys)
 
     try:
-        from sqlalchemy import update as sa_update, desc
+        from sqlalchemy import update as sa_update
         from models.mypage.trust_score import TrustScore
         user_uuid = uuid.UUID(user_id)
         async with AsyncSessionLocal() as db:
@@ -168,35 +168,9 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
             user = result.scalar_one_or_none()
             if user:
 
-                current_warn_count = user.chat_warn_count or 0
-
                 user.is_active = True
                 user.banned_until = None
                 user.chat_warn_count = 0
-
-                penalty_result = await db.execute(
-                    select(TrustScore)
-                    .where(
-                        TrustScore.user_id == user_uuid,
-                        TrustScore.reason.like("%욕설 감지%") | TrustScore.reason.like("%심한 욕설%"),
-                    )
-                    .order_by(desc(TrustScore.created_at))
-                    .limit(max(1, current_warn_count))
-                )
-                penalties = penalty_result.scalars().all()
-                restore_amount = round(sum(abs(float(p.change_amount)) for p in penalties), 1)
-                if restore_amount > 0:
-                    previous = float(user.trust_score) if user.trust_score is not None else 0.0
-                    new_score = min(99.0, round(previous + restore_amount, 1))
-                    user.trust_score = new_score
-                    db.add(TrustScore(
-                        user_id=user_uuid,
-                        previous_score=previous,
-                        new_score=new_score,
-                        change_amount=round(new_score - previous, 1),
-                        reason="관리자 채팅 차단 해제 — 신뢰도 복구",
-                        created_by=user_uuid,
-                    ))
 
             await db.execute(
                 sa_update(PartyMember)
