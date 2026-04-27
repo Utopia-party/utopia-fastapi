@@ -140,6 +140,7 @@ class Service(Base):
     commission_rate: Mapped[float | None] = mapped_column(Float)
     leader_discount_rate: Mapped[float | None] = mapped_column(Float)
     referral_discount_rate: Mapped[float | None] = mapped_column(Float)
+    quick_match_fee_rate: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.05")
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

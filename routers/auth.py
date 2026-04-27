@@ -251,7 +251,7 @@ async def logout(
 async def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None):
     oauth = oauth.lower().strip()
     if oauth == "google":
-        token = await get_google_access_token(code)
+        token =  get_google_access_token(code)
         info = await get_google_user_info(token)
         return str(info.get("sub")), info.get("email"), info.get("name")
     elif oauth == "kakao":
@@ -263,7 +263,7 @@ async def get_oauth_user_info(oauth: str, code: str, state: Optional[str] = None
     elif oauth == "naver":
         if not state:
             raise HTTPException(status_code=400, detail="네이버 로그인에는 state 값이 필요합니다.")
-        token = await get_naver_access_token(code, state)
+        token = get_naver_access_token(code, state)
         info = await get_naver_user_info(token)
         return str(info.get("id")), info.get("email"), info.get("name") or info.get("nickname")
     else:
