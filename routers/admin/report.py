@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 from uuid import UUID
@@ -13,8 +13,14 @@ from sqlalchemy.orm import selectinload
 
 from core.database import get_db
 from core.security import get_current_user
+from models.mypage.trust_score import TrustScore
 from models.report import Report, ReportEvidence
 from models.user import User
+from services.notifications.report_notification_service import (
+    notify_report_penalty_to_target,
+    notify_report_result_to_reporter,
+    notify_report_warning_to_target,
+)
 from services.report_storage_service import get_report_file_bytes
 
 
@@ -48,8 +54,15 @@ STATUS_TO_API = {
 ACTION_RESULT_BY_STATUS = {
     "PENDING": "NONE",
     "IN_REVIEW": "NONE",
-    "APPROVED": "NONE",
+    "APPROVED": "WARNING",
     "REJECTED": "NONE",
+}
+
+
+AUTO_REPORT_PENALTY = {
+    "PROFANITY": -1.0,
+    "SPAM": -5.0,
+    "SCAM": -5.0,
 }
 
 
@@ -101,6 +114,73 @@ def build_admin_report_response(report: Report) -> dict[str, Any]:
             for evidence in report.evidences
         ],
     }
+
+
+def _resolve_auto_report_penalty(report: Report) -> float:
+    category = (report.category or "").strip().upper()
+    return AUTO_REPORT_PENALTY.get(category, -1.0)
+
+
+def _build_target_warning_message(report: Report, penalty: float, new_score: float) -> str:
+    target_name = report.target_snapshot_name or "회원님의 계정"
+    return (
+        f"{target_name} 관련 신고가 승인되어 신뢰도 {abs(penalty):.1f}점이 차감되었어요. "
+        f"현재 신뢰도는 {new_score:.1f}점입니다."
+    )
+
+
+async def _apply_report_penalty(
+    db: AsyncSession,
+    *,
+    report: Report,
+    reviewer_id: UUID,
+) -> tuple[float | None, int | None]:
+    if report.target_type != "USER":
+        return None, None
+
+    target_user = await db.get(User, report.target_id)
+    if not target_user:
+        return None, None
+
+    penalty = _resolve_auto_report_penalty(report)
+    previous_score = (
+        float(target_user.trust_score)
+        if target_user.trust_score is not None
+        else 36.5
+    )
+    new_score = max(0.0, round(previous_score + penalty, 1))
+    target_user.trust_score = new_score
+
+    warn_count = (target_user.chat_warn_count or 0) + 1
+    target_user.chat_warn_count = warn_count
+
+    if new_score <= 0 or warn_count >= 4:
+        target_user.is_active = False
+        target_user.banned_until = None
+        report.action_result_code = "PENALTY"
+    elif new_score < 10 or warn_count >= 3:
+        target_user.is_active = False
+        target_user.banned_until = datetime.now(timezone.utc) + timedelta(days=30)
+        report.action_result_code = "PENALTY"
+    else:
+        report.action_result_code = "WARNING"
+
+    db.add(
+        TrustScore(
+            user_id=target_user.id,
+            previous_score=previous_score,
+            new_score=new_score,
+            change_amount=round(new_score - previous_score, 1),
+            reason=f"신고 승인: {report.category}",
+            reference_id=report.id,
+            created_by=reviewer_id,
+        )
+    )
+
+    report.admin_memo = (
+        f"자동 신뢰도 차감 {abs(penalty):.1f}점 적용 / 현재 {new_score:.1f}점"
+    )
+    return new_score, warn_count
 
 
 async def ensure_admin_can_manage_reports(current_user: User) -> None:
@@ -201,10 +281,20 @@ async def update_admin_report_status(
             detail="신고를 찾을 수 없습니다.",
         )
 
+    previous_status = report.status
     report.status = next_status
     report.reviewed_by = current_user.id
     report.reviewed_at = datetime.now(timezone.utc)
     report.action_result_code = ACTION_RESULT_BY_STATUS[next_status]
+
+    new_score: float | None = None
+    warn_count: int | None = None
+    if previous_status != "APPROVED" and next_status == "APPROVED":
+        new_score, warn_count = await _apply_report_penalty(
+            db,
+            report=report,
+            reviewer_id=current_user.id,
+        )
 
     await db.commit()
 
@@ -214,6 +304,40 @@ async def update_admin_report_status(
         .where(Report.id == report_id)
     )
     updated_report = result.scalar_one()
+
+    if next_status == "APPROVED":
+        await notify_report_result_to_reporter(
+            db,
+            report=updated_report,
+        )
+        if updated_report.target_type == "USER" and new_score is not None:
+            message = _build_target_warning_message(
+                updated_report,
+                _resolve_auto_report_penalty(updated_report),
+                new_score,
+            )
+            if updated_report.action_result_code == "PENALTY":
+                await notify_report_penalty_to_target(
+                    db,
+                    report=updated_report,
+                    penalty_message=message,
+                    penalty_code=(
+                        "PERMANENT_BAN"
+                        if new_score <= 0 or (warn_count or 0) >= 4
+                        else "TEMP_BAN_30_DAYS"
+                    ),
+                )
+            else:
+                await notify_report_warning_to_target(
+                    db,
+                    report=updated_report,
+                    warning_message=message,
+                )
+    elif next_status == "REJECTED":
+        await notify_report_result_to_reporter(
+            db,
+            report=updated_report,
+        )
 
     return build_admin_report_response(updated_report)
 
