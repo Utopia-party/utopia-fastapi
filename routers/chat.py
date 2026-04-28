@@ -138,12 +138,20 @@ async def check_message(content: str) -> dict:
     config = await get_config()
     stripped = content.strip()
 
-    # 1단계: 규칙 기반
+    # 1단계: 규칙 기반 — 완전일치가 아닌 포함 여부로 검사
     if config.get("stage1_enabled", True):
-        if stripped in config.get("whitelist", []):
-            return {"violation": False, "severe": False, "reason": "", "stage": 1, "score": None}
-        if stripped in config.get("blacklist", []):
+        whitelist = config.get("whitelist", [])
+        blacklist = config.get("blacklist", [])
+
+        has_blacklist = any(w in stripped for w in blacklist)
+        has_whitelist = any(w in stripped for w in whitelist)
+
+        # blacklist 우선: 욕설 포함이면 즉시 차단
+        if has_blacklist:
             return {"violation": True, "severe": True, "reason": "욕설 축약어", "stage": 1, "score": None}
+        # whitelist만 포함: 정상 처리 (ㅋㅋ 재밌다 등 일상 표현)
+        if has_whitelist:
+            return {"violation": False, "severe": False, "reason": "", "stage": 1, "score": None}
 
     # 2단계: GPU 서버 ML
     if config.get("stage2_enabled", True) and ML_SERVER_URL:
@@ -154,7 +162,7 @@ async def check_message(content: str) -> dict:
                 label = ml["label"]
                 score = ml["score"]
                 pass_t = config.get("stage2_pass_threshold", 0.75)
-                block_t = config.get("stage2_block_threshold", 0.92)
+                block_t = config.get("stage2_block_threshold", 0.97)  # 기본값 상향
 
                 if label == "none" or score < pass_t:
                     return {"violation": False, "severe": False, "reason": "", "stage": 2, "score": score}
@@ -166,6 +174,7 @@ async def check_message(content: str) -> dict:
                         "stage": 2,
                         "score": score,
                     }
+                # pass_t <= score < block_t 구간은 3단계(Ollama)로 넘겨 문맥 판단
         except Exception:
             pass
 
