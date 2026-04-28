@@ -35,3 +35,13 @@ class UserPraise(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+    hidden_from_sender_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    hidden_from_receiver_at = Column(
+        DateTime,
+        nullable=True,
+    )

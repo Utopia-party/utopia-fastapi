@@ -84,6 +84,10 @@ class MyPraisesResponse(BaseModel):
     items: list[MyPraiseItemResponse]
     total: int
 
+class DeletePraiseResponse(BaseModel):
+    deleted: bool
+    praise_id: uuid.UUID
+
 
 def _now_naive_utc() -> datetime:
     """
@@ -284,9 +288,15 @@ async def get_my_praises(
     ToUser = aliased(User)
 
     if direction == "received":
-        condition = UserPraise.to_user_id == current_user.id
+        condition = (
+            (UserPraise.to_user_id == current_user.id)
+            & (UserPraise.hidden_from_receiver_at.is_(None))
+        )
     else:
-        condition = UserPraise.from_user_id == current_user.id
+        condition = (
+            (UserPraise.from_user_id == current_user.id)
+            & (UserPraise.hidden_from_sender_at.is_(None))
+        )
 
     total_result = await db.execute(
         select(func.count())
@@ -471,4 +481,45 @@ async def create_praise(
         praise_type=praise.praise_type,
         message=praise.message,
         created_at=praise.created_at,
+    )
+
+@router.delete(
+    "/{praise_id}",
+    response_model=DeletePraiseResponse,
+)
+async def delete_my_praise(
+    praise_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(UserPraise).where(UserPraise.id == praise_id)
+    )
+    praise = result.scalar_one_or_none()
+
+    if not praise:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="칭찬 내역을 찾을 수 없습니다.",
+        )
+
+    now = _now_naive_utc()
+
+    if praise.from_user_id == current_user.id:
+        praise.hidden_from_sender_at = now
+
+    elif praise.to_user_id == current_user.id:
+        praise.hidden_from_receiver_at = now
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="삭제할 권한이 없습니다.",
+        )
+
+    await db.commit()
+
+    return DeletePraiseResponse(
+        deleted=True,
+        praise_id=praise.id,
     )
