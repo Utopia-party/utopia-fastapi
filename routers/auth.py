@@ -708,11 +708,11 @@ async def login(
     user = result.scalar_one_or_none()
 
     if not user:
-        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 일치하지 않습니다.")
+        raise HTTPException(status_code=401, detail="아이디가 틀렸습니다.")
     if user.provider != "local" or user.password_hash is None:
         raise HTTPException(status_code=400, detail="소셜 로그인으로 가입한 계정입니다.")
     if not verify_password(user_credentials.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 일치하지 않습니다.")
+        raise HTTPException(status_code=401, detail="비밀번호가 틀렸습니다.")
     client_ip = request.client.host if request.client else None
     if client_ip:
         is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
