@@ -1,7 +1,6 @@
 import json
 import uuid
-from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from routers.admin.deps import require_admin_moderation_permission
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -11,12 +10,14 @@ from core.database import get_db, AsyncSessionLocal
 from core.config import settings
 from models.party import PartyChat, PartyMember
 from models.user import User
+from models.moderation_config import ModerationConfig
 import redis.asyncio as aioredis
 
 router = APIRouter(prefix="/admin/moderation", tags=["admin-moderation"])
 redis_client = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
 
 CONFIG_KEY = "moderation:config"
+CONFIG_CACHE_TTL = 300  # Redis 캐시 5분 — 재시작해도 DB에서 복구
 
 DEFAULT_CONFIG = {
     "stage1_enabled": True,
@@ -37,14 +38,44 @@ DEFAULT_CONFIG = {
 
 
 async def get_config() -> dict:
+    # 1) Redis 캐시 우선 (빠른 응답)
     raw = await redis_client.get(CONFIG_KEY)
     if raw:
         return json.loads(raw)
+
+    # 2) Redis 없으면 DB에서 로드 (재시작 후 복구)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ModerationConfig).order_by(ModerationConfig.updated_at.desc()).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            config = json.loads(row.config_json)
+            await redis_client.set(CONFIG_KEY, json.dumps(config, ensure_ascii=False), ex=CONFIG_CACHE_TTL)
+            return config
+
+    # 3) DB도 없으면 DEFAULT로 초기 저장
+    await save_config(DEFAULT_CONFIG.copy())
     return DEFAULT_CONFIG.copy()
 
 
 async def save_config(config: dict):
-    await redis_client.set(CONFIG_KEY, json.dumps(config, ensure_ascii=False))
+    config_str = json.dumps(config, ensure_ascii=False)
+
+    # DB 영구 저장
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ModerationConfig).order_by(ModerationConfig.updated_at.desc()).limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            row.config_json = config_str
+        else:
+            db.add(ModerationConfig(config_json=config_str))
+        await db.commit()
+
+    # Redis 캐시 갱신
+    await redis_client.set(CONFIG_KEY, config_str, ex=CONFIG_CACHE_TTL)
 
 
 # ── 설정 조회/저장 ──
@@ -153,7 +184,6 @@ async def get_finetune_stats(db: AsyncSession = Depends(get_db), _: object = Dep
 @router.post("/unblock/user/{user_id}")
 async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_moderation_permission)):
     """채팅 욕설로 차단된 유저 완전 해제"""
-    # 1) Redis: 채팅 블럭 + warn 카운트 키 전부 삭제
     await redis_client.delete(f"blocked:user:{user_id}")
     warn_keys = await redis_client.keys(f"warn:*:{user_id}")
     if warn_keys:
@@ -161,13 +191,11 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
 
     try:
         from sqlalchemy import update as sa_update
-        from models.mypage.trust_score import TrustScore
         user_uuid = uuid.UUID(user_id)
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(User).where(User.id == user_uuid))
             user = result.scalar_one_or_none()
             if user:
-
                 user.is_active = True
                 user.banned_until = None
                 user.chat_warn_count = 0
@@ -183,9 +211,10 @@ async def unblock_chat_user(user_id: str, _: object = Depends(require_admin_mode
 
     return {"unblocked": True, "user_id": user_id}
 
+
 @router.get("/chat-bans")
 async def list_chat_bans(_: object = Depends(require_admin_moderation_permission)):
-    """채팅 욕설로 IP 벤된 목록 (ip:banned:* 키 기준)"""
+    """채팅 욕설로 IP 벤된 목록"""
     keys = await redis_client.keys("ip:banned:*")
     result = []
     for key in keys:
