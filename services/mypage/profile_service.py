@@ -2,17 +2,16 @@ import io
 import os
 import uuid
 from datetime import timedelta, datetime, timezone
-from typing import Optional,Any
+from typing import Optional, Any
 
 from fastapi import HTTPException, UploadFile
 from minio import Minio
 from minio.error import S3Error
-from sqlalchemy import select, func, distinct
-from sqlalchemy import update
+from sqlalchemy import select, func, distinct, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
-from models.user import User
+from models.user import User, UserReferrer
 from models.party import PartyMember
 from models.refresh_token import RefreshToken
 from models.admin import ActivityLog
@@ -20,6 +19,7 @@ from schemas.mypage.profile import (
     MyPageProfileResponse,
     UpdateMyPageProfileResponse,
     RecentActivityItem,
+    ReferrerOut,
 )
 from services.auth_service import verify_password
 
@@ -33,7 +33,6 @@ MAX_IMAGE_SIZE = 5 * 1024 * 1024
 
 
 def _get_minio_client() -> Minio:
-    """내부 전용 클라이언트 - 업로드/삭제/Presigned URL 생성용"""
     return Minio(
         endpoint=settings.MINIO_ENDPOINT,
         access_key=settings.MINIO_ACCESS_KEY,
@@ -60,12 +59,8 @@ def _get_extension(filename: Optional[str], content_type: Optional[str]) -> str:
     }
     return mapping.get(content_type or "", ".jpg")
 
+
 def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
-    """
-    내부 클라이언트로 Presigned URL 생성 후
-    nginx proxy_set_header Host가 내부 IP로 바꿔주므로
-    단순히 host 문자열만 외부 주소로 교체
-    """
     if not profile_image_key:
         return None
 
@@ -85,6 +80,7 @@ def _build_profile_image_url(profile_image_key: Optional[str]) -> Optional[str]:
 
     return url
 
+
 def _normalize_metadata(metadata: Any) -> dict:
     if isinstance(metadata, dict):
         return metadata
@@ -94,7 +90,7 @@ def _normalize_metadata(metadata: Any) -> dict:
 def _to_recent_activity_item(activity: ActivityLog) -> RecentActivityItem:
     return RecentActivityItem(
         id=str(activity.id),
-        action=activity.action_type,  
+        action=activity.action_type,
         description=activity.description,
         ip_address=str(activity.ip_address) if activity.ip_address else None,
         user_agent=activity.user_agent,
@@ -103,13 +99,17 @@ def _to_recent_activity_item(activity: ActivityLog) -> RecentActivityItem:
         created_at=activity.created_at,
     )
 
+
 def _to_profile_response(
     user: User,
     total_party_participations: int = 0,
     active_party_count: int = 0,
     recommendation_count: int = 0,
+    referrers: list[ReferrerOut] | None = None,
     recent_activities: list[RecentActivityItem] | None = None,
 ) -> MyPageProfileResponse:
+    referrers = referrers or []
+
     return MyPageProfileResponse(
         user_id=str(user.id),
         email=user.email,
@@ -124,8 +124,11 @@ def _to_profile_response(
         total_party_participations=total_party_participations,
         active_party_count=active_party_count,
         recommendation_count=recommendation_count,
+        referrers=referrers,
+        referrer_count=len(referrers),
         recent_activities=recent_activities or [],
     )
+
 
 async def _get_total_party_participations(
     db: AsyncSession,
@@ -153,16 +156,40 @@ async def _get_active_party_count(
     result = await db.execute(stmt)
     return result.scalar() or 0
 
+
 async def _get_recommendation_count(
     db: AsyncSession,
     user_id: uuid.UUID,
 ) -> int:
     stmt = (
-        select(func.count(User.id))
-        .where(User.referrer_id == user_id)
+        select(func.count(UserReferrer.id))
+        .where(UserReferrer.referrer_id == user_id)
     )
     result = await db.execute(stmt)
     return result.scalar() or 0
+
+
+async def _get_my_referrers(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> list[ReferrerOut]:
+    stmt = (
+        select(User)
+        .join(UserReferrer, UserReferrer.referrer_id == User.id)
+        .where(UserReferrer.user_id == user_id)
+        .order_by(UserReferrer.created_at.asc())
+    )
+    result = await db.execute(stmt)
+    referrer_users = result.scalars().all()
+
+    return [
+        ReferrerOut(
+            id=str(referrer_user.id),
+            nickname=referrer_user.nickname,
+        )
+        for referrer_user in referrer_users
+    ]
+
 
 async def _get_recent_activities(
     db: AsyncSession,
@@ -179,6 +206,7 @@ async def _get_recent_activities(
     activities = result.scalars().all()
     return [_to_recent_activity_item(activity) for activity in activities]
 
+
 async def get_my_profile_service(
     db: AsyncSession,
     current_user: User,
@@ -187,14 +215,22 @@ async def get_my_profile_service(
         db=db,
         user_id=current_user.id,
     )
+
     active_party_count = await _get_active_party_count(
         db=db,
         user_id=current_user.id,
     )
+
     recommendation_count = await _get_recommendation_count(
         db=db,
         user_id=current_user.id,
     )
+
+    referrers = await _get_my_referrers(
+        db=db,
+        user_id=current_user.id,
+    )
+
     recent_activities = await _get_recent_activities(
         db=db,
         user_id=current_user.id,
@@ -206,10 +242,11 @@ async def get_my_profile_service(
         total_party_participations=total_party_participations,
         active_party_count=active_party_count,
         recommendation_count=recommendation_count,
+        referrers=referrers,
         recent_activities=recent_activities,
     )
 
-# 프로필 수정
+
 async def update_my_profile_service(
     db: AsyncSession,
     current_user: User,
@@ -230,6 +267,7 @@ async def update_my_profile_service(
         stmt = select(User).where(User.nickname == nickname, User.id != current_user.id)
         result = await db.execute(stmt)
         duplicate_user = result.scalar_one_or_none()
+
         if duplicate_user:
             raise HTTPException(status_code=409, detail="이미 사용 중인 닉네임입니다.")
 
@@ -245,15 +283,23 @@ async def update_my_profile_service(
             client.remove_object(bucket_name, current_user.profile_image_key)
         except S3Error:
             pass
+
         current_user.profile_image_key = None
 
     if profile_image is not None and profile_image.filename:
         if profile_image.content_type not in ALLOWED_IMAGE_CONTENT_TYPES:
-            raise HTTPException(status_code=400, detail="JPG, PNG, WEBP 형식만 업로드 가능합니다.")
+            raise HTTPException(
+                status_code=400,
+                detail="JPG, PNG, WEBP 형식만 업로드 가능합니다.",
+            )
 
         file_bytes = await profile_image.read()
+
         if len(file_bytes) > MAX_IMAGE_SIZE:
-            raise HTTPException(status_code=400, detail="프로필 이미지는 5MB 이하만 가능합니다.")
+            raise HTTPException(
+                status_code=400,
+                detail="프로필 이미지는 5MB 이하만 가능합니다.",
+            )
 
         extension = _get_extension(profile_image.filename, profile_image.content_type)
         object_name = f"profile/{current_user.id}_{uuid.uuid4().hex}{extension}"
@@ -281,14 +327,22 @@ async def update_my_profile_service(
         db=db,
         user_id=current_user.id,
     )
+
     active_party_count = await _get_active_party_count(
         db=db,
         user_id=current_user.id,
     )
+
     recommendation_count = await _get_recommendation_count(
         db=db,
         user_id=current_user.id,
     )
+
+    referrers = await _get_my_referrers(
+        db=db,
+        user_id=current_user.id,
+    )
+
     recent_activities = await _get_recent_activities(
         db=db,
         user_id=current_user.id,
@@ -302,12 +356,12 @@ async def update_my_profile_service(
             total_party_participations=total_party_participations,
             active_party_count=active_party_count,
             recommendation_count=recommendation_count,
+            referrers=referrers,
             recent_activities=recent_activities,
         ),
     )
 
 
-# 회원탈퇴
 async def delete_my_account_service(
     db: AsyncSession,
     current_user: User,
@@ -318,7 +372,6 @@ async def delete_my_account_service(
     if not current_user.is_active:
         raise HTTPException(status_code=400, detail="이미 탈퇴한 회원입니다.")
 
-    # 일반 로그인 계정은 비밀번호 확인
     if current_user.provider == "local":
         if not password:
             raise HTTPException(status_code=400, detail="비밀번호를 입력해주세요.")
@@ -329,15 +382,12 @@ async def delete_my_account_service(
         if not verify_password(password, current_user.password_hash):
             raise HTTPException(status_code=401, detail="비밀번호가 일치하지 않습니다.")
 
-    # 소프트 삭제
     current_user.is_active = False
 
     delete_suffix = uuid.uuid4().hex[:12]
 
     current_user.email = f"deleted_{delete_suffix}@deleted.local"
     current_user.nickname = f"deleted_{delete_suffix}"
-
-    # 개인정보 제거
     current_user.name = None
     current_user.phone = ""
     current_user.profile_image_key = None
@@ -345,7 +395,6 @@ async def delete_my_account_service(
 
     now = datetime.now(timezone.utc)
 
-    # 모든 refresh token 무효화
     await db.execute(
         update(RefreshToken)
         .where(

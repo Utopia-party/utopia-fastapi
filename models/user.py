@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database import Base
 from datetime import datetime
+from sqlalchemy import DateTime, ForeignKey, CheckConstraint, UniqueConstraint, func, text
 
 
 class User(Base):
@@ -30,6 +31,11 @@ class User(Base):
         ForeignKey("users.id"),
         nullable=True,
     )
+    referrer_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default="0",
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     banned_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -49,4 +55,64 @@ class User(Base):
         "QuickMatchRequest",
         back_populates="user",
         cascade="all, delete-orphan",
+    )
+    referrers: Mapped[list["UserReferrer"]] = relationship(
+        "UserReferrer",
+        foreign_keys="UserReferrer.user_id",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    referred_users: Mapped[list["UserReferrer"]] = relationship(
+        "UserReferrer",
+        foreign_keys="UserReferrer.referrer_id",
+        back_populates="referrer",
+        cascade="all, delete-orphan",
+    )
+
+# 추천인     
+class UserReferrer(Base):
+    __tablename__ = "user_referrers"
+
+    __table_args__ = (
+        CheckConstraint("user_id <> referrer_id", name="chk_no_self_referral"),
+        UniqueConstraint("user_id", "referrer_id", name="unique_user_referrer"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    referrer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    user: Mapped["User"] = relationship(
+        "User",
+        foreign_keys=[user_id],
+        back_populates="referrers",
+    )
+
+    referrer: Mapped["User"] = relationship(
+        "User",
+        foreign_keys=[referrer_id],
+        back_populates="referred_users",
     )

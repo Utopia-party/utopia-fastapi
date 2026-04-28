@@ -2,18 +2,20 @@ import secrets   # 토큰 랜덤문자열 생성용
 import hashlib   # 토큰 문자열-> 해시값 변경
 import uuid
 
-from sqlalchemy import select
-from sqlalchemy import update
+from sqlalchemy import select, update, delete
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import UUID
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi import Cookie, HTTPException, Response, status
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.refresh_token import RefreshToken
 from models.user import User
+from models.user import UserReferrer
 from core.config import settings
 
 SECRET_KEY = settings.SECRET_KEY
@@ -209,13 +211,119 @@ async def handle_refresh_token_reuse(
     )
 
 
-# def get_current_user_email(
-#     access_token: Optional[str] = Cookie(default=None, alias=ACCESS_TOKEN_COOKIE_NAME),
-# ) -> str:
-#     if not access_token:
-#         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="로그인이 필요합니다.")
-#     payload = decode_access_token(access_token)
-#     user_id = payload.get("sub")
-#     if not user_id:
-#         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="토큰에 사용자 정보가 없습니다.")
-#     return user_id
+
+# 
+MAX_REFERRERS = 5
+
+
+async def get_my_referrers_service(
+    db: AsyncSession,
+    user_id: UUID,
+) -> list[User]:
+    result = await db.execute(
+        select(UserReferrer)
+        .options(selectinload(UserReferrer.referrer))
+        .where(UserReferrer.user_id == user_id)
+        .order_by(UserReferrer.created_at.asc())
+    )
+
+    rows = result.scalars().all()
+    return [row.referrer for row in rows if row.referrer]
+
+
+async def replace_user_referrers_service(
+    db: AsyncSession,
+    *,
+    user_id: UUID,
+    referrer_nicknames: list[str],
+    commit: bool = True,
+) -> list[User]:
+    cleaned = [item.strip() for item in referrer_nicknames if item and item.strip()]
+    cleaned = list(dict.fromkeys(cleaned))
+
+    if len(cleaned) > MAX_REFERRERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="추천인은 최대 5명까지 등록할 수 있습니다.",
+        )
+
+    if not cleaned:
+        old_rows_result = await db.execute(
+            select(UserReferrer).where(UserReferrer.user_id == user_id)
+        )
+        old_rows = old_rows_result.scalars().all()
+
+        for row in old_rows:
+            await db.execute(
+                update(User)
+                .where(User.id == row.referrer_id, User.referrer_count > 0)
+                .values(referrer_count=User.referrer_count - 1)
+            )
+
+        await db.execute(delete(UserReferrer).where(UserReferrer.user_id == user_id))
+        await db.commit()
+        return []
+
+    users_result = await db.execute(
+        select(User).where(User.nickname.in_(cleaned))
+    )
+    referrer_users = list(users_result.scalars().all())
+
+    found_nicknames = {user.nickname for user in referrer_users}
+    missing = [nickname for nickname in cleaned if nickname not in found_nicknames]
+
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"존재하지 않는 추천인입니다: {', '.join(missing)}",
+        )
+
+    if any(user.id == user_id for user in referrer_users):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="자기 자신은 추천인으로 등록할 수 없습니다.",
+        )
+
+    old_rows_result = await db.execute(
+        select(UserReferrer).where(UserReferrer.user_id == user_id)
+    )
+    old_rows = old_rows_result.scalars().all()
+
+    old_referrer_ids = {row.referrer_id for row in old_rows}
+    new_referrer_ids = {user.id for user in referrer_users}
+
+    remove_ids = old_referrer_ids - new_referrer_ids
+    add_ids = new_referrer_ids - old_referrer_ids
+
+    if remove_ids:
+        await db.execute(
+            delete(UserReferrer).where(
+                UserReferrer.user_id == user_id,
+                UserReferrer.referrer_id.in_(remove_ids),
+            )
+        )
+
+        for referrer_id in remove_ids:
+            await db.execute(
+                update(User)
+                .where(User.id == referrer_id, User.referrer_count > 0)
+                .values(referrer_count=User.referrer_count - 1)
+            )
+
+    for referrer_id in add_ids:
+        db.add(
+            UserReferrer(
+                user_id=user_id,
+                referrer_id=referrer_id,
+            )
+        )
+
+        await db.execute(
+            update(User)
+            .where(User.id == referrer_id)
+            .values(referrer_count=User.referrer_count + 1)
+        )
+
+    await db.commit()
+
+    return await get_my_referrers_service(db=db, user_id=user_id)

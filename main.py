@@ -18,6 +18,7 @@ from models.admin import ActivityLog
 from routers import admin, assets, auth, behavior_captcha, captcha, chat, notifications, parties, report, ws_notifications, payments, admin_handocr, praises
 
 from routers.mypage import profile, trust_history
+from routers.user import referrers
 from routers.mypage import parties as mypage_parties
 from routers.mypage import payments as mypage_payments
 
@@ -240,6 +241,7 @@ app.include_router(profile.router, prefix="/api")
 app.include_router(mypage_parties.router, prefix="/api")
 app.include_router(trust_history.router, prefix="/api")
 app.include_router(mypage_payments.router, prefix="/api")
+app.include_router(referrers.router, prefix="/api")
 
 app.include_router(admin_mod_config_router, prefix="/api")
 app.include_router(admin_cloud_monitor_router, prefix="/api")

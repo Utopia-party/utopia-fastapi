@@ -1,7 +1,14 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+
+class ReferrerOut(BaseModel):
+    id: str
+    nickname: str
+
+    model_config = {"from_attributes": True}
 
 
 class RecentActivityItem(BaseModel):
@@ -10,9 +17,9 @@ class RecentActivityItem(BaseModel):
     description: Optional[str] = None
     ip_address: Optional[str] = None
     user_agent: Optional[str] = None
-    metadata: dict = Field(default_factory=dict)
+    metadata: dict[str, Any] = {}
     target_id: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
 
 class MyPageProfileResponse(BaseModel):
@@ -29,18 +36,22 @@ class MyPageProfileResponse(BaseModel):
 
     total_party_participations: int = 0
     active_party_count: int = 0
-    recommendation_count: int = 0
-    recent_activities: list[RecentActivityItem] = Field(default_factory=list)
 
-    model_config = {"from_attributes": True}
+    # 나를 추천인으로 등록한 사용자 수
+    recommendation_count: int = 0
+
+    # 내가 등록한 추천인 목록
+    referrers: list[ReferrerOut] = []
+    referrer_count: int = 0
+
+    recent_activities: list[RecentActivityItem] = []
 
 
 class UpdateMyPageProfileResponse(BaseModel):
-    message: str = Field(default="프로필이 수정되었습니다.")
+    message: str
     user: MyPageProfileResponse
 
 
-# 회원탈퇴
 class DeleteMyAccountRequest(BaseModel):
     password: Optional[str] = None
 
