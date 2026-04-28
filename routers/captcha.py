@@ -75,6 +75,15 @@ BLOCK_TTL_LONG = 60 * 60       # 1시간
 ACTIVE_SESSION_TTL = CAPTCHA_SESSION_TTL
 
 
+# 운영 환경에서 내부 디버그 정보를 클라이언트에 노출할지 여부
+# CAPTCHA 성격상 기본값은 False를 권장합니다.
+EXPOSE_CAPTCHA_DEBUG = getattr(settings, "EXPOSE_CAPTCHA_DEBUG", False)
+
+
+# ─────────────────────────────────────────────
+# DB / 공통 유틸
+# ─────────────────────────────────────────────
+
 def normalize_asyncpg_dsn(database_url: str) -> str:
     if database_url.startswith("postgresql+asyncpg://"):
         return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
@@ -93,6 +102,111 @@ async def get_db_pool() -> asyncpg.Pool:
         )
     return _db_pool
 
+
+def safe_float(value: Any):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def safe_int(value: Any):
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def get_remaining_attempts(session_data: dict) -> int:
+    return max(MAX_ATTEMPTS - (session_data.get("attempts", 0) + 1), 0)
+
+
+def build_text_ocr_user_hint() -> str:
+    return (
+        "사진 안에는 미션 문자 5자리 외의 다른 글자나 숫자가 보이지 않게 촬영해주세요. "
+        "배경의 책, 포스터, 모니터, 키보드, 옷 로고도 AI가 잘못 읽을 수 있습니다."
+    )
+
+
+def build_mission_mismatch_user_hint(
+    *,
+    pose_ok: bool,
+    text_ok: bool,
+) -> str:
+    if not pose_ok and not text_ok:
+        return (
+            "AI가 손 포즈와 문자를 모두 미션과 다르게 판단했어요. "
+            "요구한 손 포즈를 정확히 취하고, 종이에는 미션 문자 5자리만 크게 적어주세요. "
+            "사진 안에 다른 글자나 숫자가 보이지 않게 촬영해주세요."
+        )
+
+    if not pose_ok:
+        return (
+            "AI가 손 포즈를 미션과 다르게 판단했어요. "
+            "손은 1개만 보이게 하고, 손 전체가 잘리지 않도록 다시 촬영해주세요."
+        )
+
+    if not text_ok:
+        return (
+            "AI가 문자를 미션과 다르게 읽었어요. "
+            "종이에는 미션 문자 5자리만 크게 적고, "
+            "사진 안에 다른 글자, 숫자, 로고, 화면 글자가 보이지 않게 해주세요."
+        )
+
+    return "손 포즈와 5자리 문자가 모두 선명하게 보이도록 다시 촬영해주세요."
+
+
+def build_user_diagnosis(
+    *,
+    pose_ok: Optional[bool],
+    text_ok: Optional[bool],
+    expected_pose: str,
+    detected_pose: Optional[str],
+    expected_text: str,
+    detected_text: Optional[str],
+    pose_confidence: Optional[float],
+    ocr_confidence: Optional[float],
+    text_match_mode: Optional[str],
+    remaining_attempts: int,
+    next_action: str,
+) -> dict:
+    return {
+        "pose": {
+            "matched": pose_ok,
+            "expected": expected_pose,
+            "detected": detected_pose,
+            "confidence": pose_confidence,
+        },
+        "text": {
+            "matched": text_ok,
+            "expected": expected_text,
+            "detected": detected_text,
+            "confidence": ocr_confidence,
+            "matchMode": text_match_mode,
+        },
+        "nextAction": next_action,
+        "remainingAttempts": remaining_attempts,
+    }
+
+
+def maybe_attach_debug_payload(failure_reason: dict, debug_payload: Optional[dict]) -> dict:
+    """
+    운영 환경에서는 inspection, bbox, feature_vector, ocr_debug_top 같은 내부 정보를
+    클라이언트에 그대로 노출하지 않는 편이 안전합니다.
+    필요할 때만 settings.EXPOSE_CAPTCHA_DEBUG=True로 노출하세요.
+    """
+    if EXPOSE_CAPTCHA_DEBUG and debug_payload:
+        failure_reason["debug"] = debug_payload
+    return failure_reason
+
+
+# ─────────────────────────────────────────────
+# 실패 메시지 / 사용자 안내
+# ─────────────────────────────────────────────
 
 def build_ai_failure_message(gpu_result: dict, remaining_attempts: int) -> str:
     error_code = gpu_result.get("error_code", "UNKNOWN_ERROR")
@@ -115,7 +229,12 @@ def build_ai_failure_message(gpu_result: dict, remaining_attempts: int) -> str:
         "HAND_TOO_SMALL": "AI 검사에 실패했습니다. 손이 너무 작게 찍혔어요.",
     }
 
-    lines = [title_map.get(error_code, f"AI 검사에 실패했습니다. {gpu_result.get('message', '')}")]
+    lines = [
+        title_map.get(
+            error_code,
+            f"AI 검사에 실패했습니다. {gpu_result.get('message', '')}",
+        )
+    ]
 
     if detail:
         lines.append(f"상세 사유: {detail}")
@@ -123,32 +242,30 @@ def build_ai_failure_message(gpu_result: dict, remaining_attempts: int) -> str:
     if guide:
         lines.append(f"다시 시도하는 방법: {guide}")
 
-    raw_candidates = gpu_result.get("ocr_text_candidates")
-    if raw_candidates:
-        lines.append(f"OCR 후보: {', '.join(raw_candidates[:5])}")
+    if error_code in {"TEXT_NOT_DETECTED", "TEXT_LENGTH_INVALID", "OCR_FAILED"}:
+        lines.append(
+            "사진 안에 미션 문자 외의 다른 글자, 숫자, 로고, 화면 글자가 함께 보이면 "
+            "AI가 다른 문자를 읽을 수 있습니다."
+        )
+        lines.append(
+            "종이에는 미션 문자 5자리만 적고, 빈 배경에서 다시 촬영해주세요."
+        )
+
+    # OCR 후보는 디버깅에 유용하지만 CAPTCHA 운영에서는 과도한 노출이 될 수 있습니다.
+    if EXPOSE_CAPTCHA_DEBUG:
+        raw_candidates = gpu_result.get("ocr_text_candidates")
+        if raw_candidates:
+            lines.append(f"OCR 후보: {', '.join(raw_candidates[:5])}")
 
     lines.append("요구되는 손 포즈와 5자리 문자+숫자가 한 장의 사진 안에 선명하게 보여야 합니다.")
     lines.append(f"남은 기회: {remaining_attempts}회")
+
     return "\n".join(lines)
 
 
-def safe_float(value: Any):
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def safe_int(value: Any):
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except Exception:
-        return None
-
+# ─────────────────────────────────────────────
+# OCR 혼동 문자 보정
+# ─────────────────────────────────────────────
 
 CONFUSION_MAP = {
     "0": ["O"],
@@ -214,6 +331,10 @@ def resolve_text_match_with_confusions(
 
     return False, "no_match", detected or None
 
+
+# ─────────────────────────────────────────────
+# 이미지 / MinIO 유틸
+# ─────────────────────────────────────────────
 
 def guess_image_ext(upload: UploadFile) -> str:
     filename = (upload.filename or "").lower()
@@ -291,7 +412,11 @@ def upload_original_image_to_minio(upload: UploadFile, image_bytes: bytes) -> di
     }
 
 
-def normalize_text_region_bbox(text_region_bbox: Optional[dict], image_width: int, image_height: int) -> Optional[dict]:
+def normalize_text_region_bbox(
+    text_region_bbox: Optional[dict],
+    image_width: int,
+    image_height: int,
+) -> Optional[dict]:
     if not text_region_bbox:
         return None
 
@@ -316,14 +441,21 @@ def normalize_text_region_bbox(text_region_bbox: Optional[dict], image_width: in
         return None
 
 
-def upload_text_crop_to_minio(image_bytes: bytes, text_region_bbox: dict) -> tuple[Optional[str], Optional[dict]]:
+def upload_text_crop_to_minio(
+    image_bytes: bytes,
+    text_region_bbox: dict,
+) -> tuple[Optional[str], Optional[dict]]:
     ensure_photo_bucket()
 
     with Image.open(BytesIO(image_bytes)) as img:
         rgb = img.convert("RGB")
         image_width, image_height = rgb.size
 
-        normalized_bbox = normalize_text_region_bbox(text_region_bbox, image_width, image_height)
+        normalized_bbox = normalize_text_region_bbox(
+            text_region_bbox,
+            image_width,
+            image_height,
+        )
         if not normalized_bbox:
             return None, None
 
@@ -484,7 +616,7 @@ def make_blocked_response(ttl: int, message: Optional[str] = None) -> dict:
         "failureReason": {
             "type": "IP_BLOCKED",
             "retryAfterSeconds": ttl,
-        }
+        },
     }
 
 
@@ -679,7 +811,7 @@ async def start_captcha(request: Request):
     if blocked:
         return make_blocked_response(
             ttl,
-            f"요청이 너무 많아 임시 차단되었습니다. {ttl}초 후 다시 시도해주세요."
+            f"요청이 너무 많아 임시 차단되었습니다. {ttl}초 후 다시 시도해주세요.",
         )
 
     limited, limit_ttl, _ = await register_start_rate_limit(ip)
@@ -746,7 +878,7 @@ async def verify_captcha(
             "message": "유효하지 않거나 5분이 지나 만료된 세션입니다. 새로고침 후 다시 시작해주세요.",
             "failureReason": {
                 "type": "SESSION_EXPIRED",
-            }
+            },
         }
 
     session_data = json.loads(session_str)
@@ -763,7 +895,7 @@ async def verify_captcha(
             failure_reason={
                 "type": "SESSION_IP_MISMATCH",
                 "expectedSessionIp": session_ip,
-            }
+            },
         )
 
     if session_data.get("attempts", 0) >= MAX_ATTEMPTS:
@@ -775,8 +907,10 @@ async def verify_captcha(
             "message": "실패 횟수(5회)를 초과했습니다. 새로고침하여 처음부터 다시 시도해주세요.",
             "failureReason": {
                 "type": "MAX_SESSION_ATTEMPTS_EXCEEDED",
-            }
+            },
         }
+
+    remaining_attempts = get_remaining_attempts(session_data)
 
     image_bytes = await image.read()
     if not image_bytes:
@@ -787,13 +921,14 @@ async def verify_captcha(
             message=(
                 "업로드된 이미지가 비어 있습니다.\n"
                 "사진을 다시 찍거나 다른 파일을 업로드해주세요.\n"
-                f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                f"남은 기회: {remaining_attempts}회"
             ),
             failure_reason={
                 "type": "EMPTY_IMAGE",
                 "expectedPose": expected_pose,
                 "expectedText": expected_text,
-            }
+                "remainingAttempts": remaining_attempts,
+            },
         )
 
     image_meta = {
@@ -825,14 +960,14 @@ async def verify_captcha(
             "image": (
                 image.filename or "upload.jpg",
                 image_bytes,
-                image.content_type or "application/octet-stream"
+                image.content_type or "application/octet-stream",
             )
         }
 
         try:
             response = await client.post(
                 GPU_SERVER_URL,
-                files=files
+                files=files,
             )
             gpu_status_code = response.status_code
             gpu_raw_text = response.text[:2000]
@@ -894,7 +1029,7 @@ async def verify_captcha(
                         "AI 서버 응답을 해석하지 못했습니다.\n"
                         "AI 서버가 JSON이 아닌 응답을 반환했습니다.\n"
                         f"상세: {repr(json_error)}\n"
-                        f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                        f"남은 기회: {remaining_attempts}회"
                     ),
                     failure_reason={
                         "type": "GPU_JSON_PARSE_FAILED",
@@ -903,8 +1038,9 @@ async def verify_captcha(
                         "statusCode": gpu_status_code,
                         "rawText": gpu_raw_text,
                         "detail": repr(json_error),
+                        "remainingAttempts": remaining_attempts,
                         "gpuServerUrl": GPU_SERVER_URL,
-                    }
+                    },
                 )
 
             logger.info("GPU json=%s", gpu_result)
@@ -918,15 +1054,16 @@ async def verify_captcha(
                 message=(
                     "AI 서버 연결 시간이 초과되었습니다.\n"
                     "GPU 서버가 응답 가능한 상태인지 확인해주세요.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_CONNECT_TIMEOUT",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
                     "detail": repr(e),
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
         except httpx.ConnectError as e:
@@ -938,15 +1075,16 @@ async def verify_captcha(
                 message=(
                     "AI 서버 연결에 실패했습니다.\n"
                     "GPU 서버가 꺼져 있거나, 주소/포트가 잘못되었거나, 네트워크에 문제가 있을 수 있습니다.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_CONNECT_ERROR",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
                     "detail": repr(e),
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
         except httpx.ReadTimeout as e:
@@ -958,15 +1096,16 @@ async def verify_captcha(
                 message=(
                     "AI 서버가 사진을 분석하는 데 시간이 너무 오래 걸리고 있습니다.\n"
                     "서버는 살아 있지만 응답이 지연되고 있을 수 있습니다.\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_READ_TIMEOUT",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
                     "detail": repr(e),
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
         except httpx.HTTPStatusError as e:
@@ -997,7 +1136,7 @@ async def verify_captcha(
                 message=(
                     f"{message}\n"
                     f"HTTP 상태 코드: {status_code}\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_HTTP_ERROR",
@@ -1005,8 +1144,9 @@ async def verify_captcha(
                     "expectedText": expected_text,
                     "statusCode": status_code,
                     "responseText": response_text,
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
         except httpx.RequestError as e:
@@ -1018,15 +1158,16 @@ async def verify_captcha(
                 message=(
                     "AI 서버 요청 처리 중 네트워크 오류가 발생했습니다.\n"
                     f"상세: {repr(e)}\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_REQUEST_ERROR",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
                     "detail": repr(e),
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
         except Exception as e:
@@ -1039,15 +1180,16 @@ async def verify_captcha(
                 message=(
                     "AI 서버 통신 처리 중 알 수 없는 오류가 발생했습니다.\n"
                     f"상세: {repr(e)}\n"
-                    f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                    f"남은 기회: {remaining_attempts}회"
                 ),
                 failure_reason={
                     "type": "GPU_UNKNOWN_ERROR",
                     "expectedPose": expected_pose,
                     "expectedText": expected_text,
                     "detail": repr(e),
+                    "remainingAttempts": remaining_attempts,
                     "gpuServerUrl": GPU_SERVER_URL,
-                }
+                },
             )
 
     if not isinstance(gpu_result, dict):
@@ -1057,18 +1199,24 @@ async def verify_captcha(
             session_data=session_data,
             message=(
                 "AI 서버 응답 형식이 올바르지 않습니다.\n"
-                f"남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+                f"남은 기회: {remaining_attempts}회"
             ),
             failure_reason={
                 "type": "GPU_INVALID_RESPONSE",
                 "expectedPose": expected_pose,
                 "expectedText": expected_text,
                 "gpuResultType": str(type(gpu_result)),
+                "remainingAttempts": remaining_attempts,
                 "gpuServerUrl": GPU_SERVER_URL,
-            }
+            },
         )
 
+    # ─────────────────────────────────────────
+    # GPU AI 판독 자체가 실패한 경우
+    # ─────────────────────────────────────────
     if not gpu_result.get("success"):
+        ai_error_code = gpu_result.get("error_code")
+
         try:
             await save_hand_pose_sample(
                 session_id=sessionId,
@@ -1088,28 +1236,64 @@ async def verify_captcha(
         except Exception:
             logger.exception("failed to save failed hand pose sample")
 
+        user_hint = gpu_result.get("guide") or "손 포즈와 5자리 문자가 모두 선명하게 보이도록 다시 촬영해주세요."
+        if ai_error_code in {"TEXT_NOT_DETECTED", "TEXT_LENGTH_INVALID", "OCR_FAILED"}:
+            user_hint = build_text_ocr_user_hint()
+
+        failure_reason = {
+            "type": "AI_DETECTION_FAILED",
+            "expectedPose": expected_pose,
+            "expectedText": expected_text,
+            "detectedPose": gpu_result.get("detected_pose"),
+            "detectedText": gpu_result.get("detected_text"),
+            "poseConfidence": safe_float(gpu_result.get("pose_confidence")),
+            "ocrConfidence": safe_float(gpu_result.get("ocr_confidence")),
+            "aiErrorCode": ai_error_code,
+            "aiMessage": gpu_result.get("message"),
+            "aiDetail": gpu_result.get("detail"),
+            "aiGuide": gpu_result.get("guide"),
+            "ocrCandidates": gpu_result.get("ocr_text_candidates"),
+            "userHint": user_hint,
+            "remainingAttempts": remaining_attempts,
+            "userDiagnosis": build_user_diagnosis(
+                pose_ok=None,
+                text_ok=None,
+                expected_pose=expected_pose,
+                detected_pose=gpu_result.get("detected_pose"),
+                expected_text=expected_text,
+                detected_text=gpu_result.get("detected_text"),
+                pose_confidence=safe_float(gpu_result.get("pose_confidence")),
+                ocr_confidence=safe_float(gpu_result.get("ocr_confidence")),
+                text_match_mode=None,
+                remaining_attempts=remaining_attempts,
+                next_action=user_hint,
+            ),
+            "gpuServerUrl": GPU_SERVER_URL,
+        }
+
+        failure_reason = maybe_attach_debug_payload(
+            failure_reason,
+            {
+                "inspection": gpu_result.get("inspection"),
+                "ocrDebugTop": gpu_result.get("ocr_debug_top"),
+                "textRegionBbox": gpu_result.get("text_region_bbox"),
+            },
+        )
+
         return await handle_verify_failure_common(
             ip=ip,
             session_id=sessionId,
             session_data=session_data,
             message=build_ai_failure_message(
                 gpu_result,
-                MAX_ATTEMPTS - (session_data.get("attempts", 0) + 1),
+                remaining_attempts,
             ),
-            failure_reason={
-                "type": "AI_DETECTION_FAILED",
-                "expectedPose": expected_pose,
-                "expectedText": expected_text,
-                "aiErrorCode": gpu_result.get("error_code"),
-                "aiMessage": gpu_result.get("message"),
-                "aiDetail": gpu_result.get("detail"),
-                "aiGuide": gpu_result.get("guide"),
-                "ocrCandidates": gpu_result.get("ocr_text_candidates"),
-                "inspection": gpu_result.get("inspection"),
-                "gpuServerUrl": GPU_SERVER_URL,
-            }
+            failure_reason=failure_reason,
         )
 
+    # ─────────────────────────────────────────
+    # GPU 판독 성공 후 미션 정답 비교
+    # ─────────────────────────────────────────
     detected_pose = gpu_result.get("detected_pose")
     pose_confidence = safe_float(gpu_result.get("pose_confidence"))
     detected_text = gpu_result.get("detected_text")
@@ -1161,19 +1345,34 @@ async def verify_captcha(
         reasons = []
 
         if not pose_ok:
-            reasons.append(f"손 포즈 불일치 (요구: {expected_pose} / 인식: {detected_pose})")
+            reasons.append(
+                f"손 포즈 불일치 "
+                f"(요구: {expected_pose} / AI가 판단한 손 포즈: {detected_pose or '인식하지 못함'})"
+            )
 
         if not text_ok:
             if ocr_low_confidence and ocr_confidence is not None:
                 reasons.append(
                     f"문자 인식 신뢰도가 낮습니다. "
-                    f"(요구: {expected_text} / 인식: {detected_text}, OCR 신뢰도: {ocr_confidence:.2f})"
+                    f"(요구: {expected_text} / AI가 읽은 문자: {detected_text or '인식하지 못함'}, "
+                    f"OCR 신뢰도: {ocr_confidence:.2f})"
                 )
             else:
                 reasons.append(
-                    f"문자열 불일치 (요구: {expected_text} / 인식: {detected_text}, "
+                    f"문자열 불일치 "
+                    f"(요구: {expected_text} / AI가 읽은 문자: {detected_text or '인식하지 못함'}, "
                     f"매칭 방식: {text_match_mode})"
                 )
+
+            reasons.append(
+                "사진 안에 미션 문자 외의 다른 글자나 숫자가 함께 보이면 "
+                "AI가 다른 문자를 선택할 수 있습니다."
+            )
+
+        user_hint = build_mission_mismatch_user_hint(
+            pose_ok=pose_ok,
+            text_ok=text_ok,
+        )
 
         message = "AI 검사에 실패했습니다.\n" + "\n".join(reasons)
 
@@ -1183,26 +1382,53 @@ async def verify_captcha(
         if ocr_confidence is not None:
             message += f"\nOCR 신뢰도: {ocr_confidence:.2f}"
 
-        message += "\n손 포즈와 5자리 문자+숫자가 모두 선명하게 보이도록 다시 촬영해주세요."
-        message += f"\n남은 기회: {MAX_ATTEMPTS - (session_data.get('attempts', 0) + 1)}회"
+        message += f"\n{user_hint}"
+        message += f"\n남은 기회: {remaining_attempts}회"
+
+        failure_reason = {
+            "type": "MISSION_MISMATCH",
+            "expectedPose": expected_pose,
+            "detectedPose": detected_pose,
+            "expectedText": expected_text,
+            "detectedText": detected_text,
+            "poseConfidence": pose_confidence,
+            "ocrConfidence": ocr_confidence,
+            "ocrCandidates": gpu_result.get("ocr_text_candidates"),
+            "textMatchMode": text_match_mode,
+            "matchedCandidate": matched_candidate,
+            "userHint": user_hint,
+            "remainingAttempts": remaining_attempts,
+            "userDiagnosis": build_user_diagnosis(
+                pose_ok=pose_ok,
+                text_ok=text_ok,
+                expected_pose=expected_pose,
+                detected_pose=detected_pose,
+                expected_text=expected_text,
+                detected_text=detected_text,
+                pose_confidence=pose_confidence,
+                ocr_confidence=ocr_confidence,
+                text_match_mode=text_match_mode,
+                remaining_attempts=remaining_attempts,
+                next_action=user_hint,
+            ),
+            "gpuServerUrl": GPU_SERVER_URL,
+        }
+
+        failure_reason = maybe_attach_debug_payload(
+            failure_reason,
+            {
+                "inspection": gpu_result.get("inspection"),
+                "ocrDebugTop": gpu_result.get("ocr_debug_top"),
+                "textRegionBbox": gpu_result.get("text_region_bbox"),
+            },
+        )
 
         return await handle_verify_failure_common(
             ip=ip,
             session_id=sessionId,
             session_data=session_data,
             message=message,
-            failure_reason={
-                "type": "MISSION_MISMATCH",
-                "expectedPose": expected_pose,
-                "detectedPose": detected_pose,
-                "expectedText": expected_text,
-                "detectedText": detected_text,
-                "poseConfidence": pose_confidence,
-                "ocrConfidence": ocr_confidence,
-                "ocrCandidates": gpu_result.get("ocr_text_candidates"),
-                "inspection": gpu_result.get("inspection"),
-                "gpuServerUrl": GPU_SERVER_URL,
-            }
+            failure_reason=failure_reason,
         )
 
     pass_token = str(uuid.uuid4())
@@ -1216,5 +1442,5 @@ async def verify_captcha(
     return {
         "success": True,
         "message": "인증이 완료되었습니다.",
-        "passToken": pass_token
+        "passToken": pass_token,
     }
