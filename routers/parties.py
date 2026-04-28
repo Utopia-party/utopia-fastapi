@@ -71,13 +71,23 @@ def _party_max_members(party: Party, service: Service | None) -> int | None:
     return party.max_members or (service.max_members if service else None)
 
 def _party_member_count(party: Party) -> int:
-    if party.current_members is not None:
-        return party.current_members
+    # 항상 실제 members 관계로 계산 (current_members 캐시 미신뢰)
     active_count = sum(
         1 for m in (party.members or [])
         if (m.status or "active").lower() == "active"
     )
     return active_count + (1 if party.leader_id else 0)
+
+
+async def _sync_member_count(db: AsyncSession, party: Party) -> int:
+    """PartyMember 테이블 기준으로 current_members 재계산 후 동기화"""
+    result = await db.execute(
+        select(func.count(PartyMember.user_id))
+        .where(PartyMember.party_id == party.id, PartyMember.status == "active")
+    )
+    real_count = (result.scalar() or 0) + 1  # +1 방장
+    party.current_members = real_count
+    return real_count
 
 
 def _service_original_price(service: Service | None) -> int | None:
@@ -547,8 +557,8 @@ async def leave_party(
     try:
         member.status = "left"
         member.left_at = func.now()
-        current = party.current_members if party.current_members is not None else _party_member_count(party)
-        party.current_members = max(0, current - 1)
+        await _sync_member_count(db, party)
+        party.current_members = max(0, party.current_members - 1)
 
         await create_activity_log(
             db=db,
@@ -594,8 +604,8 @@ async def kick_member(
     try:
         target.status = "kicked"
         target.left_at = func.now()
-        current = party.current_members if party.current_members is not None else _party_member_count(party)
-        party.current_members = max(0, current - 1)
+        await _sync_member_count(db, party)
+        party.current_members = max(0, party.current_members - 1)
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -704,7 +714,7 @@ async def approve_application(
     if target is None:
         raise HTTPException(status_code=404, detail="대기 중인 신청을 찾을 수 없습니다.")
 
-    current_count = party.current_members if party.current_members is not None else _party_member_count(party)
+    current_count = await _sync_member_count(db, party)
     if current_count >= (party.max_members or 0):
         raise HTTPException(status_code=400, detail="파티 정원이 가득 차서 승인할 수 없습니다.")
 
