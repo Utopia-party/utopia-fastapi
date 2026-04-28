@@ -230,7 +230,7 @@ async def notify_party_member_kicked(
     """
     파티원용: 강퇴 알림
     """
-    message = f"[{_party_title(party)}] 파티 이용이 종료되었어요."
+    message = f"[{_party_title(party)}] 파티에서 강퇴 처리되었습니다."
     if reason:
         message += f"\n사유: {reason}"
 
@@ -238,7 +238,7 @@ async def notify_party_member_kicked(
         db=db,
         user_id=target_user_id,
         type="party",
-        title="파티 이용이 종료되었어요",
+        title="파티 강퇴 처리 안내",
         message=message,
         reference_type=PARTY_REFERENCE_TYPE,
         reference_id=party.id,
