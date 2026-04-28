@@ -19,6 +19,7 @@ from models.user import User
 from services.notifications.report_notification_service import (
     notify_report_penalty_to_target,
     notify_report_result_to_reporter,
+    notify_report_result_to_target,
     notify_report_warning_to_target,
 )
 from services.report_storage_service import get_report_file_bytes
@@ -310,6 +311,11 @@ async def update_admin_report_status(
             db,
             report=updated_report,
         )
+        if updated_report.target_type == "USER":
+            await notify_report_result_to_target(
+                db,
+                report=updated_report,
+            )
         if updated_report.target_type == "USER" and new_score is not None:
             message = _build_target_warning_message(
                 updated_report,
@@ -338,6 +344,11 @@ async def update_admin_report_status(
             db,
             report=updated_report,
         )
+        if updated_report.target_type == "USER":
+            await notify_report_result_to_target(
+                db,
+                report=updated_report,
+            )
 
     return build_admin_report_response(updated_report)
 

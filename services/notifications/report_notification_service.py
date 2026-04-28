@@ -35,6 +35,19 @@ def _build_report_detail_message(report: Report) -> str:
     return f"{base}\n처리 결과: {result_label}"
 
 
+def _build_target_report_result_message(report: Report) -> str:
+    result_label = _resolve_report_result_label(
+        report.action_result_code,
+        report.status,
+    )
+    base = "회원님에 대한 신고가 처리되었어요."
+
+    if report.admin_memo:
+        return f"{base}\n처리 결과: {result_label}\n상세: {report.admin_memo}"
+
+    return f"{base}\n처리 결과: {result_label}"
+
+
 async def notify_report_submitted(
     db: AsyncSession,
     *,
@@ -142,5 +155,34 @@ async def notify_report_penalty_to_target(
             "status": report.status,
             "action_result_code": report.action_result_code,
             "penalty_code": penalty_code,
+        },
+    )
+
+
+async def notify_report_result_to_target(
+    db: AsyncSession,
+    *,
+    report: Report,
+) -> None:
+    """
+    피신고자용: 신고 처리 결과 안내
+    관리자 검토 완료 시점에 호출
+    """
+    await notify_user(
+        db=db,
+        user_id=report.target_id,
+        type="report",
+        title="신고 처리 결과가 안내되었어요",
+        message=_build_target_report_result_message(report),
+        reference_type="report",
+        reference_id=report.id,
+        metadata={
+            "event_code": "REPORT_TARGET_RESOLVED",
+            "report_id": str(report.id),
+            "target_type": report.target_type,
+            "target_id": str(report.target_id),
+            "status": report.status,
+            "action_result_code": report.action_result_code,
+            "admin_memo": report.admin_memo,
         },
     )
