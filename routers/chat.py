@@ -13,6 +13,7 @@ from core.config import settings
 from core.database import get_db, AsyncSessionLocal
 from core.security import get_current_user_optional
 from models.party import Party, PartyMember, PartyChat, Service
+from models.payment import Payment
 from models.user import User
 from models.refresh_token import RefreshToken
 from services.mypage.profile_service import _build_profile_image_url
@@ -91,6 +92,7 @@ def _serialize_member(
     role: str,
     status: str,
     joined_at: datetime | None,
+    payment_status: str | None = None,
 ) -> dict:
     return {
         "user_id": str(user.id),
@@ -101,6 +103,7 @@ def _serialize_member(
         "trust_score": float(user.trust_score) if user.trust_score is not None else None,
         "joined_at": joined_at.isoformat() if joined_at else None,
         "profile_image": _safe_profile_image_url(user.profile_image_key),
+        "payment_status": payment_status,
         "is_active": bool(user.is_active),
     }
 
@@ -563,6 +566,23 @@ async def get_party_info(
         .order_by(PartyMember.joined_at.asc())
     )
     rows = result.all()
+    billing_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    member_user_ids = [user.id for _, user in rows]
+    if party.host:
+        member_user_ids.append(party.host.id)
+    unique_member_user_ids = list({user_id for user_id in member_user_ids})
+
+    paid_user_ids: set[uuid.UUID] = set()
+    if unique_member_user_ids:
+        paid_result = await db.execute(
+            select(Payment.user_id).where(
+                Payment.party_id == party_id,
+                Payment.billing_month == billing_month,
+                Payment.status == "approved",
+                Payment.user_id.in_(unique_member_user_ids),
+            )
+        )
+        paid_user_ids = set(paid_result.scalars().all())
 
     members = [
         _serialize_member(
@@ -570,6 +590,7 @@ async def get_party_info(
             role=member.role,
             status=member.status,
             joined_at=member.joined_at,
+            payment_status="completed" if user.id in paid_user_ids else "pending",
         )
         for member, user in rows
     ]
@@ -582,6 +603,7 @@ async def get_party_info(
                 role="leader",
                 status="active",
                 joined_at=party.created_at,
+                payment_status="completed" if party.host.id in paid_user_ids else "pending",
             ),
         )
 
