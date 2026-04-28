@@ -164,9 +164,11 @@ async def check_message(content: str) -> dict:
                 pass_t = config.get("stage2_pass_threshold", 0.75)
                 block_t = config.get("stage2_block_threshold", 0.97)  # 기본값 상향
 
-                if label == "none" or score < pass_t:
+                # none 라벨이어도 score가 확실할 때만 통과 — 애매하면 3단계로
+                if label == "none" and score >= pass_t:
                     return {"violation": False, "severe": False, "reason": "", "stage": 2, "score": score}
-                if score >= block_t:
+                # 욕설 라벨이고 score가 block_t 이상일 때만 즉시 차단
+                if label != "none" and score >= block_t:
                     return {
                         "violation": True,
                         "severe": label == "hate",
@@ -174,7 +176,7 @@ async def check_message(content: str) -> dict:
                         "stage": 2,
                         "score": score,
                     }
-                # pass_t <= score < block_t 구간은 3단계(Ollama)로 넘겨 문맥 판단
+                # 그 외 모든 애매한 경우는 3단계(Ollama) 문맥 판단으로 위임
         except Exception:
             pass
 
