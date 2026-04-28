@@ -72,20 +72,21 @@ def _party_max_members(party: Party, service: Service | None) -> int | None:
 
 def _party_member_count(party: Party) -> int:
     # 항상 실제 members 관계로 계산 (current_members 캐시 미신뢰)
-    active_count = sum(
+    # 방장도 PartyMember에 role=leader로 포함되므로 +1 없이 COUNT
+    return sum(
         1 for m in (party.members or [])
         if (m.status or "active").lower() == "active"
     )
-    return active_count + (1 if party.leader_id else 0)
 
 
 async def _sync_member_count(db: AsyncSession, party: Party) -> int:
-    """PartyMember 테이블 기준으로 current_members 재계산 후 동기화"""
+    """PartyMember 테이블 기준으로 current_members 재계산 후 동기화
+    방장도 PartyMember에 role=leader로 포함되어 있으므로 +1 없이 COUNT만"""
     result = await db.execute(
         select(func.count(PartyMember.user_id))
         .where(PartyMember.party_id == party.id, PartyMember.status == "active")
     )
-    real_count = (result.scalar() or 0) + 1  # +1 방장
+    real_count = result.scalar() or 0
     party.current_members = real_count
     return real_count
 
