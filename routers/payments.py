@@ -19,7 +19,6 @@ from services.notifications.settlement_notification_service import (
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
-
 async def get_current_user(
     access_token: str | None = Cookie(default=None, alias="access_token"),
     authorization: str | None = Header(default=None),
@@ -44,7 +43,6 @@ async def get_current_user(
         raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
     return user
 
-
 async def _has_referrer_in_party(
     db: AsyncSession,
     party_id: uuid.UUID,
@@ -65,29 +63,12 @@ async def _has_referrer_in_party(
     return result.scalar_one_or_none() is not None
 
 
-async def _is_quick_match_member(
-    db: AsyncSession,
-    party_id: uuid.UUID,
-    user_id: uuid.UUID,
-) -> bool:
-    result = await db.execute(
-        select(PartyMember).where(
-            PartyMember.party_id == party_id,
-            PartyMember.user_id == user_id,
-            PartyMember.status == "active",
-            PartyMember.join_type == "quick_match",
-        )
-    )
-    return result.scalar_one_or_none() is not None
-
-
 def _calc_payment(
     base_amount: int,
     service: Service | None,
     is_leader: bool,
     has_referrer: bool,
-    is_quick_match: bool = False,
-) -> tuple[int, float, int, str | None, str]:
+) -> tuple[int, float, int, str | None]:
     discount_rate = 0.0
     reasons: list[str] = []
 
@@ -104,27 +85,15 @@ def _calc_payment(
     discount_rate = min(discount_rate, 1.0)
     amount = round(base_amount * (1 - discount_rate))
 
-    base_commission_rate = (
+    commission_rate = (
         float(service.commission_rate)
         if service and service.commission_rate is not None
         else 0.30
     )
-
-    if is_quick_match and service and service.quick_match_fee_rate is not None:
-        commission_rate = base_commission_rate + float(service.quick_match_fee_rate)
-        pricing_type = "quick_match"
-    else:
-        commission_rate = base_commission_rate
-        pricing_type = "normal"
-
-    commission_amount = (
-        round(amount * commission_rate / (1 + commission_rate))
-        if commission_rate > 0
-        else 0
-    )
+    commission_amount = round(amount * commission_rate / (1 + commission_rate)) if commission_rate > 0 else 0
 
     discount_reason = " + ".join(reasons) if reasons else None
-    return amount, commission_rate, commission_amount, discount_reason, pricing_type
+    return amount, commission_rate, commission_amount, discount_reason
 
 
 # ── 포트원 검증 ──────────────────────────────────────────────────
@@ -196,56 +165,6 @@ async def get_payment_status(
     return {"paid": result.scalar_one_or_none() is not None, "billing_month": billing_month}
 
 
-# 빠른매칭 사용자 성공모달 / 정산요청 표시
-@router.get("/preview")
-async def preview_payment(
-    party_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    party = await db.get(Party, party_id)
-    if not party:
-        raise HTTPException(status_code=404, detail="파티를 찾을 수 없습니다.")
-
-    service = await db.get(Service, party.service_id) if party.service_id else None
-    is_leader = party.leader_id == current_user.id
-
-    has_referrer = await _has_referrer_in_party(
-        db=db,
-        party_id=party_id,
-        leader_id=party.leader_id,
-        referrer_id=current_user.referrer_id,
-    )
-
-    base_price = int(party.monthly_per_person) if party.monthly_per_person else 0
-
-    is_quick_match = await _is_quick_match_member(
-        db=db,
-        party_id=party_id,
-        user_id=current_user.id,
-    )
-
-    amount, commission_rate, commission_amount, discount_reason, pricing_type = _calc_payment(
-        base_price,
-        service,
-        is_leader,
-        has_referrer,
-        is_quick_match,
-    )
-
-    return {
-        "party_id": party.id,
-        "base_price": base_price,
-        "amount": amount,
-        "commission_rate": commission_rate,
-        "commission_amount": commission_amount,
-        "discount_reason": discount_reason,
-        "pricing_type": pricing_type,
-        "is_quick_match": is_quick_match,
-        "quick_match_fee_rate": float(service.quick_match_fee_rate or 0) if service else 0,
-    }
-
-
 @router.post("/card/confirm", response_model=PaymentOut)
 async def card_confirm(
     body: CardConfirmRequest,
@@ -283,15 +202,8 @@ async def card_confirm(
     )
 
     base_price = int(party.monthly_per_person) if party.monthly_per_person else 0
-
-    is_quick_match = await _is_quick_match_member(
-        db=db,
-        party_id=body.party_id,
-        user_id=current_user.id,
-    )
-
-    amount, commission_rate, commission_amount, discount_reason, pricing_type = _calc_payment(
-        base_price, service, is_leader, has_referrer, is_quick_match
+    amount, commission_rate, commission_amount, discount_reason = _calc_payment(
+        base_price, service, is_leader, has_referrer
     )
 
     await _verify_portone(body.pg_transaction_id, amount)
@@ -308,7 +220,7 @@ async def card_confirm(
         status="approved",
         billing_month=billing_month,
         paid_at=now,
-        pricing_type=pricing_type,
+        pricing_type="normal",
         pg_provider="portone",
         pg_transaction_id=body.pg_transaction_id,
     )
@@ -356,14 +268,8 @@ async def transfer_register(
     )
 
     base_price = int(party.monthly_per_person) if party.monthly_per_person else 0
-    is_quick_match = await _is_quick_match_member(
-        db=db,
-        party_id=body.party_id,
-        user_id=current_user.id,
-    )
-
-    amount, commission_rate, commission_amount, discount_reason, pricing_type = _calc_payment(
-        base_price, service, is_leader, has_referrer, is_quick_match
+    amount, commission_rate, commission_amount, discount_reason = _calc_payment(
+        base_price, service, is_leader, has_referrer
     )
 
     payment = Payment(
@@ -378,7 +284,7 @@ async def transfer_register(
         status="pending",
         billing_month=billing_month,
         paid_at=None,
-        pricing_type=pricing_type,
+        pricing_type="normal",
         pg_provider=None,
         pg_transaction_id=None,
     )
