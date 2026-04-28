@@ -19,6 +19,7 @@ from services.notifications.settlement_notification_service import (
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
+
 async def get_current_user(
     access_token: str | None = Cookie(default=None, alias="access_token"),
     authorization: str | None = Header(default=None),
@@ -43,6 +44,7 @@ async def get_current_user(
         raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
     return user
 
+
 async def _has_referrer_in_party(
     db: AsyncSession,
     party_id: uuid.UUID,
@@ -58,6 +60,22 @@ async def _has_referrer_in_party(
             PartyMember.party_id == party_id,
             PartyMember.user_id == referrer_id,
             PartyMember.status == "active",
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _is_quick_match_member(
+    db: AsyncSession,
+    party_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    result = await db.execute(
+        select(PartyMember).where(
+            PartyMember.party_id == party_id,
+            PartyMember.user_id == user_id,
+            PartyMember.status == "active",
+            PartyMember.join_type == "quick_match",
         )
     )
     return result.scalar_one_or_none() is not None
@@ -84,6 +102,7 @@ def _calc_payment(
         reasons.append(f"추천인 할인 {int(d * 100)}%")
 
     discount_rate = min(discount_rate, 1.0)
+    amount = round(base_amount * (1 - discount_rate))
 
     base_commission_rate = (
         float(service.commission_rate)
@@ -91,22 +110,12 @@ def _calc_payment(
         else 0.30
     )
 
-    commission_rate = base_commission_rate
-    pricing_type = "normal"
-
-    normal_amount = round(base_amount * (1 - discount_rate))
-    amount = normal_amount
-
-    if is_quick_match and service:
-        quick_match_fee_rate = float(service.quick_match_fee_rate or 0)
-        commission_rate = base_commission_rate + quick_match_fee_rate
+    if is_quick_match and service and service.quick_match_fee_rate is not None:
+        commission_rate = base_commission_rate + float(service.quick_match_fee_rate)
         pricing_type = "quick_match"
-
-        normal_rate = 1 + base_commission_rate
-        quick_rate = 1 + commission_rate
-
-        if normal_rate > 0:
-            amount = round(normal_amount / normal_rate * quick_rate)
+    else:
+        commission_rate = base_commission_rate
+        pricing_type = "normal"
 
     commission_amount = (
         round(amount * commission_rate / (1 + commission_rate))
@@ -116,6 +125,8 @@ def _calc_payment(
 
     discount_reason = " + ".join(reasons) if reasons else None
     return amount, commission_rate, commission_amount, discount_reason, pricing_type
+
+
 # ── 포트원 검증 ──────────────────────────────────────────────────
 
 async def _verify_portone(payment_id: str, expected_amount: int) -> None:
@@ -184,6 +195,7 @@ async def get_payment_status(
     )
     return {"paid": result.scalar_one_or_none() is not None, "billing_month": billing_month}
 
+
 # 빠른매칭 사용자 성공모달 / 정산요청 표시
 @router.get("/preview")
 async def preview_payment(
@@ -233,6 +245,7 @@ async def preview_payment(
         "quick_match_fee_rate": float(service.quick_match_fee_rate or 0) if service else 0,
     }
 
+
 @router.post("/card/confirm", response_model=PaymentOut)
 async def card_confirm(
     body: CardConfirmRequest,
@@ -270,7 +283,7 @@ async def card_confirm(
     )
 
     base_price = int(party.monthly_per_person) if party.monthly_per_person else 0
-    
+
     is_quick_match = await _is_quick_match_member(
         db=db,
         party_id=body.party_id,
@@ -411,19 +424,3 @@ async def approve_transfer(
         member_nickname=user.nickname if user else None,
     )
     return {"message": "승인 완료", "payment_id": str(payment_id)}
-
-# 빠른매칭 참여 여부 
-async def _is_quick_match_member(
-    db: AsyncSession,
-    party_id: uuid.UUID,
-    user_id: uuid.UUID,
-) -> bool:
-    result = await db.execute(
-        select(PartyMember).where(
-            PartyMember.party_id == party_id,
-            PartyMember.user_id == user_id,
-            PartyMember.status == "active",
-            PartyMember.join_type == "quick_match",
-        )
-    )
-    return result.scalar_one_or_none() is not None
