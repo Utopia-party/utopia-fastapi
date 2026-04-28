@@ -270,15 +270,15 @@ async def get_admin_party_members(
         await db.execute(
             select(PartyMember, User)
             .join(User, PartyMember.user_id == User.id)
-            .where(PartyMember.party_id == party_uuid)
+            .where(PartyMember.party_id == party_uuid, PartyMember.status == "active")
             .order_by(PartyMember.joined_at.asc())
         )
     ).all()
 
     result: list[AdminPartyMemberOut] = []
     for member, user in rows:
-        # 파티장 여부: party.leader_id 또는 role == "leader"
-        effective_role = "leader" if user.id == party.leader_id or member.role == "leader" else member.role
+        # party.leader_id 기준으로만 파티장 판단 (임명 후 즉시 반영)
+        effective_role = "leader" if user.id == party.leader_id else "member"
         result.append(
             AdminPartyMemberOut(
                 memberId=str(member.id),
