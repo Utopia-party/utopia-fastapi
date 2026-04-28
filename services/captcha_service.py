@@ -834,6 +834,11 @@ async def get_proxied_image(token: str) -> tuple[bytes, str]:
 
 
 def _pick_from_library(library: dict[str, list[str]], category: str, used_paths: set[str]) -> str:
+    if category not in library or not library[category]:
+        raise KeyError(
+            f"카테고리 '{category}'가 라이브러리에 없습니다. "
+            f"사용 가능: {list(library.keys())}"
+        )
     candidates = [path for path in library[category] if path not in used_paths]
     if not candidates:
         candidates = library[category]
@@ -869,11 +874,11 @@ async def _build_new_challenge_payload(
     emoji_lib = EMOJI_ASSET_LIBRARY if EMOJI_ASSET_LIBRARY else PHOTO_ASSET_LIBRARY
     photo_lib = PHOTO_ASSET_LIBRARY
 
-    # 이모지가 없는 카테고리는 실사 이미지로 대체 (임시)
+    # 이모지 + 실사 사진 모두 있는 카테고리만 사용
     available_categories = [
         category
         for category in SUPPORTED_CHALLENGE_CATEGORIES
-        if photo_lib.get(category)
+        if emoji_lib.get(category) and photo_lib.get(category)
     ]
 
     if len(available_categories) < 3:
