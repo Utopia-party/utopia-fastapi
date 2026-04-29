@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select, text
@@ -188,7 +189,8 @@ async def get_admin_parties(
                 createdAt=_format_datetime(party.created_at),
                 service=service.name,
                 category=service.category,
-                leaderId=user.nickname,
+                leaderId=str(user.id),
+                leaderNickname=user.nickname,
                 memberCount=party.current_members,
                 status=status_label,
                 reportCount=int(report_count),
@@ -260,7 +262,8 @@ async def force_end_admin_party(
         createdAt=_format_datetime(party.created_at),
         service=service.name if service else "-",
         category=service.category if service else "-",
-        leaderId=host.nickname if host else str(party.leader_id),
+        leaderId=str(host.id) if host else str(party.leader_id),
+        leaderNickname=host.nickname if host else str(party.leader_id),
         memberCount=party.current_members,
         status=_party_status_label(party, int(report_count)),
         reportCount=int(report_count),

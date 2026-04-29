@@ -231,6 +231,7 @@ class AdminPartyRecordOut(BaseModel):
     service: str
     category: str
     leaderId: str
+    leaderNickname: str
     memberCount: int
     status: str
     reportCount: int
