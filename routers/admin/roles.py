@@ -2,9 +2,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -103,6 +104,41 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+
+def _parse_user_id_or_none(user_id: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(user_id)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _resolve_user_from_identifier(
+    db: AsyncSession,
+    user_identifier: str,
+) -> User:
+    value = user_identifier.strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="사용자 ID, 닉네임, 또는 이메일을 입력해주세요.")
+
+    user_uuid = _parse_user_id_or_none(value)
+    if user_uuid is not None:
+        user = await db.get(User, user_uuid)
+        if user is not None:
+            return user
+
+    user = await db.scalar(
+        select(User).where(
+            or_(
+                User.nickname == value,
+                User.email == value,
+            )
+        )
+    )
+    if user is None:
+        raise HTTPException(status_code=404, detail="관리자 대상으로 지정한 사용자가 없습니다.")
+
+    return user
+
 @router.get("/me", response_model=AdminPermissionOut)
 async def get_admin_me(
     admin: AdminContext = Depends(require_admin_context),
@@ -134,9 +170,7 @@ async def update_admin_role(
     admin: AdminContext = Depends(require_admin_role_permission),
     db: AsyncSession = Depends(get_db),
 ):
-    target_user = await db.get(User, user_id)
-    if not target_user:
-        raise HTTPException(status_code=404, detail="관리자 대상으로 지정한 사용자가 없습니다.")
+    target_user = await _resolve_user_from_identifier(db, user_id)
 
     next_permissions = _admin_permissions_payload(payload)
     if not _has_any_admin_permission(next_permissions):

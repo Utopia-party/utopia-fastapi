@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select, text
@@ -104,6 +105,13 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+
+def _parse_user_id_or_400(user_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="유효하지 않은 사용자 ID입니다.")
+
 @router.get("/users", response_model=list[AdminUserRecordOut])
 async def get_admin_users(
     _: AdminContext = Depends(require_admin_user_permission),
@@ -183,7 +191,8 @@ async def get_admin_user_detail(
     _: AdminContext = Depends(require_admin_user_permission),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await db.get(User, user_id)
+    user_uuid = _parse_user_id_or_400(user_id)
+    user = await db.get(User, user_uuid)
     if not user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
@@ -369,7 +378,8 @@ async def update_admin_user_status(
     admin: AdminContext = Depends(require_admin_user_permission),
     db: AsyncSession = Depends(get_db),
 ):
-    target_user = await db.get(User, user_id)
+    user_uuid = _parse_user_id_or_400(user_id)
+    target_user = await db.get(User, user_uuid)
     if not target_user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
@@ -449,7 +459,8 @@ async def get_admin_user_status_logs(
     _: AdminContext = Depends(require_admin_user_permission),
     db: AsyncSession = Depends(get_db),
 ):
-    target_user = await db.get(User, user_id)
+    user_uuid = _parse_user_id_or_400(user_id)
+    target_user = await db.get(User, user_uuid)
     if not target_user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
@@ -493,7 +504,8 @@ async def update_admin_user_trust_score(
     admin: AdminContext = Depends(require_admin_user_permission),
     db: AsyncSession = Depends(get_db),
 ):
-    target_user = await db.get(User, user_id)
+    user_uuid = _parse_user_id_or_400(user_id)
+    target_user = await db.get(User, user_uuid)
     if not target_user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
 
@@ -535,4 +547,4 @@ async def update_admin_user_trust_score(
     )
     await db.commit()
 
-    return await get_admin_user_detail(user_id, admin, db)
+    return await get_admin_user_detail(str(user_uuid), admin, db)
