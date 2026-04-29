@@ -44,19 +44,18 @@ class PartyOut(BaseModel):
     max_members: Optional[int] = None
     monthly_price: Optional[int] = None
     original_price: Optional[int] = None
-    service_total_price: Optional[int] = None  # 서비스 전체 구독 금액 (환급 계산용)
+    service_total_price: Optional[int] = None 
     logo_image_key: Optional[str] = None
     logo_image_url: Optional[str] = None
     member_count: int = 0
     is_joined: bool = False
-    # 현재 로그인 유저의 해당 파티 참여 상태
-    # None | 'pending' | 'active' | 'kicked' | 'left' | 'rejected' | 'leader'
     my_member_status: Optional[str] = None
-    # 추가 필드
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     min_trust_score: Optional[float] = None
     created_at: Optional[datetime] = None
+    leader_discount_rate: Optional[float] = None
+    has_referrer_discount: bool = False
     model_config = {"from_attributes": True}
 
 
@@ -66,8 +65,6 @@ class PartyListOut(BaseModel):
     page: int
     size: int
 
-
-# ---- 내 파티 / 멤버 관리용 (v2 추가) ----
 
 class MyPartyOut(PartyOut):
     """내 파티 목록 전용 — is_owner 플래그 포함."""
@@ -81,7 +78,7 @@ class MyPartyListOut(BaseModel):
 class PartyMemberOut(BaseModel):
     user_id: uuid.UUID
     nickname: Optional[str] = None
-    role: str  # 'leader' | 'member'
+    role: str  
     is_current_user: bool = False
 
     model_config = {"from_attributes": True}
