@@ -53,8 +53,7 @@ def _party_max_members(party: Party, service: Service | None) -> int | None:
 
 
 def _party_member_count(party: Party, members: list[dict]) -> int:
-    if party.current_members is not None:
-        return party.current_members
+    # current_members는 리더를 제외한 카운트일 수 있어 실제 members 리스트 길이를 사용
     return len(members)
 
 
@@ -646,6 +645,7 @@ async def get_party_info(
         "member_count": _party_member_count(party, members),
         "monthly_price": _party_total_price(party, service),
         "monthly_per_person": party.monthly_per_person,
+        "quick_match_fee_rate": float(service.quick_match_fee_rate) if service and service.quick_match_fee_rate is not None else 0.0,
         "leader_discount_rate": float(service.leader_discount_rate) if service and service.leader_discount_rate is not None else None,
         "referral_discount_rate": float(service.referral_discount_rate) if service and service.referral_discount_rate is not None else None,
         "is_leader": is_leader,
