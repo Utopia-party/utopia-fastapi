@@ -702,3 +702,515 @@ async def list_captcha_sessions(
                 "total_pages": 0,
             }
         raise
+
+
+@router.get("/captcha/sessions/{session_id}/images", tags=["admin-captcha"])
+async def get_session_images(
+    session_id: str,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """캡챠 세션에 사용된 이모지 + 실사 이미지를 프록시 URL로 반환
+
+    - emojis: 이모지 이미지 목록 (카테고리 + 프록시 URL)
+    - photos: 실사 사진 목록 (카테고리 + 프록시 URL)
+    - answer_indices: 정답 위치 (photos 배열 내 인덱스)
+    """
+    import services.captcha_service as cs
+
+    try:
+        # 1) 세션 → captcha_set_id 조회
+        session_result = await db.execute(text("""
+            SELECT captcha_set_id FROM captcha_sessions WHERE id = :sid
+        """), {"sid": session_id})
+        session_row = session_result.mappings().first()
+
+        if not session_row or not session_row["captcha_set_id"]:
+            return {
+                "session_id": session_id,
+                "emojis": [],
+                "photos": [],
+                "answer_indices": [],
+                "message": "이 세션에 연결된 캡챠 세트가 없습니다 (pass 세션일 수 있음)",
+            }
+
+        set_id = session_row["captcha_set_id"]
+
+        # 2) captcha_sets → emoji_ids, photo_ids, answer_indices
+        set_result = await db.execute(text("""
+            SELECT emoji_ids, photo_ids, answer_indices
+            FROM captcha_sets WHERE id = :set_id
+        """), {"set_id": set_id})
+        set_row = set_result.mappings().first()
+
+        if not set_row:
+            raise HTTPException(status_code=404, detail="캡챠 세트를 찾을 수 없습니다")
+
+        emoji_ids = set_row["emoji_ids"] or []
+        photo_ids = set_row["photo_ids"] or []
+        answer_indices = set_row["answer_indices"] or []
+
+        # 3) emoji_images 조회
+        emojis = []
+        if emoji_ids:
+            emoji_result = await db.execute(text("""
+                SELECT id, category, image_key
+                FROM emoji_images
+                WHERE id = ANY(:ids)
+            """), {"ids": emoji_ids})
+            emoji_map = {str(r["id"]): r for r in emoji_result.mappings()}
+
+            for eid in emoji_ids:
+                row = emoji_map.get(str(eid))
+                if row:
+                    token = await cs._create_image_token("captcha-emojis", row["image_key"])
+                    emojis.append({
+                        "id": str(row["id"]),
+                        "category": row["category"],
+                        "url": cs._build_proxy_url(token),
+                    })
+
+        # 4) real_photos 조회
+        photos = []
+        if photo_ids:
+            photo_result = await db.execute(text("""
+                SELECT id, category, image_key
+                FROM real_photos
+                WHERE id = ANY(:ids)
+            """), {"ids": photo_ids})
+            photo_map = {str(r["id"]): r for r in photo_result.mappings()}
+
+            for pid in photo_ids:
+                row = photo_map.get(str(pid))
+                if row:
+                    token = await cs._create_image_token("captcha-photos", row["image_key"])
+                    photos.append({
+                        "id": str(row["id"]),
+                        "category": row["category"],
+                        "url": cs._build_proxy_url(token),
+                    })
+
+        return {
+            "session_id": session_id,
+            "captcha_set_id": str(set_id),
+            "emojis": emojis,
+            "photos": photos,
+            "answer_indices": answer_indices,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger("admin.captcha.images").error(
+            f"[captcha/sessions/images] 조회 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"이미지 조회 실패: {e}")
+
+
+# ── 이미지 관리 ──────────────────────────────────────
+
+@router.get("/captcha/images", tags=["admin-captcha"])
+async def list_captcha_images(
+    image_type: str = Query(description="emoji 또는 photo"),
+    category: str | None = Query(default=None, description="동물 카테고리 필터"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=50, ge=1, le=200),
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """이모지 또는 실사 이미지 목록 조회 (카테고리별 필터 + 페이지네이션)"""
+    import services.captcha_service as cs
+
+    if image_type not in ("emoji", "photo"):
+        raise HTTPException(status_code=400, detail="image_type은 'emoji' 또는 'photo'여야 합니다")
+
+    try:
+        table = "emoji_images" if image_type == "emoji" else "real_photos"
+        bucket = "captcha-emojis" if image_type == "emoji" else "captcha-photos"
+
+        where_parts = ["is_active = true"]
+        params: dict = {"limit": size, "offset": (page - 1) * size}
+
+        if category:
+            where_parts.append("category = :category")
+            params["category"] = category
+
+        where_clause = "WHERE " + " AND ".join(where_parts)
+
+        # 카테고리 목록 (필터 UI용)
+        cat_result = await db.execute(text(f"""
+            SELECT category, COUNT(*) AS cnt
+            FROM {table}
+            WHERE is_active = true
+            GROUP BY category
+            ORDER BY category
+        """))
+        categories = [
+            {"category": r["category"], "count": r["cnt"]}
+            for r in cat_result.mappings()
+        ]
+
+        # 전체 건수
+        count_result = await db.execute(
+            text(f"SELECT COUNT(*) AS cnt FROM {table} {where_clause}"),
+            params,
+        )
+        total = count_result.scalar() or 0
+
+        # 이미지 목록
+        rows_result = await db.execute(text(f"""
+            SELECT id, category, image_key, created_at
+            FROM {table}
+            {where_clause}
+            ORDER BY category, created_at DESC
+            LIMIT :limit OFFSET :offset
+        """), params)
+
+        images = []
+        for row in rows_result.mappings():
+            token = await cs._create_image_token(bucket, row["image_key"])
+            images.append({
+                "id": str(row["id"]),
+                "category": row["category"],
+                "image_key": row["image_key"],
+                "url": cs._build_proxy_url(token),
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            })
+
+        return {
+            "image_type": image_type,
+            "categories": categories,
+            "images": images,
+            "total": total,
+            "page": page,
+            "size": size,
+            "total_pages": (total + size - 1) // size,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger("admin.captcha.images").error(
+            f"[captcha/images] 조회 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"이미지 목록 조회 실패: {e}")
+
+
+@router.get("/captcha/images/{image_id}/sets", tags=["admin-captcha"])
+async def get_image_sets(
+    image_id: str,
+    image_type: str = Query(description="emoji 또는 photo"),
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """특정 이미지가 사용된 캡챠 세트 목록 조회"""
+    if image_type not in ("emoji", "photo"):
+        raise HTTPException(status_code=400, detail="image_type은 'emoji' 또는 'photo'여야 합니다")
+
+    try:
+        # UUID 배열에 해당 이미지 ID가 포함된 세트 조회
+        column = "emoji_ids" if image_type == "emoji" else "photo_ids"
+
+        result = await db.execute(text(f"""
+            SELECT id, emoji_ids, photo_ids, answer_indices,
+                   use_count, is_active, created_by, created_at
+            FROM captcha_sets
+            WHERE :image_id = ANY({column})
+            ORDER BY created_at DESC
+            LIMIT 50
+        """), {"image_id": image_id})
+
+        sets = []
+        for row in result.mappings():
+            sets.append({
+                "id": str(row["id"]),
+                "emoji_count": len(row["emoji_ids"] or []),
+                "photo_count": len(row["photo_ids"] or []),
+                "answer_indices": row["answer_indices"] or [],
+                "use_count": row["use_count"] or 0,
+                "is_active": row["is_active"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            })
+
+        return {
+            "image_id": image_id,
+            "image_type": image_type,
+            "sets": sets,
+            "total": len(sets),
+        }
+
+    except Exception as e:
+        import logging
+        logging.getLogger("admin.captcha.images").error(
+            f"[captcha/images/sets] 조회 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"세트 조회 실패: {e}")
+
+
+@router.put("/captcha/sets/{set_id}/deactivate", tags=["admin-captcha"])
+async def deactivate_captcha_set(
+    set_id: str,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """캡챠 세트 비활성화 (is_active = false)"""
+    try:
+        result = await db.execute(text("""
+            UPDATE captcha_sets
+            SET is_active = false
+            WHERE id = :set_id AND is_active = true
+            RETURNING id
+        """), {"set_id": set_id})
+        await db.commit()
+
+        updated = result.fetchone()
+        if not updated:
+            raise HTTPException(
+                status_code=404,
+                detail="세트를 찾을 수 없거나 이미 비활성화 상태입니다",
+            )
+
+        return {
+            "set_id": set_id,
+            "is_active": False,
+            "message": f"캡챠 세트 {set_id[:8]}... 비활성화 완료",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        import logging
+        logging.getLogger("admin.captcha.sets").error(
+            f"[captcha/sets/deactivate] 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"세트 비활성화 실패: {e}")
+
+
+@router.put("/captcha/images/{image_id}/deactivate", tags=["admin-captcha"])
+async def deactivate_image(
+    image_id: str,
+    image_type: str = Query(description="emoji 또는 photo"),
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """이미지 비활성화 + 해당 이미지가 포함된 활성 세트 일괄 정지"""
+    if image_type not in ("emoji", "photo"):
+        raise HTTPException(status_code=400, detail="image_type은 'emoji' 또는 'photo'여야 합니다")
+
+    try:
+        table = "emoji_images" if image_type == "emoji" else "real_photos"
+        column = "emoji_ids" if image_type == "emoji" else "photo_ids"
+
+        # 1) 이미지 비활성화
+        img_result = await db.execute(text(f"""
+            UPDATE {table}
+            SET is_active = false
+            WHERE id = :image_id AND is_active = true
+            RETURNING id, category
+        """), {"image_id": image_id})
+        img_row = img_result.fetchone()
+
+        if not img_row:
+            raise HTTPException(
+                status_code=404,
+                detail="이미지를 찾을 수 없거나 이미 비활성화 상태입니다",
+            )
+
+        # 2) 해당 이미지가 포함된 활성 세트 일괄 정지
+        sets_result = await db.execute(text(f"""
+            UPDATE captcha_sets
+            SET is_active = false
+            WHERE :image_id = ANY({column}) AND is_active = true
+            RETURNING id
+        """), {"image_id": image_id})
+        deactivated_sets = [str(r[0]) for r in sets_result.fetchall()]
+
+        await db.commit()
+
+        return {
+            "image_id": image_id,
+            "image_type": image_type,
+            "category": img_row[1],
+            "deactivated_sets_count": len(deactivated_sets),
+            "message": f"이미지 비활성화 완료. 연관 세트 {len(deactivated_sets)}개 정지됨",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        import logging
+        logging.getLogger("admin.captcha.images").error(
+            f"[captcha/images/deactivate] 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"이미지 비활성화 실패: {e}")
+
+
+# ── 이미지 일괄 비활성화 ──────────────────────────────────────
+
+@router.put("/captcha/images/batch-deactivate", tags=["admin-captcha"])
+async def batch_deactivate_images(
+    body: dict,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """여러 이미지 일괄 비활성화 + 관련 세트 연쇄 비활성화
+
+    body: {"image_ids": ["uuid1", "uuid2", ...], "image_type": "emoji" | "photo"}
+    """
+    image_ids = body.get("image_ids", [])
+    image_type = body.get("image_type", "emoji")
+
+    if not image_ids:
+        raise HTTPException(status_code=400, detail="image_ids가 비어있습니다")
+    if image_type not in ("emoji", "photo"):
+        raise HTTPException(status_code=400, detail="image_type은 'emoji' 또는 'photo'여야 합니다")
+
+    try:
+        table = "emoji_images" if image_type == "emoji" else "real_photos"
+        column = "emoji_ids" if image_type == "emoji" else "photo_ids"
+
+        # 1) 이미지 일괄 비활성화
+        img_result = await db.execute(text(f"""
+            UPDATE {table}
+            SET is_active = false
+            WHERE id = ANY(:ids) AND is_active = true
+            RETURNING id
+        """), {"ids": image_ids})
+        deactivated_images = [str(r[0]) for r in img_result.fetchall()]
+
+        # 2) 각 이미지가 포함된 활성 세트 일괄 정지
+        total_sets_deactivated = 0
+        for img_id in deactivated_images:
+            sets_result = await db.execute(text(f"""
+                UPDATE captcha_sets
+                SET is_active = false
+                WHERE :image_id = ANY({column}) AND is_active = true
+                RETURNING id
+            """), {"image_id": img_id})
+            total_sets_deactivated += len(sets_result.fetchall())
+
+        await db.commit()
+
+        return {
+            "deactivated_images": len(deactivated_images),
+            "deactivated_sets": total_sets_deactivated,
+            "message": f"이미지 {len(deactivated_images)}장 비활성화, 관련 세트 {total_sets_deactivated}개 정지",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        import logging
+        logging.getLogger("admin.captcha.images").error(
+            f"[captcha/images/batch-deactivate] 실패: {type(e).__name__}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=f"일괄 비활성화 실패: {e}")
+
+
+# ── 이모지 자동 생성 + 세트 생성 ──────────────────────────────
+
+@router.post("/captcha/generate", tags=["admin-captcha"])
+async def generate_captcha_images(
+    body: dict,
+    current_user: User = Depends(require_user),
+):
+    """GAN 이모지 생성 → CLIP 필터 → MinIO 업로드 → DB 등록 → 세트 조합 (비동기 실행)
+
+    body: {
+        "num_per_category": 30,   # 카테고리당 생성 수 (10~100)
+        "num_sets": 50,           # 생성할 캡챠 세트 수
+        "categories": "bear,cat,dog,elephant,fox,rabbit,lion,penguin,tiger"  # 선택
+    }
+    """
+    import asyncio
+    import subprocess
+
+    num_per_category = body.get("num_per_category", 30)
+    num_sets = body.get("num_sets", 50)
+    cats = body.get("categories", "bear,cat,dog,elephant,fox,rabbit,lion,penguin,tiger")
+
+    # 범위 검증
+    if not (10 <= num_per_category <= 100):
+        raise HTTPException(status_code=400, detail="num_per_category는 10~100 사이여야 합니다")
+    if not (1 <= num_sets <= 500):
+        raise HTTPException(status_code=400, detail="num_sets는 1~500 사이여야 합니다")
+
+    # 이미 생성 중인지 확인 (Redis 락)
+    lock_key = "captcha:generate:running"
+    is_running = await redis_client.get(lock_key)
+    if is_running:
+        return {
+            "status": "already_running",
+            "message": "이미 생성이 진행 중입니다. 잠시 후 다시 시도해주세요.",
+        }
+
+    # 5분 락 설정
+    await redis_client.setex(lock_key, 300, "1")
+    await redis_client.set("captcha:generate:progress", "starting")
+
+    async def run_generate():
+        try:
+            await redis_client.set("captcha:generate:progress", "generating")
+
+            cmd = [
+                "python", "/home/ubuntu/ganpipeline/generate_and_register.py",
+                "--categories", cats,
+                "--num_per_category", str(num_per_category),
+                "--num_sets", str(num_sets),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd="/home/ubuntu/ganpipeline",
+            )
+            stdout, _ = await process.communicate()
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+
+            if process.returncode == 0:
+                await redis_client.set("captcha:generate:progress", "done")
+                await redis_client.setex("captcha:generate:last_result", 3600, output[-2000:])
+            else:
+                await redis_client.set("captcha:generate:progress", f"error: exit code {process.returncode}")
+                await redis_client.setex("captcha:generate:last_result", 3600, output[-2000:])
+        except Exception as e:
+            await redis_client.set("captcha:generate:progress", f"error: {str(e)[:200]}")
+        finally:
+            await redis_client.delete(lock_key)
+
+    # 백그라운드 실행
+    asyncio.create_task(run_generate())
+
+    return {
+        "status": "started",
+        "num_per_category": num_per_category,
+        "num_sets": num_sets,
+        "categories": cats,
+        "message": f"이모지 생성 시작 (카테고리당 {num_per_category}장, 세트 {num_sets}개)",
+    }
+
+
+@router.get("/captcha/generate/status", tags=["admin-captcha"])
+async def get_generate_status(
+    current_user: User = Depends(require_user),
+):
+    """이모지 생성 진행 상태 조회"""
+    progress = await redis_client.get("captcha:generate:progress")
+    last_result = await redis_client.get("captcha:generate:last_result")
+
+    if isinstance(progress, bytes):
+        progress = progress.decode()
+    if isinstance(last_result, bytes):
+        last_result = last_result.decode()
+
+    return {
+        "progress": progress or "idle",
+        "last_result": last_result,
+    }
