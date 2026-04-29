@@ -48,6 +48,7 @@ class PartyOut(BaseModel):
     logo_image_key: Optional[str] = None
     logo_image_url: Optional[str] = None
     member_count: int = 0
+    pending_count:int = 0
     is_joined: bool = False
     my_member_status: Optional[str] = None
     start_date: Optional[date] = None

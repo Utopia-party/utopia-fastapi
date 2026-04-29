@@ -94,6 +94,12 @@ def _party_member_count(party: Party) -> int:
         member_count += 1
     return member_count
 
+def _party_pending_count(party: Party) -> int:
+    """status가 'pending'인 대기 멤버 수를 계산"""
+    return sum(
+        1 for m in (party.members or [])
+        if (m.status or "").lower() == "pending"
+    )
 
 async def _sync_member_count(db: AsyncSession, party: Party) -> int:
     """PartyMember 테이블 기준으로 current_members 재계산 후 동기화
@@ -151,6 +157,7 @@ def _build_party_out(
         original_price=_service_original_price(svc),
         service_total_price=svc.original_price if svc else None,
         member_count=_party_member_count(party),
+        pending_count=_party_pending_count(party),
         logo_image_key=svc.logo_image_key if svc else None,
         logo_image_url=build_minio_asset_url(svc.logo_image_key) if svc else None,
         is_joined=is_joined,
