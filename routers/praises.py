@@ -16,8 +16,11 @@ from models.party import Party, PartyMember
 from models.user import User
 from models.user_praise import UserPraise
 from models.mypage.trust_score import TrustScore
+
+from models.notification import Notification
 from services.mypage.profile_service import _build_profile_image_url
 
+from services.notification_ws_service import notification_connection_manager
 
 router = APIRouter(prefix="/praises", tags=["praises"])
 
@@ -446,8 +449,41 @@ async def create_praise(
             praise_id=praise.id,
         )
 
+        notification = Notification(
+            user_id=to_user.id,
+            type="praise",
+            title="새로운 칭찬이 도착했어요! 🎉",
+            message=f"{current_user.nickname or '누군가'}님이 회원님을 칭찬했습니다.",
+            reference_type="user_praise",
+            reference_id=praise.id,
+            meta={"praise_type": payload.praise_type}
+        )
+
+        db.add(notification)
+
         await db.commit()
         await db.refresh(praise)
+        await db.refresh(notification)
+
+        await notification_connection_manager.send_to_user(
+            user_id=to_user.id,
+            payload={ 
+                "type": "notification_created",
+                "notification": {
+                    "id": str(notification.id),
+                    "user_id": str(notification.user_id),
+                    "type": notification.type,
+                    "title": notification.title,
+                    "message": notification.message,
+                    "reference_type": notification.reference_type,
+                    "reference_id": str(notification.reference_id) if notification.reference_id else None,
+                    "is_read": notification.is_read,
+                    "created_at": notification.created_at.isoformat(),
+                    "metadata": notification.meta 
+                }
+            }
+        )
+
 
     except IntegrityError:
         await db.rollback()
