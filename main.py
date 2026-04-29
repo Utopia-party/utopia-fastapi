@@ -233,7 +233,7 @@ async def admin_access_log_middleware(request: Request, call_next):
 
     response = await call_next(request)
 
-    if request.url.path.startswith("/api/admin"):
+    if request.url.path.startswith("/api/admin") and request.url.path != "/api/admin/logs":
         try:
             async with AsyncSessionLocal() as session:
                 session.add(

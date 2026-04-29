@@ -109,6 +109,7 @@ async def get_admin_logs(
     db: AsyncSession = Depends(get_db),
     keyword: str = Query(default=""),
     log_type: str = Query(default="", alias="type"),
+    actor_type: str = Query(default="", alias="actor_type"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
 ):
@@ -116,9 +117,9 @@ async def get_admin_logs(
 
     dt_from, dt_to = _date_range_bounds(date_from, date_to)
 
-    activity_stmt = select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(100)
-    system_stmt = select(SystemLog).order_by(SystemLog.created_at.desc()).limit(100)
-    moderation_stmt = select(ModerationAction).order_by(ModerationAction.created_at.desc()).limit(100)
+    activity_stmt = select(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(500)
+    system_stmt = select(SystemLog).order_by(SystemLog.created_at.desc()).limit(200)
+    moderation_stmt = select(ModerationAction).order_by(ModerationAction.created_at.desc()).limit(200)
 
     if dt_from:
         activity_stmt = activity_stmt.where(ActivityLog.created_at >= dt_from)
@@ -132,6 +133,15 @@ async def get_admin_logs(
     activity_rows = (await db.execute(activity_stmt)).scalars().all()
     system_rows = (await db.execute(system_stmt)).scalars().all()
     moderation_rows = (await db.execute(moderation_stmt)).scalars().all()
+
+    activity_rows = [
+        row
+        for row in activity_rows
+        if not (
+            row.action_type == "admin_access"
+            and ((row.extra_metadata or {}).get("path") == "/api/admin/logs")
+        )
+    ]
 
     actor_ids = {
         row.actor_user_id
@@ -147,17 +157,35 @@ async def get_admin_logs(
             await db.execute(select(User).where(User.id.in_(actor_ids)))
         ).scalars().all()
         users_by_id = {user.id: user for user in actor_users}
+    admin_user_ids = set(
+        (
+            await db.execute(select(AdminRole.user_id).where(AdminRole.user_id.in_(actor_ids)))
+        ).scalars().all()
+    ) if actor_ids else set()
 
     logs.extend(
         [
             SystemLogRecordOut(
                 id=str(row.id),
                 timestamp=_format_datetime(row.created_at),
-                type="ADMIN_ACTION",
+                type=(
+                    "ADMIN_ACTION"
+                    if row.actor_user_id in admin_user_ids or row.action_type == "admin_access"
+                    else "USER_ACTION"
+                    if row.actor_user_id is not None
+                    else "SYSTEM"
+                ),
                 message=row.description,
                 actor=_actor_display_name(
                     users_by_id.get(row.actor_user_id),
                     "system",
+                ),
+                actorType=(
+                    "admin"
+                    if row.actor_user_id in admin_user_ids or row.action_type == "admin_access"
+                    else "user"
+                    if row.actor_user_id is not None
+                    else "system"
                 ),
             )
             for row in activity_rows
@@ -175,6 +203,11 @@ async def get_admin_logs(
                     ((row.extra_metadata or {}).get("actor") if row.extra_metadata else None)
                     or row.service,
                 ),
+                actorType=(
+                    "admin"
+                    if row.admin_id in admin_user_ids or row.admin_id is not None
+                    else "system"
+                ),
             )
             for row in system_rows
         ]
@@ -190,6 +223,7 @@ async def get_admin_logs(
                     users_by_id.get(row.admin_id),
                     "system",
                 ),
+                actorType="admin",
             )
             for row in moderation_rows
         ]
@@ -199,16 +233,15 @@ async def get_admin_logs(
 
     q = keyword.lower().strip()
     lt = log_type.upper().strip()
-    if q or lt:
+    at = actor_type.lower().strip()
+    if q or lt or at:
         filtered: list[SystemLogRecordOut] = []
         for log in logs:
             if lt and log.type.upper() != lt:
                 continue
-            if q and not (
-                q in log.message.lower()
-                or q in log.actor.lower()
-                or q in log.type.lower()
-            ):
+            if at and log.actorType.lower() != at:
+                continue
+            if q and q not in log.actor.lower():
                 continue
             filtered.append(log)
         return filtered[:200]

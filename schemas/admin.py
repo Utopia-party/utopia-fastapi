@@ -285,6 +285,7 @@ class SystemLogRecordOut(BaseModel):
     type: str
     message: str
     actor: str
+    actorType: str
 
 class AdminPartyMemberOut(BaseModel):
     memberId: str        
