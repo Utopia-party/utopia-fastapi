@@ -79,6 +79,38 @@ async def lifespan(app: FastAPI):
                            OR can_approve_settlements = true
                     ';
 
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'admin_roles'
+                          AND column_name = 'can_approve_receipts'
+                    ) AND NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'admin_roles'
+                          AND column_name = 'can_manage_captcha'
+                    ) THEN
+                        EXECUTE '
+                            ALTER TABLE admin_roles
+                            RENAME COLUMN can_approve_receipts TO can_manage_captcha
+                        ';
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'admin_roles'
+                          AND column_name = 'can_manage_captcha'
+                    ) THEN
+                        EXECUTE '
+                            ALTER TABLE admin_roles
+                            ADD COLUMN can_manage_captcha BOOLEAN NOT NULL DEFAULT false
+                        ';
+                    END IF;
+
                     IF NOT EXISTS (
                         SELECT 1
                         FROM information_schema.columns
@@ -93,7 +125,7 @@ async def lifespan(app: FastAPI):
                         UPDATE admin_roles
                         SET can_manage_handocr = true
                         WHERE can_manage_admins = true
-                           OR can_approve_receipts = true
+                           OR can_manage_captcha = true
                     ';
 
                     IF EXISTS (

@@ -17,13 +17,22 @@ class AdminRole(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, unique=True
     )
+    can_view_dashboard: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     can_manage_users: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    can_manage_services: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     can_manage_parties: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    can_manage_quick_match: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     can_manage_reports: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     can_manage_moderation: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
     )
-    can_approve_receipts: Mapped[bool] = mapped_column(
+    can_manage_captcha: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
     )
     can_approve_settlements: Mapped[bool] = mapped_column(
@@ -36,6 +45,9 @@ class AdminRole(Base):
         Boolean, nullable=False, server_default="false"
     )
     can_view_logs: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    can_view_cloud_monitoring: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     can_manage_admins: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True

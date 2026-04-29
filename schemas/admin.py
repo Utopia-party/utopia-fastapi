@@ -99,8 +99,11 @@ class AdminRoleRecordOut(BaseModel):
     id: str
     userId: str
     adminId: str
+    canViewDashboard: bool
     canManageUsers: bool
+    canManageServices: bool
     canManageParties: bool
+    canManageQuickMatch: bool
     canManageReports: bool
     canManageChatModeration: bool
     canManageCaptcha: bool
@@ -108,14 +111,18 @@ class AdminRoleRecordOut(BaseModel):
     canManagePayments: bool
     canManageHandOcr: bool
     canViewLogs: bool
+    canViewCloudMonitoring: bool
     canManageAdmins: bool
     lastUpdated: str
     updatedBy: str
 
 
 class AdminRoleUpdateIn(BaseModel):
+    canViewDashboard: bool
     canManageUsers: bool
+    canManageServices: bool
     canManageParties: bool
+    canManageQuickMatch: bool
     canManageReports: bool
     canManageChatModeration: bool
     canManageCaptcha: bool
@@ -123,12 +130,16 @@ class AdminRoleUpdateIn(BaseModel):
     canManagePayments: bool
     canManageHandOcr: bool
     canViewLogs: bool
+    canViewCloudMonitoring: bool
     canManageAdmins: bool
 
 
 class AdminPermissionOut(BaseModel):
+    canViewDashboard: bool
     canManageUsers: bool
+    canManageServices: bool
     canManageParties: bool
+    canManageQuickMatch: bool
     canManageReports: bool
     canManageChatModeration: bool
     canManageCaptcha: bool
@@ -136,6 +147,7 @@ class AdminPermissionOut(BaseModel):
     canManagePayments: bool
     canManageHandOcr: bool
     canViewLogs: bool
+    canViewCloudMonitoring: bool
     canManageAdmins: bool
 
 
@@ -219,6 +231,7 @@ class AdminPartyRecordOut(BaseModel):
     service: str
     category: str
     leaderId: str
+    leaderNickname: str
     memberCount: int
     status: str
     reportCount: int

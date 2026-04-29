@@ -72,6 +72,7 @@ from services.notifications.report_notification_service import (
 from .deps import (
     AdminContext,
     require_admin_context,
+    require_admin_dashboard_permission,
     require_admin_user_permission,
     require_admin_party_permission,
     require_admin_report_permission,
@@ -105,7 +106,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 @router.get("/dashboard", response_model=AdminDashboardOut)
 async def get_admin_dashboard(
-    _: AdminContext = Depends(require_admin_context),
+    _: AdminContext = Depends(require_admin_dashboard_permission),
     db: AsyncSession = Depends(get_db),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),

@@ -226,27 +226,35 @@ def _admin_permissions_for_role(role: str) -> dict[str, Any]:
     role = role.upper()
     if role == "ROOT":
         return {
+            "can_view_dashboard": True,
             "can_manage_users": True,
+            "can_manage_services": True,
             "can_manage_parties": True,
+            "can_manage_quick_match": True,
             "can_manage_reports": True,
             "can_manage_moderation": True,
-            "can_approve_receipts": True,
+            "can_manage_captcha": True,
             "can_approve_settlements": True,
             "can_manage_payments": True,
             "can_manage_handocr": True,
             "can_view_logs": True,
+            "can_view_cloud_monitoring": True,
             "can_manage_admins": True,
         }
     return {
+        "can_view_dashboard": True,
         "can_manage_users": True,
+        "can_manage_services": True,
         "can_manage_parties": True,
+        "can_manage_quick_match": True,
         "can_manage_reports": True,
         "can_manage_moderation": True,
-        "can_approve_receipts": True,
+        "can_manage_captcha": True,
         "can_approve_settlements": True,
         "can_manage_payments": True,
         "can_manage_handocr": True,
         "can_view_logs": True,
+        "can_view_cloud_monitoring": True,
         "can_manage_admins": False,
     }
 
@@ -428,15 +436,19 @@ async def _append_system_log(
 
 def _admin_permissions_payload(payload: AdminRoleUpdateIn) -> dict[str, bool]:
     return {
+        "can_view_dashboard": payload.canViewDashboard,
         "can_manage_users": payload.canManageUsers,
+        "can_manage_services": payload.canManageServices,
         "can_manage_parties": payload.canManageParties,
+        "can_manage_quick_match": payload.canManageQuickMatch,
         "can_manage_reports": payload.canManageReports,
         "can_manage_moderation": payload.canManageChatModeration,
-        "can_approve_receipts": payload.canManageCaptcha,
+        "can_manage_captcha": payload.canManageCaptcha,
         "can_approve_settlements": payload.canApproveSettlements,
         "can_manage_payments": payload.canManagePayments,
         "can_manage_handocr": payload.canManageHandOcr,
         "can_view_logs": payload.canViewLogs,
+        "can_view_cloud_monitoring": payload.canViewCloudMonitoring,
         "can_manage_admins": payload.canManageAdmins,
     }
 
@@ -447,15 +459,19 @@ def _has_any_admin_permission(values: dict[str, bool]) -> bool:
 
 def _serialize_admin_permissions(role: AdminRole) -> AdminPermissionOut:
     return AdminPermissionOut(
+        canViewDashboard=role.can_view_dashboard,
         canManageUsers=role.can_manage_users,
+        canManageServices=role.can_manage_services,
         canManageParties=role.can_manage_parties,
+        canManageQuickMatch=role.can_manage_quick_match,
         canManageReports=role.can_manage_reports,
         canManageChatModeration=role.can_manage_moderation,
-        canManageCaptcha=role.can_approve_receipts,
+        canManageCaptcha=role.can_manage_captcha,
         canApproveSettlements=role.can_approve_settlements,
         canManagePayments=role.can_manage_payments,
         canManageHandOcr=role.can_manage_handocr,
         canViewLogs=role.can_view_logs,
+        canViewCloudMonitoring=role.can_view_cloud_monitoring,
         canManageAdmins=role.can_manage_admins,
     )
 
@@ -465,15 +481,19 @@ def _serialize_admin_role(role: AdminRole, user: User, created_by: User | None) 
         id=str(role.id),
         userId=str(user.id),
         adminId=user.nickname or user.email,
+        canViewDashboard=role.can_view_dashboard,
         canManageUsers=role.can_manage_users,
+        canManageServices=role.can_manage_services,
         canManageParties=role.can_manage_parties,
+        canManageQuickMatch=role.can_manage_quick_match,
         canManageReports=role.can_manage_reports,
         canManageChatModeration=role.can_manage_moderation,
-        canManageCaptcha=role.can_approve_receipts,
+        canManageCaptcha=role.can_manage_captcha,
         canApproveSettlements=role.can_approve_settlements,
         canManagePayments=role.can_manage_payments,
         canManageHandOcr=role.can_manage_handocr,
         canViewLogs=role.can_view_logs,
+        canViewCloudMonitoring=role.can_view_cloud_monitoring,
         canManageAdmins=role.can_manage_admins,
         lastUpdated=_format_datetime(role.updated_at),
         updatedBy=(created_by.nickname or created_by.email) if created_by else "system",
@@ -648,10 +668,28 @@ async def require_admin_user_permission(
     return _assert_admin_permission(admin, "can_manage_users", "사용자 관리 권한이 없습니다.")
 
 
+async def require_admin_dashboard_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_view_dashboard", "대시보드 조회 권한이 없습니다.")
+
+
+async def require_admin_service_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_manage_services", "구독 서비스 관리 권한이 없습니다.")
+
+
 async def require_admin_party_permission(
     admin: AdminContext = Depends(require_admin_context),
 ) -> AdminContext:
     return _assert_admin_permission(admin, "can_manage_parties", "파티 관리 권한이 없습니다.")
+
+
+async def require_admin_quick_match_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(admin, "can_manage_quick_match", "빠른매칭 관리 권한이 없습니다.")
 
 
 async def require_admin_report_permission(
@@ -663,7 +701,7 @@ async def require_admin_report_permission(
 async def require_admin_receipt_permission(
     admin: AdminContext = Depends(require_admin_context),
 ) -> AdminContext:
-    return _assert_admin_permission(admin, "can_approve_receipts", "영수증 승인 권한이 없습니다.")
+    return _assert_admin_permission(admin, "can_manage_captcha", "캡챠 관리 권한이 없습니다.")
 
 
 async def require_admin_settlement_permission(
@@ -688,6 +726,16 @@ async def require_admin_log_permission(
     admin: AdminContext = Depends(require_admin_context),
 ) -> AdminContext:
     return _assert_admin_permission(admin, "can_view_logs", "시스템 로그 조회 권한이 없습니다.")
+
+
+async def require_admin_cloud_monitor_permission(
+    admin: AdminContext = Depends(require_admin_context),
+) -> AdminContext:
+    return _assert_admin_permission(
+        admin,
+        "can_view_cloud_monitoring",
+        "클라우드 모니터링 조회 권한이 없습니다.",
+    )
 
 
 async def require_admin_moderation_permission(

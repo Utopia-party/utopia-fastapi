@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select, text
@@ -68,6 +69,9 @@ from services.notifications.report_notification_service import (
     notify_report_warning_to_target,
     notify_report_penalty_to_target,
 )
+from services.notifications.party_notification_service import (
+    notify_party_member_kicked,
+)
 
 from .deps import (
     AdminContext,
@@ -102,6 +106,22 @@ from .deps import (
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+async def _recalculate_party_member_count(db: AsyncSession, party: Party) -> int:
+    active_user_ids = set(
+        (
+            await db.execute(
+                select(PartyMember.user_id).where(
+                    PartyMember.party_id == party.id,
+                    PartyMember.status == "active",
+                )
+            )
+        ).scalars().all()
+    )
+    if party.leader_id:
+        active_user_ids.add(party.leader_id)
+    return len(active_user_ids)
 
 @router.get("/parties", response_model=list[AdminPartyRecordOut])
 async def get_admin_parties(
@@ -169,7 +189,8 @@ async def get_admin_parties(
                 createdAt=_format_datetime(party.created_at),
                 service=service.name,
                 category=service.category,
-                leaderId=user.nickname,
+                leaderId=str(user.id),
+                leaderNickname=user.nickname,
                 memberCount=party.current_members,
                 status=status_label,
                 reportCount=int(report_count),
@@ -241,7 +262,8 @@ async def force_end_admin_party(
         createdAt=_format_datetime(party.created_at),
         service=service.name if service else "-",
         category=service.category if service else "-",
-        leaderId=host.nickname if host else str(party.leader_id),
+        leaderId=str(host.id) if host else str(party.leader_id),
+        leaderNickname=host.nickname if host else str(party.leader_id),
         memberCount=party.current_members,
         status=_party_status_label(party, int(report_count)),
         reportCount=int(report_count),
@@ -330,9 +352,7 @@ async def kick_admin_party_member(
 
     # 멤버 강퇴 처리
     member_row.status = "kicked"
-    member_row.left_at = datetime.now(timezone.utc)
-    if party.current_members and party.current_members > 0:
-        party.current_members -= 1
+    member_row.left_at = func.now()
 
     # 파티장 강퇴 시 → 가장 오래된 active 멤버를 새 파티장으로 승격
     new_leader_user: User | None = None
@@ -371,18 +391,14 @@ async def kick_admin_party_member(
             party.status = "ended"
             party.end_date = datetime.now(timezone.utc).date()
 
-    # 강퇴 알림
-    if target_user:
-        db.add(
-            Notification(
-                user_id=target_uuid,
-                type="PARTY",
-                title="파티 강퇴 안내",
-                message=f"관리자에 의해 '{party.title}' 파티에서 강퇴되었습니다. 사유: {payload.reason or '운영 정책 위반'}",
-                reference_type="party",
-                reference_id=party.id,
-            )
-        )
+    party.current_members = await _recalculate_party_member_count(db, party)
+
+    await notify_party_member_kicked(
+        db=db,
+        party=party,
+        target_user_id=target_uuid,
+        reason=payload.reason or "운영 정책 위반",
+    )
 
     desc_extra = f" (신규 파티장: {new_leader_user.nickname})" if new_leader_user else ""
     await _append_activity_log(
