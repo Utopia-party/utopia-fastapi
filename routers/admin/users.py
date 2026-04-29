@@ -72,6 +72,7 @@ from services.notifications.report_notification_service import (
 from .deps import (
     AdminContext,
     require_admin_context,
+    require_admin_service_permission,
     require_admin_user_permission,
     require_admin_party_permission,
     require_admin_report_permission,
@@ -303,7 +304,7 @@ async def get_admin_user_detail(
 
 @router.get("/services", response_model=list[AdminServiceRecordOut])
 async def get_admin_services(
-    _: AdminContext = Depends(require_admin_party_permission),
+    _: AdminContext = Depends(require_admin_service_permission),
     db: AsyncSession = Depends(get_db),
 ):
     creator = aliased(User)
@@ -320,7 +321,7 @@ async def get_admin_services(
 async def update_admin_service(
     service_id: str,
     payload: AdminServiceUpdateIn,
-    admin: AdminContext = Depends(require_admin_party_permission),
+    admin: AdminContext = Depends(require_admin_service_permission),
     db: AsyncSession = Depends(get_db),
 ):
     service = await db.get(Service, service_id)

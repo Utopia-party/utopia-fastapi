@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 from core.config import settings
-from routers.admin.deps import require_admin_context
+from routers.admin.deps import require_admin_cloud_monitor_permission
 
 router = APIRouter(prefix="/admin/cloud-monitor", tags=["admin-cloud-monitor"])
 
@@ -60,7 +60,7 @@ def _extract_values(prom_result: dict) -> list:
 
 
 @router.get("/summary")
-async def get_cloud_summary(_: object = Depends(require_admin_context)):
+async def get_cloud_summary(_: object = Depends(require_admin_cloud_monitor_permission)):
     """서버별 CPU / 메모리 / 네트워크 현재값 요약 (병렬 요청)"""
     METRIC_LABELS = [
         ("cpu_usage",               "cpu"),
@@ -101,7 +101,7 @@ async def get_metric_range(
     step: str = "60",
     service_type: str = "server",
     instance_id: str = "",
-    _: object = Depends(require_admin_context),
+    _: object = Depends(require_admin_cloud_monitor_permission),
 ):
     """
     특정 메트릭 시계열 데이터 조회
@@ -135,7 +135,7 @@ async def get_metric_range(
 
 
 @router.get("/lb")
-async def get_lb_metrics(_: object = Depends(require_admin_context)):
+async def get_lb_metrics(_: object = Depends(require_admin_cloud_monitor_permission)):
     """로드밸런서 트래픽 현재값"""
     metrics = {}
     for metric_name, label in [
@@ -154,7 +154,7 @@ async def get_lb_metrics(_: object = Depends(require_admin_context)):
 
 
 @router.get("/debug/labels")
-async def debug_metric_labels(_: object = Depends(require_admin_context)):
+async def debug_metric_labels(_: object = Depends(require_admin_cloud_monitor_permission)):
     """실제 메트릭 레이블 키 확인용 (인스턴스명 문제 디버깅)"""
     result = await _query_metric("cpu_usage")
     raw = result.get("data", {}).get("result", [])
@@ -163,7 +163,7 @@ async def debug_metric_labels(_: object = Depends(require_admin_context)):
 
 
 @router.get("/debug/raw")
-async def debug_raw_values(_: object = Depends(require_admin_context)):
+async def debug_raw_values(_: object = Depends(require_admin_cloud_monitor_permission)):
     """disk_used, disk_total, mem_used, mem_total 실제 값 확인"""
     result = {}
     for m in ["disk_used", "disk_total", "mem_used", "mem_total"]:
@@ -177,7 +177,7 @@ async def debug_raw_values(_: object = Depends(require_admin_context)):
 
 
 @router.get("/debug/disk-unit")
-async def debug_disk_unit(_: object = Depends(require_admin_context)):
+async def debug_disk_unit(_: object = Depends(require_admin_cloud_monitor_permission)):
     """disk_used, disk_total 실제 raw 값 확인 (단위 파악용)"""
     out = {}
     for m in ["disk_used", "disk_total", "mem_used", "mem_total"]:

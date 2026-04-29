@@ -58,8 +58,7 @@ async def require_admin_user(
         )
 
     if not (
-        role.can_manage_parties
-        or role.can_view_logs
+        role.can_manage_quick_match
         or role.can_manage_admins
     ):
         raise HTTPException(
