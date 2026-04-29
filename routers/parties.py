@@ -43,6 +43,18 @@ logger = logging.getLogger(__name__)
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
+async def _broadcast_party_updated(party_id: uuid.UUID) -> None:
+    try:
+        from routers.chat import manager
+        from datetime import datetime, timezone
+        await manager.broadcast(str(party_id), {
+            "type": "party_updated",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"[party_updated broadcast failed] {e}")
+
+
 async def create_activity_log(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -339,7 +351,7 @@ async def create_party(
 
     await consume_captcha_pass_token(body.captcha_pass_token)
 
-    base_per_person = svc.monthly_price / max_members
+    base_per_person = (svc.original_price or svc.monthly_price) / max_members
     commission = svc.commission_rate or 0.0
     monthly_per_person = round(base_per_person * (1 + commission))
 
@@ -576,6 +588,7 @@ async def leave_party(
         logger.error(f"Error leaving party: {e}")
         raise HTTPException(status_code=500, detail="파티 탈퇴 처리 중 오류가 발생했습니다.")
 
+    await _broadcast_party_updated(party_id)
     return MessageOut(message="파티에서 탈퇴했습니다.")
 
 
@@ -619,6 +632,7 @@ async def kick_member(
         target_user_id=user_id,
     )
 
+    await _broadcast_party_updated(party_id)
     return MessageOut(message="멤버를 강퇴했습니다.")
 
 
@@ -755,6 +769,7 @@ async def approve_application(
         join_type=target.join_type,
     )
 
+    await _broadcast_party_updated(party_id)
     return MessageOut(message="신청을 승인했습니다.")
 
 
