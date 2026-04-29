@@ -59,7 +59,7 @@ def _party_member_count(party: Party, members: list[dict]) -> int:
 
 def _party_total_price(party: Party, service: Service | None) -> int | None:
     if service is not None:
-        return service.monthly_price
+        return service.original_price or service.monthly_price
     max_members = _party_max_members(party, service)
     if party.monthly_per_person is not None and max_members:
         return party.monthly_per_person * max_members

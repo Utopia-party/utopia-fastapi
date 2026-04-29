@@ -699,6 +699,16 @@ class QuickMatchService:
                 total_match_elapsed if total_match_elapsed is not None else -1.0,
             )
 
+            try:
+                from routers.chat import manager
+                from datetime import timezone
+                await manager.broadcast(str(party.id), {
+                    "type": "party_updated",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                logger.warning(f"[party_updated broadcast failed] {e}")
+
             return {
                 "party_member_id": new_member.id,
                 "party_id": party.id,
