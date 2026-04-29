@@ -1,9 +1,3 @@
-"""
-마이페이지 — 내 파티 목록 (v2 신규)
-
-- 내가 리더이거나 active 멤버인 파티 전부 반환
-- is_owner 플래그로 프론트에서 '내가 만든 파티' 배지 / 리더 전용 버튼 렌더링
-"""
 import uuid
 from typing import List
 
@@ -27,10 +21,8 @@ async def list_my_parties(
     current_user: User = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # 1) 내가 리더인 party_id 수집
     leader_q = select(Party.id).where(Party.leader_id == current_user.id)
 
-    # 2) 내가 active 멤버인 party_id 수집
     member_q = (
         select(PartyMember.party_id)
         .where(
@@ -39,7 +31,6 @@ async def list_my_parties(
         )
     )
 
-    # union
     party_id_rows = await db.execute(
         select(Party.id)
         .where(or_(Party.id.in_(leader_q), Party.id.in_(member_q)))
@@ -49,7 +40,6 @@ async def list_my_parties(
     if not party_ids:
         return MyPartyListOut(parties=[])
 
-    # 3) 해당 파티들 full load
     result = await db.execute(
         select(Party)
         .options(
@@ -65,9 +55,14 @@ async def list_my_parties(
     items: list[MyPartyOut] = []
     for p in parties:
         base = _build_party_out(p, current_user.id)
+        has_referrer_discount = False
+        if current_user.referrer_id is not None:
+            member_user_ids = {m.user_id for m in (p.members or [])}
+            has_referrer_discount = current_user.referrer_id in member_user_ids
         items.append(MyPartyOut(
             **base.model_dump(),
             is_owner=(p.leader_id == current_user.id),
+            has_referrer_discount=has_referrer_discount,
         ))
 
     return MyPartyListOut(parties=items)

@@ -83,12 +83,16 @@ def _party_max_members(party: Party, service: Service | None) -> int | None:
     return party.max_members or (service.max_members if service else None)
 
 def _party_member_count(party: Party) -> int:
-    # 항상 실제 members 관계로 계산 (current_members 캐시 미신뢰)
-    # 방장도 PartyMember에 role=leader로 포함되므로 +1 없이 COUNT
-    return sum(
+    member_count = sum(
         1 for m in (party.members or [])
         if (m.status or "active").lower() == "active"
     )
+    leader_in_members = any(
+        m.user_id == party.leader_id for m in (party.members or [])
+    )
+    if party.leader_id and not leader_in_members:
+        member_count += 1
+    return member_count
 
 
 async def _sync_member_count(db: AsyncSession, party: Party) -> int:
@@ -155,6 +159,8 @@ def _build_party_out(
         end_date=party.end_date,
         min_trust_score=party.min_trust_score,
         created_at=party.created_at,
+        leader_discount_rate=float(svc.leader_discount_rate) if svc and svc.leader_discount_rate else None,
+        has_referrer_discount=False,
     )
 
 
