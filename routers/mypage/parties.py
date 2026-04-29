@@ -57,8 +57,11 @@ async def list_my_parties(
         base = _build_party_out(p, current_user.id)
         has_referrer_discount = False
         if current_user.referrer_id is not None:
-            member_user_ids = {m.user_id for m in (p.members or [])}
-            has_referrer_discount = current_user.referrer_id in member_user_ids
+            if p.leader_id == current_user.referrer_id:
+                has_referrer_discount = True
+            else:
+                member_user_ids = {m.user_id for m in (p.members or [])}
+                has_referrer_discount = current_user.referrer_id in member_user_ids
         dumped = base.model_dump()
         dumped['has_referrer_discount'] = has_referrer_discount
         items.append(MyPartyOut(
