@@ -3,11 +3,13 @@ from pydantic import BaseModel, Field
 
 INT32_MAX = 1_000_000
 
+
 # 관리자 신고 관련 알림
 class AdminReportStatusUpdateIn(BaseModel):
     status: str
     actionResultCode: str = "NONE"
     adminMemo: str | None = None
+
 
 class DashboardMetricOut(BaseModel):
     id: str
@@ -203,6 +205,12 @@ class AdminUserDetailOut(BaseModel):
     trustScore: float
     reportCount: int
     partyCount: int
+
+    referrerId: str | None = None
+    referrerNickname: str | None = None
+    referrerName: str | None = None
+    referrerCount: int = 0
+
     createdAt: str | None = None
     lastActive: str | None = None
     bannedUntil: str | None = None
@@ -221,6 +229,11 @@ class AdminUserStatusUpdateIn(BaseModel):
 
 class AdminUserTrustScoreUpdateIn(BaseModel):
     trustScore: float
+    reason: str | None = None
+
+
+class AdminUserRecommenderUpdateIn(BaseModel):
+    referrerNickname: str | None = None
     reason: str | None = None
 
 
@@ -289,22 +302,26 @@ class SystemLogRecordOut(BaseModel):
     actorType: str
     ipAddress: str | None = None
 
+
 class AdminPartyMemberOut(BaseModel):
-    memberId: str        
+    memberId: str
     userId: str
     nickname: str
     name: str | None = None
-    role: str           
-    status: str          
+    role: str
+    status: str
     trustScore: float
     joinedAt: str
     leftAt: str | None = None
 
+
 class AdminPartyMemberKickIn(BaseModel):
     reason: str | None = None
 
+
 class AdminPartyMemberRoleIn(BaseModel):
-    role: str            
+    role: str
+
 
 class ChatModerationLogOut(BaseModel):
     id: str
@@ -321,18 +338,51 @@ class ChatModerationLogOut(BaseModel):
     createdAt: str
     warnCount: int | None = None
 
+
 class ChatModerationStatsOut(BaseModel):
     totalFlagged: int
     blocked: int
     warned: int
     falsePositive: int
     pending: int
-    detectionRate: float   
+    detectionRate: float
+
 
 class UserStatusLogOut(BaseModel):
     id: str
-    toStatus: str          
-    changedBy: str         
+    toStatus: str
+    changedBy: str
     reason: str | None = None
-    trigger: str           
+    trigger: str
     createdAt: str
+
+
+class AdminOperationLogOut(BaseModel):
+    id: str
+    type: str
+    userId: str
+
+    beforeStatus: str | None = None
+    afterStatus: str | None = None
+
+    sanctionType: str | None = None
+    sanctionDurationDays: int | None = None
+
+    reportId: str | None = None
+    reportReason: str | None = None
+    reportTargetUserId: str | None = None
+
+    beforeTrustScore: float | None = None
+    afterTrustScore: float | None = None
+
+    beforeRecommenderId: str | None = None
+    afterRecommenderId: str | None = None
+
+    reason: str | None = None
+    adminId: str | None = None
+    createdAt: str
+
+
+class AdminOperationLogListOut(BaseModel):
+    logs: list[AdminOperationLogOut]
+    total: int

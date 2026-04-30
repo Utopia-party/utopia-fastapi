@@ -5,7 +5,7 @@ from typing import Any
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -30,7 +30,7 @@ from models.payment import Payment
 from models.quick_match.request import QuickMatchRequest
 from models.refresh_token import RefreshToken
 from models.mypage.trust_score import TrustScore
-from models.user import User
+from models.user import User, UserReferrer
 from schemas.admin import (
     AdminDashboardOut,
     AdminModerationHistoryOut,
@@ -56,6 +56,7 @@ from schemas.admin import (
     AdminUserStatusLogOut,
     AdminUserTrustHistoryOut,
     AdminUserTrustScoreUpdateIn,
+    AdminUserRecommenderUpdateIn,
     AdminUserStatusUpdateIn,
     DashboardSeriesPointOut,
     ReceiptRecordOut,
@@ -63,6 +64,7 @@ from schemas.admin import (
     SettlementRecordOut,
     SystemLogRecordOut,
     UserStatusLogOut,
+    AdminOperationLogListOut,
 )
 from services.notifications.report_notification_service import (
     notify_report_result_to_reporter,
@@ -70,6 +72,7 @@ from services.notifications.report_notification_service import (
     notify_report_penalty_to_target,
 )
 
+from services.admin.admin_user_service import get_admin_user_operation_logs_service
 from .deps import (
     AdminContext,
     require_admin_context,
@@ -257,6 +260,10 @@ async def get_admin_user_detail(
         ).scalars().all()
         moderation_actors = {actor.id: actor for actor in actor_rows}
 
+    referrer_user = None
+    if user.referrer_id:
+        referrer_user = await db.get(User, user.referrer_id)
+
     return AdminUserDetailOut(
         id=str(user.id),
         email=user.email,
@@ -268,6 +275,10 @@ async def get_admin_user_detail(
         trustScore=float(user.trust_score) if user.trust_score is not None else 36.5,
         reportCount=int(report_count),
         partyCount=int(party_count),
+        referrerId=str(user.referrer_id) if user.referrer_id else None,
+        referrerNickname=referrer_user.nickname if referrer_user else None,
+        referrerName=referrer_user.name if referrer_user else None,
+        referrerCount=int(user.referrer_count or 0),
         createdAt=_format_datetime(user.created_at),
         lastActive=_format_datetime(user.last_login_at or user.updated_at),
         bannedUntil=_format_datetime(user.banned_until) if user.banned_until else None,
@@ -310,6 +321,26 @@ async def get_admin_user_detail(
         ],
     )
 
+
+@router.get(
+    "/users/{user_id}/operation-logs",
+    response_model=AdminOperationLogListOut,
+)
+async def get_admin_user_operation_logs(
+    user_id: str,
+    _: AdminContext = Depends(require_admin_user_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    user_uuid = _parse_user_id_or_400(user_id)
+
+    target_user = await db.get(User, user_uuid)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+    return await get_admin_user_operation_logs_service(
+        db,
+        target_user_id=user_uuid,
+    )
 
 @router.get("/services", response_model=list[AdminServiceRecordOut])
 async def get_admin_services(
@@ -545,6 +576,113 @@ async def update_admin_user_trust_score(
         actor=admin.user.nickname,
         admin_id=admin.user.id,
     )
+    await db.commit()
+
+    return await get_admin_user_detail(str(user_uuid), admin, db)
+
+
+@router.patch("/users/{user_id}/recommender", response_model=AdminUserDetailOut)
+async def update_admin_user_recommender(
+    user_id: str,
+    payload: AdminUserRecommenderUpdateIn,
+    admin: AdminContext = Depends(require_admin_user_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    user_uuid = _parse_user_id_or_400(user_id)
+    target_user = await db.get(User, user_uuid)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+
+    referrer_nickname = (payload.referrerNickname or "").strip()
+
+    if not referrer_nickname:
+        await db.execute(
+            delete(UserReferrer).where(UserReferrer.user_id == target_user.id)
+        )
+
+        target_user.referrer_id = None
+        target_user.referrer_count = 0
+
+        await _append_activity_log(
+            db,
+            actor_user_id=admin.user.id,
+            action_type="REFERRER_UPDATED",
+            description=(
+                f"{target_user.nickname} 추천인을 제거"
+                f"{f' ({payload.reason.strip()})' if payload.reason and payload.reason.strip() else ''}"
+            ),
+            path=f"/api/admin/users/{user_id}/recommender",
+            target_id=target_user.id,
+            reason=payload.reason,
+        )
+
+        await _append_system_log(
+            db,
+            level="INFO",
+            service="admin",
+            message=f"사용자 추천인 제거: {target_user.nickname}",
+            actor=admin.user.nickname,
+            admin_id=admin.user.id,
+        )
+
+        await db.commit()
+        return await get_admin_user_detail(str(user_uuid), admin, db)
+
+    referrer_user = await db.scalar(
+        select(User).where(
+            User.nickname == referrer_nickname,
+            User.is_active.is_(True),
+        )
+    )
+
+    if not referrer_user:
+        raise HTTPException(
+            status_code=400,
+            detail="존재하지 않는 추천인이거나 비활성화된 사용자입니다.",
+        )
+
+    if referrer_user.id == target_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="자기 자신은 추천인으로 설정할 수 없습니다.",
+        )
+
+    await db.execute(
+        delete(UserReferrer).where(UserReferrer.user_id == target_user.id)
+    )
+
+    db.add(
+        UserReferrer(
+            user_id=target_user.id,
+            referrer_id=referrer_user.id,
+        )
+    )
+
+    target_user.referrer_id = referrer_user.id
+    target_user.referrer_count = 1
+
+    await _append_activity_log(
+        db,
+        actor_user_id=admin.user.id,
+        action_type="REFERRER_UPDATED",
+        description=(
+            f"{target_user.nickname} 추천인을 {referrer_user.nickname}(으)로 변경"
+            f"{f' ({payload.reason.strip()})' if payload.reason and payload.reason.strip() else ''}"
+        ),
+        path=f"/api/admin/users/{user_id}/recommender",
+        target_id=target_user.id,
+        reason=payload.reason,
+    )
+
+    await _append_system_log(
+        db,
+        level="INFO",
+        service="admin",
+        message=f"사용자 추천인 변경: {target_user.nickname} -> {referrer_user.nickname}",
+        actor=admin.user.nickname,
+        admin_id=admin.user.id,
+    )
+
     await db.commit()
 
     return await get_admin_user_detail(str(user_uuid), admin, db)

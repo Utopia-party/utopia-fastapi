@@ -4,11 +4,9 @@ import asyncio
 import logging
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import AsyncSessionLocal
 from models.party import Party
-from models.notification import Notification
 
 from services.quick_match.party_embedding_service import PartyEmbeddingService
 
@@ -19,7 +17,7 @@ logger = logging.getLogger(__name__)
 async def backfill_party_embeddings() -> None:
     sync_service = PartyEmbeddingService()
 
-    async with AsyncSessionLocal() as db:  # type: AsyncSession
+    async with AsyncSessionLocal() as db:
         result = await db.execute(select(Party.id))
         party_ids = result.scalars().all()
 
