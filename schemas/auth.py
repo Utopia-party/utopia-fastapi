@@ -206,3 +206,6 @@ class UpdateMyReferrersRequest(BaseModel):
 class UpdateMyReferrersResponse(BaseModel):
     message: str
     referrers: list[ReferrerOut]
+
+class RandomNicknameResponse(BaseModel):
+    nickname: str

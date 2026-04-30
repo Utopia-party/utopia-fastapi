@@ -34,6 +34,7 @@ from schemas.auth import (
     ResetPasswordResponse,
     SocialLoginBody,
     SocialSignupBody,
+    RandomNicknameResponse,
 )
 from services.auth_service import (
     get_password_hash,
@@ -60,6 +61,32 @@ from services.mypage.profile_service import (
 )
 
 router = APIRouter(tags=["auth"])
+
+NICKNAME_ADJECTIVES = [
+    "즐거운",
+    "신나는",
+    "따뜻한",
+    "용감한",
+    "귀여운",
+    "활발한",
+]
+
+NICKNAME_NOUNS = [
+    "고양이",
+    "토끼",
+    "여우",
+    "펭귄",
+    "호랑이",
+    "강아지",
+]
+
+
+def create_random_nickname() -> str:
+    adjective = random.choice(NICKNAME_ADJECTIVES)
+    noun = random.choice(NICKNAME_NOUNS)
+    number = random.randint(100, 9999)
+
+    return f"{adjective}{noun}{number}"
 
 conf = ConnectionConfig(
     MAIL_USERNAME=settings.MAIL_USERNAME,
@@ -680,6 +707,22 @@ async def find_id(
         return FindIdResponse(message="일치하는 계정을 찾지 못했습니다.")
 
     return FindIdResponse(email=user.email)
+
+@router.get("/users/random-nickname", response_model=RandomNicknameResponse)
+async def get_random_nickname(db: AsyncSession = Depends(get_db)):
+    for _ in range(10):
+        nickname = create_random_nickname()
+
+        result = await db.execute(
+            select(User).where(User.nickname == nickname)
+        )
+
+        if result.scalar_one_or_none() is None:
+            return RandomNicknameResponse(nickname=nickname)
+
+    fallback_nickname = f"user_{uuid.uuid4().hex[:8]}"
+
+    return RandomNicknameResponse(nickname=fallback_nickname)
 
 @router.post("/users/find-password", response_model=FindPasswordResponse)
 async def find_password(
