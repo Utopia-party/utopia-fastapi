@@ -72,6 +72,7 @@ jobs:
             pip install -r requirements.txt
 
             pkill -f "uvicorn main:app" || true
+            pkill -f "celery worker" || true
             sleep 2
 
             nohup uvicorn main:app \
@@ -79,5 +80,8 @@ jobs:
               --port 8000 \
               >> /home/ubuntu/fastapi/utopia-fastapi-main/server.log 2>&1 &
 
+            nohup celery -A core.celery_app.celery_app worker \
+              --loglevel=info \
+              >> /home/ubuntu/fastapi/utopia-fastapi-main/celery.log 2>&1 &
             echo "✅ 배포 완료 $(date)"
           ENDSSH
