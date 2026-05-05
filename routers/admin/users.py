@@ -465,7 +465,6 @@ async def update_admin_user_status(
 
     # 정지 처리 시 웹소켓으로 강제 로그아웃 발송
     if payload.status == "정지":
-        from datetime import timezone as tz
         await notification_connection_manager.send_to_user(
             target_user.id,
             {

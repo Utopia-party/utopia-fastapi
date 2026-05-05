@@ -336,7 +336,6 @@ async def update_admin_report_status(
                     ),
                 )
                 # 정지 확정 시 웹소켓으로 강제 로그아웃 발송
-                from datetime import datetime, timezone
                 await notification_connection_manager.send_to_user(
                     updated_report.target_id,
                     {

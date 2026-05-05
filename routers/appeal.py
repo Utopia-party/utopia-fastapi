@@ -1,9 +1,9 @@
 """
 이의제기 라우터
-- POST /api/appeals          유저: 이의제기 신청 (정지 상태에서도 가능)
-- GET  /api/appeals/my       유저: 내 이의제기 목록
-- GET  /api/admin/appeals    관리자: 전체 목록
-- PATCH /api/admin/appeals/{id}  관리자: 승인/거부
+- POST   /api/appeals                유저: 이의제기 신청 (정지 상태에서도 가능)
+- GET    /api/appeals/my             유저: 내 이의제기 목록
+- GET    /api/admin/appeals          관리자: 전체 목록
+- PATCH  /api/admin/appeals/{id}     관리자: 승인/거부
 """
 import uuid
 from datetime import datetime, timezone
@@ -18,7 +18,7 @@ from core.security import get_current_user
 from models.admin import AdminRole, ModerationAction
 from models.appeal import BanAppeal
 from models.mypage.trust_score import TrustScore
-from models.notification import Notification
+from models.refresh_token import RefreshToken
 from models.user import User
 from schemas.appeal import (
     AdminAppealOut,
@@ -35,16 +35,34 @@ from routers.admin.deps import (
     AdminContext,
     require_admin_context,
     _append_activity_log,
-    _format_datetime,
 )
 
 router = APIRouter(tags=["appeals"])
+
+# ban_type 상수
+BAN_TYPE_IP = "ip_ban"
+BAN_TYPE_TRUST = "trust_score"
+BAN_TYPE_MANUAL = "manual"
+BAN_TYPE_REPORT = "report"
 
 
 def _fmt(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def _to_appeal_out(a: BanAppeal) -> AppealOut:
+    return AppealOut(
+        id=str(a.id),
+        user_id=str(a.user_id),
+        ban_type=a.ban_type,
+        ban_reference_id=str(a.ban_reference_id) if a.ban_reference_id else None,
+        reason=a.reason,
+        status=a.status,
+        admin_memo=a.admin_memo,
+        created_at=_fmt(a.created_at),
+    )
 
 
 # ── 유저: 이의제기 신청 ──────────────────────────────────────────────────────
@@ -57,18 +75,19 @@ async def create_appeal(
     if not current_user:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
 
-    # 이미 접수된 동일 제재 건 중복 차단
     ref_id = uuid.UUID(payload.ban_reference_id) if payload.ban_reference_id else None
 
+    # 중복 차단
     if ref_id is not None:
-        # reference_id가 있으면 동일 제재 건 기준
+        # reference_id 있으면 동일 제재 건 기준
         dup_filter = (
             BanAppeal.user_id == current_user.id,
             BanAppeal.ban_reference_id == ref_id,
             BanAppeal.status.in_(["PENDING", "APPROVED"]),
         )
     else:
-        # ip_ban / manual 등 reference_id 없는 경우 → ban_type 기준으로 중복 차단
+        # ip_ban / manual 등 reference_id 없는 경우 → ban_type 기준
+        # (NULL = NULL은 DB에서 false라 코드 레벨에서 체크)
         dup_filter = (
             BanAppeal.user_id == current_user.id,
             BanAppeal.ban_type == payload.ban_type,
@@ -91,24 +110,15 @@ async def create_appeal(
         status="PENDING",
     )
     db.add(appeal)
-    await db.flush()
+
+    # appeal 먼저 commit 후 알림 발송 (트랜잭션 순서 보장)
+    await db.commit()
+    await db.refresh(appeal)
 
     await notify_appeal_submitted(db=db, appeal=appeal)
     await notify_admins_new_appeal(db=db, appeal=appeal, user_nickname=current_user.nickname)
 
-    await db.commit()
-    await db.refresh(appeal)
-
-    return AppealOut(
-        id=str(appeal.id),
-        user_id=str(appeal.user_id),
-        ban_type=appeal.ban_type,
-        ban_reference_id=str(appeal.ban_reference_id) if appeal.ban_reference_id else None,
-        reason=appeal.reason,
-        status=appeal.status,
-        admin_memo=appeal.admin_memo,
-        created_at=_fmt(appeal.created_at),
-    )
+    return _to_appeal_out(appeal)
 
 
 # ── 유저: 내 이의제기 목록 ────────────────────────────────────────────────────
@@ -128,19 +138,7 @@ async def get_my_appeals(
         )
     ).scalars().all()
 
-    return [
-        AppealOut(
-            id=str(r.id),
-            user_id=str(r.user_id),
-            ban_type=r.ban_type,
-            ban_reference_id=str(r.ban_reference_id) if r.ban_reference_id else None,
-            reason=r.reason,
-            status=r.status,
-            admin_memo=r.admin_memo,
-            created_at=_fmt(r.created_at),
-        )
-        for r in rows
-    ]
+    return [_to_appeal_out(r) for r in rows]
 
 
 # ── 관리자: 이의제기 목록 ────────────────────────────────────────────────────
@@ -155,6 +153,9 @@ async def get_admin_appeals(
         stmt = stmt.where(BanAppeal.status == status_filter.upper())
 
     appeals = (await db.execute(stmt)).scalars().all()
+
+    if not appeals:
+        return []
 
     # 관련 유저 일괄 로드
     user_ids = {a.user_id for a in appeals}
@@ -262,10 +263,8 @@ async def review_appeal(
         target_user.banned_until = None
 
         # 2. IP 밴 해제 (Redis)
-        if appeal.ban_type == "ip_ban":
+        if appeal.ban_type == BAN_TYPE_IP:
             from core.redis_client import redis_client
-            # 최근 refresh_token에서 IP 가져와서 해제
-            from models.refresh_token import RefreshToken
             token_row = await db.scalar(
                 select(RefreshToken)
                 .where(RefreshToken.user_id == target_user.id)
@@ -277,7 +276,6 @@ async def review_appeal(
 
         # 3. trust_score 복구 (잃은 만큼)
         if appeal.ban_reference_id:
-            from models.mypage.trust_score import TrustScore
             trust_row = await db.get(TrustScore, appeal.ban_reference_id)
             if trust_row and float(trust_row.change_amount) < 0:
                 recovery = abs(float(trust_row.change_amount))
@@ -313,14 +311,54 @@ async def review_appeal(
             target_id=target_user.id if target_user else None,
         )
 
-    await db.flush()
-    await notify_appeal_result(db=db, appeal=appeal)
+    # appeal 먼저 commit 후 알림 발송 (트랜잭션 순서 보장)
     await db.commit()
+    await db.refresh(appeal)
 
-    # 응답 재조회
-    appeals_list = await get_admin_appeals(status_filter="", admin=admin, db=db)
-    for item in appeals_list:
-        if item.id == appeal_id:
-            return item
+    await notify_appeal_result(db=db, appeal=appeal)
 
-    raise HTTPException(status_code=500, detail="처리 후 조회 실패")
+    # 해당 건만 직접 조회해서 반환 (전체 재조회 성능 문제 해결)
+    return await _get_single_admin_appeal(aid, db)
+
+
+async def _get_single_admin_appeal(appeal_id: uuid.UUID, db: AsyncSession) -> AdminAppealOut:
+    appeal = await db.get(BanAppeal, appeal_id)
+    if not appeal:
+        raise HTTPException(status_code=404, detail="이의제기를 찾을 수 없습니다.")
+
+    user = await db.get(User, appeal.user_id)
+    reviewer = await db.get(User, appeal.reviewed_by) if appeal.reviewed_by else None
+
+    ban_detail = None
+    ban_score_change = None
+    ban_created_at = None
+
+    if appeal.ban_reference_id:
+        mod = await db.get(ModerationAction, appeal.ban_reference_id)
+        trust = await db.get(TrustScore, appeal.ban_reference_id)
+        if mod:
+            ban_detail = mod.reason
+            ban_score_change = float(mod.trust_score_change) if mod.trust_score_change else None
+            ban_created_at = _fmt(mod.created_at)
+        elif trust:
+            ban_detail = trust.reason
+            ban_score_change = float(trust.change_amount)
+            ban_created_at = _fmt(trust.created_at)
+
+    return AdminAppealOut(
+        id=str(appeal.id),
+        user_id=str(appeal.user_id),
+        user_nickname=user.nickname if user else "알 수 없음",
+        user_email=user.email if user else "",
+        ban_type=appeal.ban_type,
+        ban_reference_id=str(appeal.ban_reference_id) if appeal.ban_reference_id else None,
+        reason=appeal.reason,
+        status=appeal.status,
+        admin_memo=appeal.admin_memo,
+        reviewed_by_nickname=reviewer.nickname if reviewer else None,
+        reviewed_at=_fmt(appeal.reviewed_at),
+        created_at=_fmt(appeal.created_at),
+        ban_detail=ban_detail,
+        ban_score_change=ban_score_change,
+        ban_created_at=ban_created_at,
+    )
