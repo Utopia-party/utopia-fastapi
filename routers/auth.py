@@ -286,9 +286,14 @@ async def me(
     if not user.is_active:
         return {"is_logged_in": False, "user": None}
 
+
+    exp = payload.get("exp")
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    access_token_expires_in = max(exp - now, 0) if exp else 0
     return {
         "is_logged_in": True,
-        "access_token_expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "access_token_expires_in": access_token_expires_in,
         "user": {
             "user_id": str(user.id),
             "email": user.email,
