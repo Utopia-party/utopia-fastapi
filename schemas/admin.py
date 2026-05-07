@@ -169,6 +169,7 @@ class AdminServiceRecordOut(BaseModel):
     commissionRate: float
     leaderDiscountRate: float
     referralDiscountRate: float
+    quickMatchFeeRate: float
 
 
 class AdminServiceUpdateIn(BaseModel):
@@ -180,6 +181,7 @@ class AdminServiceUpdateIn(BaseModel):
     commissionRate: float = Field(ge=0, le=1)
     leaderDiscountRate: float = Field(ge=0, le=1)
     referralDiscountRate: float = Field(ge=0, le=1)
+    quickMatchFeeRate: float = Field(ge=0, le=1)
 
 
 class AdminUserRecordOut(BaseModel):

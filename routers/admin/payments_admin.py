@@ -105,8 +105,6 @@ from .deps import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-DISPLAY_COMMISSION_RATE = 0.10
-
 
 def _extract_discount_rate(discount_reason: str | None, service: Service | None) -> float:
     if not discount_reason:
@@ -146,6 +144,7 @@ class AdminPaymentRecordOut(_BaseModel):
     status: str
     billingMonth: str
     pricingType: str | None
+    quickMatchFeeRate: float
     paidAt: str | None
     createdAt: str
 
@@ -219,8 +218,18 @@ async def get_admin_payments(
         expected_amount = round(base_price * (1 - discount_rate))
         amount = expected_amount if discount_rate > 0 else int(payment.amount)
 
-        commission_rate = DISPLAY_COMMISSION_RATE
-        commission_amount = round(amount * commission_rate)
+        commission_rate = float(payment.commission_rate or 0)
+        commission_amount = int(payment.commission_amount or 0)
+
+        quick_match_fee_rate = 0.0
+        if payment.pricing_type == "quick_match":
+            if service and service.quick_match_fee_rate is not None:
+                quick_match_fee_rate = float(service.quick_match_fee_rate or 0)
+            elif service and service.commission_rate is not None:
+                quick_match_fee_rate = max(
+                    commission_rate - float(service.commission_rate or 0),
+                    0.0,
+                )
 
         items.append(
             AdminPaymentRecordOut(
@@ -241,6 +250,7 @@ async def get_admin_payments(
                 status=payment.status,
                 billingMonth=payment.billing_month,
                 pricingType=payment.pricing_type,
+                quickMatchFeeRate=quick_match_fee_rate,
                 paidAt=payment.paid_at.isoformat() if payment.paid_at else None,
                 createdAt=payment.created_at.isoformat(),
             )

@@ -525,6 +525,7 @@ def _serialize_admin_service(service: Service, created_by: User | None) -> Admin
         ),
         leaderDiscountRate=float(service.leader_discount_rate or 0),
         referralDiscountRate=float(service.referral_discount_rate or 0),
+        quickMatchFeeRate=float(service.quick_match_fee_rate or 0),
     )
 
 

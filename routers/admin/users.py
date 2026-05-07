@@ -380,6 +380,7 @@ async def update_admin_service(
     service.commission_rate = next_commission_rate
     service.leader_discount_rate = payload.leaderDiscountRate
     service.referral_discount_rate = payload.referralDiscountRate
+    service.quick_match_fee_rate = payload.quickMatchFeeRate
 
     await _append_activity_log(
         db,
