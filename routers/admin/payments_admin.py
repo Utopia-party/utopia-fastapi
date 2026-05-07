@@ -219,8 +219,8 @@ async def get_admin_payments(
         expected_amount = round(base_price * (1 - discount_rate))
         amount = expected_amount if discount_rate > 0 else int(payment.amount)
 
-        commission_rate = DISPLAY_COMMISSION_RATE
-        commission_amount = round(amount * commission_rate)
+        commission_rate = float(payment.commission_rate) if payment.commission_rate is not None else DISPLAY_COMMISSION_RATE
+        commission_amount = int(payment.commission_amount) if payment.commission_amount is not None else round(amount * commission_rate)
 
         items.append(
             AdminPaymentRecordOut(
