@@ -177,7 +177,7 @@ async def _apply_report_penalty(
         created_by=reviewer_id,
     )
     db.add(trust_row)
-    await db.flush()  # id 확정
+    await db.flush()  
 
     report.admin_memo = (
         f"자동 신뢰도 차감 {abs(penalty):.1f}점 적용 / 현재 {new_score:.1f}점"
@@ -189,7 +189,7 @@ async def ensure_admin_can_manage_reports(current_user: User) -> None:
     role = getattr(current_user, "role", None)
     is_admin = getattr(current_user, "is_admin", False)
 
-    if role == "admin" or is_admin:
+    if (role or "").upper() == "ADMIN" or is_admin:
         return
 
     raise HTTPException(
@@ -335,7 +335,6 @@ async def update_admin_report_status(
                         else "TEMP_BAN_30_DAYS"
                     ),
                 )
-                # 정지 확정 시 웹소켓으로 강제 로그아웃 발송
                 await notification_connection_manager.send_to_user(
                     updated_report.target_id,
                     {
