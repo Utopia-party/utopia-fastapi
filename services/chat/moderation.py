@@ -345,6 +345,18 @@ async def _ban_user_ip(user_id: str) -> None:
 async def moderate_in_background(party_id: str, user_id: str, content: str, ws: WebSocket):
     moderation = await check_message(content)
 
+    # 닉네임 조회 (시스템 메시지용)
+    nickname = "사용자"
+    try:
+        user_uuid = uuid.UUID(user_id)
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.id == user_uuid))
+            u = result.scalar_one_or_none()
+            if u and u.nickname:
+                nickname = u.nickname
+    except Exception:
+        pass
+
     if moderation["severe"]:
         await redis_client.set(blocked_key(user_id), "1", ex=REDIS_TTL)
         await delete_message_from_redis(party_id, content)
@@ -381,7 +393,7 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
         })
         await manager.broadcast(party_id, {
             "type": "system",
-            "content": "부적절한 메시지가 삭제되었습니다.",
+            "content": f"{nickname}님이 심각한 욕설로 인해 파티에서 퇴장되었습니다.",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -411,6 +423,11 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
                 "ban_type": "trust_score",
                 "reference_id": trust_ref_id,
                 "content": "경고 누적으로 계정이 정지되었습니다.",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            await manager.broadcast(party_id, {
+                "type": "system",
+                "content": f"{nickname}님이 경고 누적({party_warn}회)으로 파티에서 퇴장되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         else:

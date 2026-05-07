@@ -55,6 +55,19 @@ async def _broadcast_party_updated(party_id: uuid.UUID) -> None:
         logger.warning(f"[party_updated broadcast failed] {e}")
 
 
+async def _broadcast_system_message(party_id: uuid.UUID, content: str) -> None:
+    try:
+        from routers.chat import manager
+        from datetime import datetime, timezone
+        await manager.broadcast(str(party_id), {
+            "type": "system",
+            "content": content,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"[system message broadcast failed] {e}")
+
+
 async def create_activity_log(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -614,6 +627,7 @@ async def leave_party(
         raise HTTPException(status_code=500, detail="파티 탈퇴 처리 중 오류가 발생했습니다.")
 
     await _broadcast_party_updated(party_id)
+    await _broadcast_system_message(party_id, f"{current_user.nickname}님이 파티에서 퇴장했습니다.")
     return MessageOut(message="파티에서 탈퇴했습니다.")
 
 
@@ -657,7 +671,9 @@ async def kick_member(
         target_user_id=user_id,
     )
 
+    target_nickname = target.user.nickname if target.user else "멤버"
     await _broadcast_party_updated(party_id)
+    await _broadcast_system_message(party_id, f"{target_nickname}님이 파티에서 강퇴되었습니다.")
     return MessageOut(message="멤버를 강퇴했습니다.")
 
 

@@ -15,7 +15,7 @@ from services.notification_ws_service import notification_connection_manager
 
 router = APIRouter(tags=["notifications-ws"])
 
-WS_TOKEN_TTL = 30  # 30초 안에 WS 연결 안 하면 만료
+WS_TOKEN_TTL = 30  
 
 
 @router.post("/api/ws-token")
@@ -30,7 +30,6 @@ async def get_user_id_from_ws_token(token: str) -> uuid.UUID | None:
     user_id_str = await redis_client.get(f"ws_token:{token}")
     if not user_id_str:
         return None
-    # 1회용: 사용 후 즉시 삭제
     await redis_client.delete(f"ws_token:{token}")
     try:
         return uuid.UUID(user_id_str)
@@ -70,6 +69,15 @@ async def notifications_websocket(websocket: WebSocket):
                 "unread_count": unread_count,
             }
         )
+
+        pending_key = f"pending_force_logout:{user_id}"
+        if await redis_client.get(pending_key):
+            await redis_client.delete(pending_key)
+            await websocket.send_json({
+                "type": "force_logout",
+                "ban_type": None,
+                "content": "다른 기기에서 로그인되어 현재 세션이 종료되었습니다.",
+            })
 
         while True:
             try:

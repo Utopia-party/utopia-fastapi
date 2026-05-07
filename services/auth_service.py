@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.refresh_token import RefreshToken
 from models.user import User, UserReferrer
 from core.config import settings
+from core.redis_client import redis_client
 from services.notification_ws_service import notification_connection_manager
 
 
@@ -187,6 +188,8 @@ async def issue_tokens_and_save(
                 "created_at": now.isoformat(),
             },
         )
+        # WS가 끊긴 상태일 수 있으므로 Redis에 pending 플래그 저장 (60초)
+        await redis_client.setex(f"pending_force_logout:{user.id}", 60, "1")
 
     access_token = create_access_token(data={"sub": str(user.id)})
     refresh_token = create_refresh_token()

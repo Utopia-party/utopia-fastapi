@@ -227,6 +227,13 @@ async def websocket_chat(
     await manager.connect(party_id, ws, safe_user_id)
 
     if safe_user_id != "guest":
+        await manager.send_personal(ws, {
+            "type": "system_info",
+            "content": "욕설·비방 시 경고 누적 후 자동 퇴장 및 신뢰도 감점이 적용됩니다. 건전한 파티 문화를 함께 만들어요.",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    if safe_user_id != "guest":
         newly_read = await mark_all_read(party_id, safe_user_id)
         if newly_read:
             await manager.broadcast(party_id, {
