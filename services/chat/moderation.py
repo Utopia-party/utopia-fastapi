@@ -327,6 +327,13 @@ async def _increment_chat_warn_count(user_id: str) -> int:
 
 
 async def _apply_status_by_score(user_id: str, score: float, warn_count: int) -> None:
+    """
+    기획서 BAN 구조:
+      0점          → 영구 추방 (warn >= 4)
+      10점 미만    → 30일 정지 (신규 파티 참여 제한은 parties.py에서 trust_score 직접 비교)
+      10~20점      → YOLO 강제 발동은 프론트 require_action_auth 응답으로 전달
+      20~30점      → 1차 경고 (주의 문구 노출)
+    """
     try:
         user_uuid = uuid.UUID(user_id)
         async with AsyncSessionLocal() as db:
@@ -334,17 +341,21 @@ async def _apply_status_by_score(user_id: str, score: float, warn_count: int) ->
             user = result.scalar_one_or_none()
             if not user:
                 return
+
             if score <= 0 or warn_count >= 4:
+                # 영구 추방
                 user.is_active = False
                 user.banned_until = None
-            elif score < 10 or warn_count >= 3:
+            elif warn_count >= 3 or score < 10:
+                # 30일 정지
                 user.is_active = False
                 user.banned_until = datetime.now(timezone.utc) + timedelta(days=30)
-            elif score < 20:
-                user.banned_until = datetime.now(timezone.utc) + timedelta(hours=72)
+
             await db.commit()
     except Exception as e:
         print(f"[STATUS BY SCORE ERROR] {e}")
+
+
 
 
 async def _ban_user_ip(user_id: str) -> None:
