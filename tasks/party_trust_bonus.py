@@ -19,7 +19,7 @@ from models.mypage.trust_score import TrustScore
 from sqlalchemy import select
 
 
-# 개월 수, 멤버 보너스, 방장 보너스
+# 기획서 기준 구간 (개월 수, 멤버 보너스, 방장 보너스)
 BONUS_TIERS = [
     (6, 5.0, 6.0),
     (4, 3.0, 4.0),
