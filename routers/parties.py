@@ -474,6 +474,14 @@ async def apply_to_party(
         if current_status == "kicked":
             raise HTTPException(status_code=403, detail="이 파티에서 강퇴된 이력이 있어 재신청할 수 없습니다.")
 
+    min_trust = float(party.min_trust_score or 0)
+    user_trust = float(current_user.trust_score or 36.5)
+    if min_trust > 0 and user_trust < min_trust:
+        raise HTTPException(
+            status_code=403,
+            detail=f"신뢰도 점수가 부족합니다. (필요: {min_trust}점, 현재: {user_trust}점)",
+        )
+
     pending_count_row = await db.execute(
         select(func.count(PartyMember.id)).where(
             PartyMember.party_id == party_id,
