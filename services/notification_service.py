@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.notification import Notification
 from schemas.notification import NotificationOut
 from services.notification_ws_service import notification_connection_manager
+from services.notifications.email_notification_service import enqueue_email_notification
 
 
 def serialize_notification(notification: Notification) -> NotificationOut:
@@ -168,9 +169,9 @@ async def notify_user(
     metadata: dict | None = None,
 ) -> Notification:
     """
-    실무에서 다른 도메인 서비스(파티/결제/신고 등)에서 공통으로 호출하는 함수
     1. 알림 DB 저장
     2. 실시간 웹소켓 발행
+    3. 이메일 대상 이벤트면 Celery 이메일 발송
     """
     notification = await create_notification_service(
         db=db,
@@ -187,6 +188,19 @@ async def notify_user(
     await push_notification_created_event(
         db=db,
         notification=notification,
+    )
+
+    event_code = None
+    if metadata:
+        event_code = metadata.get("event_code")
+
+    await enqueue_email_notification(
+        db=db,
+        user_id=user_id,
+        event_code=event_code,
+        title=title,
+        message=message,
+        metadata=metadata,
     )
 
     return notification
