@@ -51,7 +51,10 @@ async def check_message(content: str) -> dict:
                 ml = resp.json()
                 label = ml["label"]
                 score = ml["score"]
-                pass_t = config.get("stage2_pass_threshold", 0.75)
+                # none이어도 0.95 미만이면 3단계로 넘겨 Ollama가 재판단
+                # → 기존 0.75는 너무 낮아 오탐(정상 채팅 통과) 다수 발생
+                pass_t = config.get("stage2_pass_threshold", 0.95)
+                # 위반 확정은 기존과 동일하게 0.97 이상만
                 block_t = config.get("stage2_block_threshold", 0.97)
                 if label == "none" and score >= pass_t:
                     return {"violation": False, "severe": False, "reason": "", "stage": 2, "score": score}
@@ -63,6 +66,7 @@ async def check_message(content: str) -> dict:
                         "stage": 2,
                         "score": score,
                     }
+                # score가 pass_t 미만이거나 label이 애매한 경우 → fall-through to stage3
         except Exception:
             pass
 
@@ -72,24 +76,77 @@ async def check_message(content: str) -> dict:
     return {"violation": False, "severe": False, "reason": "", "stage": 0, "score": None}
 
 
+# 기본 내장 예시 (설정에 추가 예시가 없을 때 사용)
+_DEFAULT_NONE_EXAMPLES = [
+    "ㅇㅇ", "ㅎㅇ", "ㅋㅋ", "ㄱㅇ", "ㅇㅋ", "ㄴㄴ", "ㅂㅇ",
+    "진짜요?", "ㄷㄷ", "헐", "대박", "ㄹㅇ", "레알",
+    "내가 진짜 ㅄ이지 ㅋㅋ",       # 자기 자신에 대한 욕설 → 위반 아님
+    "아 진짜 나 왜이래",             # 자기 비하 → 위반 아님
+    "이거 존나 재밌다",              # 강조 표현 → 위반 아님 (맥락상 감탄)
+    "헐 미쳤다 진짜",                # 감탄 → 위반 아님
+]
+
+_DEFAULT_OFFENSIVE_EXAMPLES = [
+    "ㅅㅂ", "씨발", "좆같다", "개새끼", "병신",
+    "존나 짜증나", "꺼져", "닥쳐",
+    "너 진짜 ㅄ이야",               # 타인에게 향한 욕설 → 위반
+    "야 이 개새끼야",               # 직접 욕설 → 위반
+]
+
+_DEFAULT_HATE_EXAMPLES = [
+    "여자들은 다 걸레야",
+    "저런 애들은 그냥 죽어야지",
+    "○○충들 다 없어져라",
+    "너같은 애는 태어나지 말았어야 해",
+]
+
+
 async def _check_message_ollama(content: str, config: dict) -> dict:
     examples = config.get("ollama_prompt_examples", [])
-    none_ex = [e["text"] for e in examples if e["label"] == "none"]
-    offensive_ex = [e["text"] for e in examples if e["label"] == "offensive"]
+    extra_none = [e["text"] for e in examples if e["label"] == "none"]
+    extra_offensive = [e["text"] for e in examples if e["label"] == "offensive"]
+    extra_hate = [e["text"] for e in examples if e["label"] == "hate"]
 
-    none_str = ", ".join(f'"{t}"' for t in none_ex) if none_ex else '"ㅇㅇ", "ㅎㅇ"'
-    off_str = ", ".join(f'"{t}"' for t in offensive_ex) if offensive_ex else '"ㅅㅂ", "존나"'
+    none_ex = _DEFAULT_NONE_EXAMPLES + extra_none
+    offensive_ex = _DEFAULT_OFFENSIVE_EXAMPLES + extra_offensive
+    hate_ex = _DEFAULT_HATE_EXAMPLES + extra_hate
 
-    prompt = f"""당신은 한국어 채팅 욕설 탐지 전문가입니다.
-아래 예시를 참고해 판단하세요.
+    none_str = ", ".join(f'"{t}"' for t in none_ex[:10])
+    off_str  = ", ".join(f'"{t}"' for t in offensive_ex[:8])
+    hate_str = ", ".join(f'"{t}"' for t in hate_ex[:5])
 
-[위반 아님 - none]: {none_str}
-[경고 수준 - offensive]: {off_str}
-[즉시 차단 - hate]: 특정 대상 혐오, 심한 욕설 조합
+    prompt = f"""당신은 한국어 실시간 채팅 욕설·혐오 표현 탐지 전문가입니다.
+반드시 아래 판단 기준과 예시를 따르세요.
 
-메시지: "{content}"
+## 판단 기준
 
-JSON만 응답, 다른 텍스트 금지:
+**[위반 아님 - violation: false]**
+- 감탄사, 추임새, 일상 채팅 (ㅇㅇ, ㅋㅋ, ㄷㄷ, 헐, 대박 등)
+- 자기 자신을 향한 욕설/비하 ("내가 진짜 ㅄ이지", "나 왜이래" 등)
+- 맥락상 흥분/강조 표현 ("존나 재밌다", "미쳤다 ㄹㅇ" 등)
+- 축약어지만 비하 대상이 없는 경우
+예시: {none_str}
+
+**[경고 - violation: true, severe: false]**
+- 타인을 향한 직접적 욕설/비하
+- 모욕적 표현이지만 혐오 발언 수준은 아닌 것
+예시: {off_str}
+
+**[즉시 차단 - violation: true, severe: true]**
+- 특정 집단(성별/인종/국적/성소수자 등) 혐오 발언
+- 심한 욕설 조합 또는 폭력·사망 언급
+- 반복적 집중 공격
+예시: {hate_str}
+
+## 주의사항
+- 자기 자신에 대한 욕설은 위반 아님
+- 단순 감탄/강조용 비속어는 문맥 고려
+- 축약어(ㅅㅂ, ㅂㅅ 등)는 타인 향한 경우만 위반
+
+## 판단할 메시지
+"{content}"
+
+JSON만 응답, 다른 텍스트·마크다운 금지:
 {{"violation": true/false, "severe": true/false, "reason": "한 줄 이유"}}"""
 
     try:
