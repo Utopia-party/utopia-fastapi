@@ -13,6 +13,7 @@ celery_app = Celery(
     backend=result_backend,
     include=[
         "tasks.email_tasks",
+        "tasks.party_trust_bonus",
     ],
 )
 
@@ -24,4 +25,11 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     broker_connection_retry_on_startup=True,
+    beat_schedule={
+        # 매일 00:00 KST(= 15:00 UTC)에 장기 파티 신뢰도 보너스 지급
+        "party-trust-bonus-daily": {
+            "task": "tasks.party_trust_bonus.run_party_trust_bonus",
+            "schedule": 86400,  # 24h (초 단위)
+        },
+    },
 )
