@@ -68,6 +68,28 @@ class UsageSummaryOut(BaseModel):
     total_usage_this_month: int
 
 
+class PlanInquiryCreateRequest(BaseModel):
+    service_type: ServiceType
+    desired_plan: str = Field(..., pattern="^(starter|pro|enterprise)$")
+    message: Optional[str] = Field(None, max_length=500)
+
+
+class PlanInquiryOut(BaseModel):
+    id: str
+    user_id: str
+    user_email: Optional[str]
+    service_type: str
+    desired_plan: str
+    message: Optional[str]
+    status: str
+    created_at: Optional[str]
+
+
+class PlanInquiryListResponse(BaseModel):
+    total: int
+    items: list[PlanInquiryOut]
+
+
 # ── 유틸 ─────────────────────────────────────────────────────────────────────
 
 def _gen_key(service_type: str) -> tuple[str, str]:
@@ -170,7 +192,6 @@ async def create_my_key(
     current_user: User = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # 서비스 타입별 최대 3개 제한
     count = (await db.execute(
         text("""
             SELECT COUNT(*) FROM saas_api_keys
@@ -195,7 +216,7 @@ async def create_my_key(
                  current_month_usage, created_by)
             VALUES
                 (:service_type, :client_name, :api_key, :secret_key,
-                 :allowed_domains, 10000, 'free', true, 0, :created_by)
+                 :allowed_domains, 1000, 'free', true, 0, :created_by)
             RETURNING id, service_type, client_name, api_key, secret_key,
                       allowed_domains, monthly_limit, current_month_usage,
                       plan, is_active, created_at
@@ -399,4 +420,109 @@ async def get_my_usage_summary(
         total_keys=result["total_keys"] or 0,
         active_keys=result["active_keys"] or 0,
         total_usage_this_month=result["total_usage"] or 0,
+    )
+
+
+# ── 9. 플랜 문의 접수 ─────────────────────────────────────────────────────────
+
+@router.post("/plan-inquiry", response_model=PlanInquiryOut, status_code=201)
+async def create_plan_inquiry(
+    payload: PlanInquiryCreateRequest,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # 동일 서비스 타입 pending 문의 중복 방지
+    existing = (await db.execute(
+        text("""
+            SELECT id FROM saas_plan_inquiries
+            WHERE user_id = :user_id
+              AND service_type = :service_type
+              AND status = 'pending'
+            LIMIT 1
+        """),
+        {"user_id": str(current_user.id), "service_type": payload.service_type},
+    )).mappings().first()
+
+    if existing:
+        raise HTTPException(status_code=400, detail="이미 대기 중인 문의가 있습니다.")
+
+    result = await db.execute(
+        text("""
+            INSERT INTO saas_plan_inquiries
+                (user_id, service_type, desired_plan, message, status)
+            VALUES
+                (:user_id, :service_type, :desired_plan, :message, 'pending')
+            RETURNING id, user_id, service_type, desired_plan, message, status, created_at
+        """),
+        {
+            "user_id": str(current_user.id),
+            "service_type": payload.service_type,
+            "desired_plan": payload.desired_plan,
+            "message": payload.message,
+        },
+    )
+    await db.commit()
+    row = dict(result.mappings().first())
+
+    return PlanInquiryOut(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        user_email=getattr(current_user, "email", None),
+        service_type=row["service_type"],
+        desired_plan=row["desired_plan"],
+        message=row.get("message"),
+        status=row["status"],
+        created_at=_fmt(row.get("created_at")),
+    )
+
+
+# ── 10. 내 플랜 문의 목록 ─────────────────────────────────────────────────────
+
+@router.get("/plan-inquiries", response_model=PlanInquiryListResponse)
+async def get_my_plan_inquiries(
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+    service_type: Optional[ServiceType] = Query(None),
+):
+    conditions = ["i.user_id = :user_id"]
+    params: dict = {"user_id": str(current_user.id)}
+
+    if service_type:
+        conditions.append("i.service_type = :service_type")
+        params["service_type"] = service_type
+
+    where = " WHERE " + " AND ".join(conditions)
+
+    total = (await db.execute(
+        text(f"SELECT COUNT(*) FROM saas_plan_inquiries i{where}"), params
+    )).scalar() or 0
+
+    result = await db.execute(
+        text(f"""
+            SELECT i.id, i.user_id, u.email as user_email,
+                   i.service_type, i.desired_plan, i.message,
+                   i.status, i.created_at
+            FROM saas_plan_inquiries i
+            LEFT JOIN users u ON u.id = i.user_id
+            {where}
+            ORDER BY i.created_at DESC
+        """),
+        params,
+    )
+
+    return PlanInquiryListResponse(
+        total=total,
+        items=[
+            PlanInquiryOut(
+                id=str(r["id"]),
+                user_id=str(r["user_id"]),
+                user_email=r.get("user_email"),
+                service_type=r["service_type"],
+                desired_plan=r["desired_plan"],
+                message=r.get("message"),
+                status=r["status"],
+                created_at=_fmt(r.get("created_at")),
+            )
+            for r in result.mappings()
+        ],
     )
