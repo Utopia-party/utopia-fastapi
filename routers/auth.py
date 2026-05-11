@@ -1,6 +1,6 @@
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 
 from celery.exceptions import CeleryError
@@ -386,7 +386,16 @@ async def social_login(data: SocialLoginBody, response: Response, request: Reque
             if is_ip_banned:
                 raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
         if not user.is_active:
-            raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
+            # 정지 유저: 이의제기 전용 단기 토큰(10분) 발급
+            appeal_token = create_access_token(
+                data={"sub": str(user.id)},
+                expires_delta=timedelta(minutes=10),
+            )
+            set_access_token_cookie(response, appeal_token)
+            return {
+                "status": "BANNED",
+                "message": "비활성화된 계정입니다.",
+            }
 
         await issue_tokens_and_save(
             response=response,
@@ -868,7 +877,16 @@ async def login(
         if is_ip_banned:
             raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
     if not user.is_active:
-        raise HTTPException(status_code=403, detail="비활성화된 계정입니다.")
+        # 정지 유저: 이의제기 전용 단기 토큰(10분) 발급
+        appeal_token = create_access_token(
+            data={"sub": str(user.id)},
+            expires_delta=timedelta(minutes=10),
+        )
+        set_access_token_cookie(response, appeal_token)
+        return {
+            "status": "BANNED",
+            "message": "비활성화된 계정입니다.",
+        }
 
     await issue_tokens_and_save(
         response=response,
