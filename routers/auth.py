@@ -875,7 +875,17 @@ async def login(
     if client_ip:
         is_ip_banned = await redis_client.get(f"ip:banned:{client_ip}")
         if is_ip_banned:
-            raise HTTPException(status_code=403, detail="이용이 제한된 계정입니다.")
+            # ip_ban도 이의제기 전용 단기 토큰 발급 후 BANNED 반환
+            appeal_token = create_access_token(
+                data={"sub": str(user.id)},
+                expires_delta=timedelta(minutes=10),
+            )
+            set_access_token_cookie(response, appeal_token)
+            return {
+                "status": "BANNED",
+                "message": "이용이 제한된 계정입니다.",
+                "ban_type": "ip_ban",
+            }
     if not user.is_active:
         # 정지 유저: 이의제기 전용 단기 토큰(10분) 발급
         appeal_token = create_access_token(
