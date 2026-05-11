@@ -140,7 +140,7 @@ class AdminPaymentRecordOut(_BaseModel):
     basePrice: int
     amount: int
     discountReason: str | None
-    cancelReason: str | None
+    statusReason: str | None
     baseCommissionRate: float
     commissionRate: float
     effectiveCommissionRate: float
@@ -224,10 +224,9 @@ async def _sync_related_settlement_status(
         settlement.status = "approved"
         settlement.approved_at = datetime.now(timezone.utc)
         auto_approved = True
-    elif not all_paid and settlement.status == "approved":
-        settlement.status = "pending"
-        settlement.approved_at = None
-        settlement.approved_by = None
+    elif not all_paid and settlement.status in {"approved", "pending"}:
+        await db.delete(settlement)
+        return None, False
 
     return settlement, auto_approved
 
@@ -312,7 +311,7 @@ def _build_admin_payment_record(
         basePrice=base_price,
         amount=amount,
         discountReason=payment.discount_reason,
-        cancelReason=payment.cancel_reason,
+        statusReason=payment.status_reason,
         baseCommissionRate=base_commission_rate,
         commissionRate=commission_rate,
         effectiveCommissionRate=effective_commission_rate,
@@ -407,17 +406,16 @@ async def update_admin_payment_status(
         raise HTTPException(status_code=400, detail="결제 상태는 대기, 승인, 거절, 취소만 변경할 수 있습니다.")
 
     reason = (payload.reason or "").strip() or None
-    if next_status == "cancelled" and not reason:
-        raise HTTPException(status_code=400, detail="취소 사유를 입력해주세요.")
+    if next_status in {"rejected", "cancelled"} and not reason:
+        raise HTTPException(status_code=400, detail="사유를 입력해주세요.")
 
     payment.status = next_status
     if next_status == "approved":
         payment.paid_at = payment.paid_at or datetime.now(timezone.utc)
-        payment.cancel_reason = None
-    elif next_status == "cancelled":
-        payment.cancel_reason = reason
+        payment.status_reason = None
     else:
-        payment.cancel_reason = None
+        payment.paid_at = None
+        payment.status_reason = reason
 
     party = await db.get(Party, payment.party_id)
     settlement, auto_approved = (None, False)
@@ -477,19 +475,29 @@ async def update_admin_payment_status(
         except Exception:
             pass
 
-    if next_status == "cancelled" and party:
+    if next_status in {"rejected", "cancelled"} and party:
         from services.notification_service import notify_user
 
+        title = (
+            "결제가 취소되었습니다"
+            if next_status == "cancelled"
+            else "결제가 거절되었습니다"
+        )
+        action_label = "취소" if next_status == "cancelled" else "거절"
         await notify_user(
             db=db,
             user_id=payment.user_id,
             type="payment",
-            title="결제가 취소되었습니다",
-            message=f"[{party.title}] 이번 달 결제가 취소되었습니다. 사유: {reason}. 다시 결제를 진행해주세요.",
+            title=title,
+            message=f"[{party.title}] 이번 달 결제가 {action_label}되었습니다. 사유: {reason}. 다시 결제를 진행해주세요.",
             reference_type="payment",
             reference_id=payment.id,
             metadata={
-                "event_code": "PAYMENT_CANCELLED_BY_ADMIN",
+                "event_code": (
+                    "PAYMENT_CANCELLED_BY_ADMIN"
+                    if next_status == "cancelled"
+                    else "PAYMENT_REJECTED_BY_ADMIN"
+                ),
                 "party_id": str(party.id),
                 "payment_id": str(payment.id),
                 "reason": reason,

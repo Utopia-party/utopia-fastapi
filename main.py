@@ -72,14 +72,30 @@ async def lifespan(app: FastAPI):
 
                     EXECUTE 'UPDATE services SET original_price = COALESCE(original_price, monthly_price) WHERE original_price IS NULL';
 
-                    IF NOT EXISTS (
+                    IF EXISTS (
                         SELECT 1
                         FROM information_schema.columns
                         WHERE table_schema = 'public'
                           AND table_name = 'payments'
                           AND column_name = 'cancel_reason'
+                    ) AND NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'payments'
+                          AND column_name = 'status_reason'
                     ) THEN
-                        EXECUTE 'ALTER TABLE payments ADD COLUMN cancel_reason VARCHAR(200)';
+                        EXECUTE 'ALTER TABLE payments RENAME COLUMN cancel_reason TO status_reason';
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'payments'
+                          AND column_name = 'status_reason'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE payments ADD COLUMN status_reason VARCHAR(200)';
                     END IF;
 
                     IF NOT EXISTS (

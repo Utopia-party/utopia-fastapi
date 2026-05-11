@@ -22,7 +22,7 @@ class Payment(Base):
     commission_rate: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.30")
     commission_amount: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     discount_reason: Mapped[str | None] = mapped_column(String(50))
-    cancel_reason: Mapped[str | None] = mapped_column(String(200))
+    status_reason: Mapped[str | None] = mapped_column(String(200))
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
     payment_method: Mapped[str | None] = mapped_column(String(30))  # 'card' | 'transfer'
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending", index=True)
