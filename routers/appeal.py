@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
-from core.security import get_current_user_optional
+from core.security import get_current_user_optional, get_current_user_or_raise_expired
 from models.admin import AdminRole, ModerationAction
 from models.appeal import BanAppeal
 from models.mypage.trust_score import TrustScore
@@ -63,7 +63,7 @@ async def create_appeal(
     payload: AppealCreateIn,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user_optional),
+    current_user: Optional[User] = Depends(get_current_user_or_raise_expired),
 ):
     # 정지 유저도 이의제기 가능하지만, 로그인은 필수
     if not current_user:
