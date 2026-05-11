@@ -805,6 +805,10 @@ async def save_hand_pose_sample(
 
 @router.post("/captcha/handocr/start")
 async def start_captcha(request: Request):
+    return await _start_captcha_logic(request)
+
+
+async def _start_captcha_logic(request: Request):
     ip = get_client_ip(request)
 
     blocked, ttl = await is_ip_blocked(ip)
@@ -860,11 +864,11 @@ async def start_captcha(request: Request):
 # ─────────────────────────────────────────────
 
 @router.post("/captcha/handocr/verify")
-async def verify_captcha(
-    request: Request,
-    sessionId: str = Form(...),
-    image: UploadFile = File(...),
-):
+async def verify_captcha(request: Request, sessionId: str = Form(...), image: UploadFile = File(...)):
+    return await _verify_captcha_logic(request, sessionId, image)
+
+
+async def _verify_captcha_logic(request: Request, sessionId: str, image: UploadFile):
     ip = get_client_ip(request)
 
     blocked, ttl = await is_ip_blocked(ip)

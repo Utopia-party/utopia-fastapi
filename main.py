@@ -35,6 +35,8 @@ from routers.admin import admin_quick_match
 from routers.appeal import router as appeal_router
 from routers.developer import router as developer_router
 from routers.developer_v2 import router as developer_v2_router
+from routers.saas_chat import router as saas_chat_router
+from routers.saas_captcha_l2 import router as saas_captcha_l2_router
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -412,6 +414,8 @@ app.include_router(admin_quick_match.router, prefix="/api")
 app.include_router(appeal_router)
 app.include_router(developer_router, prefix="/api")
 app.include_router(developer_v2_router, prefix="/api")
+app.include_router(saas_chat_router, prefix="/api")
+app.include_router(saas_captcha_l2_router, prefix="/api")
 
 app.include_router(admin_handocr.router, prefix="/api")
 
