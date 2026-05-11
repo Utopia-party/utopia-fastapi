@@ -76,6 +76,16 @@ async def lifespan(app: FastAPI):
                         SELECT 1
                         FROM information_schema.columns
                         WHERE table_schema = 'public'
+                          AND table_name = 'payments'
+                          AND column_name = 'cancel_reason'
+                    ) THEN
+                        EXECUTE 'ALTER TABLE payments ADD COLUMN cancel_reason VARCHAR(200)';
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
                           AND table_name = 'admin_roles'
                           AND column_name = 'can_manage_payments'
                     ) THEN

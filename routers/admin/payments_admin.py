@@ -4,7 +4,7 @@ from decimal import Decimal
 import re
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel as _BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,6 +140,7 @@ class AdminPaymentRecordOut(_BaseModel):
     basePrice: int
     amount: int
     discountReason: str | None
+    cancelReason: str | None
     baseCommissionRate: float
     commissionRate: float
     effectiveCommissionRate: float
@@ -164,6 +165,11 @@ class AdminPaymentListOut(_BaseModel):
     page: int
     limit: int
     totalPages: int
+
+
+class AdminPaymentStatusUpdateIn(_BaseModel):
+    status: str
+    reason: str | None = None
 
 
 async def _get_party_active_member_ids(
@@ -306,6 +312,7 @@ def _build_admin_payment_record(
         basePrice=base_price,
         amount=amount,
         discountReason=payment.discount_reason,
+        cancelReason=payment.cancel_reason,
         baseCommissionRate=base_commission_rate,
         commissionRate=commission_rate,
         effectiveCommissionRate=effective_commission_rate,
@@ -387,7 +394,7 @@ async def get_admin_payments(
 @router.patch("/payments/{payment_id}", response_model=AdminPaymentRecordOut)
 async def update_admin_payment_status(
     payment_id: str,
-    payload: AdminStatusUpdateIn,
+    payload: AdminPaymentStatusUpdateIn,
     admin: AdminContext = Depends(require_admin_payment_permission),
     db: AsyncSession = Depends(get_db),
 ):
@@ -399,9 +406,18 @@ async def update_admin_payment_status(
     if next_status not in {"pending", "approved", "rejected", "cancelled"}:
         raise HTTPException(status_code=400, detail="결제 상태는 대기, 승인, 거절, 취소만 변경할 수 있습니다.")
 
+    reason = (payload.reason or "").strip() or None
+    if next_status == "cancelled" and not reason:
+        raise HTTPException(status_code=400, detail="취소 사유를 입력해주세요.")
+
     payment.status = next_status
     if next_status == "approved":
         payment.paid_at = payment.paid_at or datetime.now(timezone.utc)
+        payment.cancel_reason = None
+    elif next_status == "cancelled":
+        payment.cancel_reason = reason
+    else:
+        payment.cancel_reason = None
 
     party = await db.get(Party, payment.party_id)
     settlement, auto_approved = (None, False)
@@ -420,6 +436,14 @@ async def update_admin_payment_status(
         path=f"/api/admin/payments/{payment_id}",
     )
     await db.commit()
+
+    if party:
+        try:
+            from routers.parties import _broadcast_party_updated
+
+            await _broadcast_party_updated(party.id)
+        except Exception:
+            pass
 
     if auto_approved and settlement and party:
         from services.notification_service import notify_user
@@ -452,6 +476,25 @@ async def update_admin_payment_status(
             )
         except Exception:
             pass
+
+    if next_status == "cancelled" and party:
+        from services.notification_service import notify_user
+
+        await notify_user(
+            db=db,
+            user_id=payment.user_id,
+            type="payment",
+            title="결제가 취소되었습니다",
+            message=f"[{party.title}] 이번 달 결제가 취소되었습니다. 사유: {reason}. 다시 결제를 진행해주세요.",
+            reference_type="payment",
+            reference_id=payment.id,
+            metadata={
+                "event_code": "PAYMENT_CANCELLED_BY_ADMIN",
+                "party_id": str(party.id),
+                "payment_id": str(payment.id),
+                "reason": reason,
+            },
+        )
 
     stmt = (
         select(Payment, User, Party, Service)
