@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,6 +61,7 @@ def _to_appeal_out(a: BanAppeal) -> AppealOut:
 @router.post("/api/appeals", response_model=AppealOut)
 async def create_appeal(
     payload: AppealCreateIn,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -91,12 +92,15 @@ async def create_appeal(
             detail="이미 해당 제재에 대한 이의제기가 접수되어 있습니다.",
         )
 
+    client_ip = request.client.host if request.client else None
+
     appeal = BanAppeal(
         user_id=current_user.id,
         ban_type=payload.ban_type,
         ban_reference_id=ref_id,
         reason=payload.reason.strip(),
         status="PENDING",
+        ip_address=client_ip,
     )
     db.add(appeal)
 
@@ -203,6 +207,7 @@ async def get_admin_appeals(
                 ban_detail=ban_detail,
                 ban_score_change=ban_score_change,
                 ban_created_at=ban_created_at,
+                ip_address=a.ip_address,
             )
         )
 
@@ -355,4 +360,5 @@ async def _get_single_admin_appeal(appeal_id: uuid.UUID, db: AsyncSession) -> Ad
         ban_detail=ban_detail,
         ban_score_change=ban_score_change,
         ban_created_at=ban_created_at,
+        ip_address=appeal.ip_address,
     )

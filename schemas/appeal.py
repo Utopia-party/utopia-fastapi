@@ -40,6 +40,7 @@ class AdminAppealOut(BaseModel):
     ban_detail: Optional[str]       
     ban_score_change: Optional[float]  
     ban_created_at: Optional[str]
+    ip_address: Optional[str]
 
 
 class AdminAppealReviewIn(BaseModel):
