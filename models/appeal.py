@@ -39,6 +39,9 @@ class BanAppeal(Base):
 
     reason: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # 이의제기 신청 시점의 IP
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
     # PENDING / APPROVED / REJECTED
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="PENDING")
 
