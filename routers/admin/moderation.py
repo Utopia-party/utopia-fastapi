@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -63,6 +63,7 @@ from schemas.admin import (
     SystemLogRecordOut,
     UserStatusLogOut,
 )
+from services.chat.serializers import blocked_key
 from services.notifications.report_notification_service import (
     notify_report_result_to_reporter,
     notify_report_warning_to_target,
@@ -266,6 +267,19 @@ async def update_chat_moderation_status(
             elif new_score >= 10:
                 # 주의 구간 — 활성화는 하되 banned_until 유지
                 sender.is_active = True
+
+            # ── Redis 채팅 차단 키 해제 ──────────────────────────
+            await redis_client.delete(blocked_key(str(sender.id)))
+
+            # ── PartyMember banned 상태 → active 복구 ────────────
+            await db.execute(
+                update(PartyMember)
+                .where(
+                    PartyMember.user_id == sender.id,
+                    PartyMember.status == "banned",
+                )
+                .values(status="active")
+            )
 
     await _append_activity_log(
         db,
