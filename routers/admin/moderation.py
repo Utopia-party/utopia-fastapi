@@ -258,6 +258,15 @@ async def update_chat_moderation_status(
                 created_by=admin.user.id,
             ))
 
+            # 신뢰도 기준으로 유저 상태 복구
+            if new_score >= 20:
+                # 정상 구간 — 정지 완전 해제
+                sender.is_active = True
+                sender.banned_until = None
+            elif new_score >= 10:
+                # 주의 구간 — 활성화는 하되 banned_until 유지
+                sender.is_active = True
+
     await _append_activity_log(
         db,
         actor_user_id=admin.user.id,
@@ -381,3 +390,117 @@ async def get_chat_moderation_trend(
         }
         for row in rows
     ]
+
+
+# ── 단계별 통계 + ML 신뢰도 분포 ─────────────────────────────
+
+import httpx as _httpx
+from core.config import settings as _settings
+
+
+@router.get("/moderation/stage-stats", response_model=dict)
+async def get_stage_stats(
+    _: AdminContext = Depends(require_admin_moderation_permission),
+    db: AsyncSession = Depends(get_db),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+):
+    """1/2/3단계별 탐지 건수 + ML 신뢰도 분포"""
+    dt_from, dt_to = _date_range_bounds(date_from, date_to)
+
+    base = select(PartyChat.flag_stage, func.count()).where(PartyChat.is_flagged == True).group_by(PartyChat.flag_stage)
+    if dt_from:
+        base = base.where(PartyChat.created_at >= dt_from)
+    if dt_to:
+        base = base.where(PartyChat.created_at < dt_to)
+
+    rows = (await db.execute(base)).all()
+    stage_counts = {str(r[0]): r[1] for r in rows}
+
+    conf_q = select(PartyChat.flag_confidence).where(
+        PartyChat.is_flagged == True,
+        PartyChat.flag_stage == 2,
+        PartyChat.flag_confidence != None,
+    )
+    if dt_from:
+        conf_q = conf_q.where(PartyChat.created_at >= dt_from)
+    if dt_to:
+        conf_q = conf_q.where(PartyChat.created_at < dt_to)
+
+    conf_rows = (await db.execute(conf_q)).scalars().all()
+    buckets = [0] * 10
+    for score in conf_rows:
+        if score is None:
+            continue
+        idx = min(int((score - 0.5) / 0.05), 9)
+        if idx >= 0:
+            buckets[idx] += 1
+
+    confidence_dist = [
+        {"range": f"{0.5 + i * 0.05:.2f}~{0.5 + (i + 1) * 0.05:.2f}", "count": buckets[i]}
+        for i in range(10)
+    ]
+
+    return {
+        "stage1": stage_counts.get("1", 0),
+        "stage2": stage_counts.get("2", 0),
+        "stage3": stage_counts.get("3", 0),
+        "confidenceDist": confidence_dist,
+    }
+
+
+@router.get("/moderation/ml-health", response_model=dict)
+async def get_ml_health(
+    _: AdminContext = Depends(require_admin_moderation_permission),
+):
+    """ML 서버 health 체크"""
+    ml_url = _settings.ML_SERVER_URL.replace("/classify", "/health")
+    try:
+        async with _httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(ml_url)
+            data = resp.json()
+            return {"status": "ok", "model": data.get("model", "unknown"), "latencyMs": None}
+    except Exception:
+        return {"status": "error", "model": None, "latencyMs": None}
+
+
+@router.get("/moderation/user-pattern/{user_id}", response_model=dict)
+async def get_user_violation_pattern(
+    user_id: str,
+    _: AdminContext = Depends(require_admin_moderation_permission),
+    db: AsyncSession = Depends(get_db),
+):
+    """유저별 위반 패턴 분석"""
+    try:
+        import uuid as _uuid
+        user_uuid = _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="유효하지 않은 사용자 ID입니다.")
+
+    rows = (await db.execute(
+        select(PartyChat.flag_stage, PartyChat.moderation_status, PartyChat.flag_confidence)
+        .where(PartyChat.sender_id == user_uuid, PartyChat.is_flagged == True)
+        .order_by(PartyChat.created_at.desc())
+        .limit(200)
+    )).all()
+
+    stage_counts = {1: 0, 2: 0, 3: 0}
+    status_counts = {"blocked": 0, "warned": 0, "false_positive": 0}
+    scores = []
+
+    for stage, status, conf in rows:
+        if stage in stage_counts:
+            stage_counts[stage] += 1
+        if status in status_counts:
+            status_counts[status] += 1
+        if conf is not None:
+            scores.append(conf)
+
+    avg_confidence = round(sum(scores) / len(scores), 3) if scores else None
+
+    return {
+        "totalViolations": len(rows),
+        "stageCounts": stage_counts,
+        "statusCounts": status_counts,
+        "avgConfidence": avg_confidence,
+    }
