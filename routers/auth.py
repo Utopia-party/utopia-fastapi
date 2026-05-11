@@ -193,9 +193,14 @@ async def refresh_token_api(
             detail="유효하지 않은 사용자입니다.",
         )
 
-    # 정지(is_active=False) 유저는 이의제기를 위해 access token 재발급은 허용하되
-    # 완전히 삭제된 계정(user=None)만 차단한다.
-    # 단, 이의제기 외 일반 기능은 백엔드 각 엔드포인트의 require_user가 막아준다.
+    # 정지 유저는 refresh로 정상 세션 복구 불가 — 즉시 차단
+    if not user.is_active:
+        clear_access_token_cookie(response)
+        clear_refresh_token_cookie(response)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="비활성화된 계정입니다.",
+        )
 
     # 이미 revoke된 토큰 처리
     if token_row.revoked_at is not None:
