@@ -1238,7 +1238,7 @@ async def generate_captcha_images(
 
             remote_cmd = (
                 f"cd {GPU_SCRIPT_DIR} && "
-                f"python generate_and_register.py "
+                f"/home/ubuntu/venv/bin/python generate_and_register.py "
                 f"--categories {cats} "
                 f"--num_per_category {num_per_category} "
                 f"--num_sets {num_sets}"
