@@ -673,6 +673,8 @@ async def leave_party(
 
     await _broadcast_party_updated(party_id)
     await _broadcast_system_message(party_id, f"{current_user.nickname}님이 파티에서 퇴장했습니다.")
+    # 탈퇴 시 join_announced 키 삭제 → 재가입 시 참가 메시지가 다시 나오도록
+    await redis_client.delete(f"chat:{party_id}:join_announced:{current_user.id}")
     return MessageOut(message="파티에서 탈퇴했습니다.")
 
 
@@ -720,6 +722,8 @@ async def kick_member(
     target_nickname = target.user.nickname if target.user else "멤버"
     await _broadcast_party_updated(party_id)
     await _broadcast_system_message(party_id, f"{target_nickname}님이 파티에서 강퇴되었습니다.")
+    # 강퇴 시 join_announced 키 삭제 → 재가입 시 참가 메시지가 다시 나오도록
+    await redis_client.delete(f"chat:{party_id}:join_announced:{user_id}")
     return MessageOut(message="멤버를 강퇴했습니다.")
 
 

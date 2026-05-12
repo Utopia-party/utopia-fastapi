@@ -235,26 +235,34 @@ async def websocket_chat(
     await manager.connect(party_id, ws, safe_user_id)
 
     if safe_user_id != "guest":
-        # 닉네임 조회
-        join_nickname = nickname
-        try:
-            async with AsyncSessionLocal() as db:
-                u_result = await db.execute(select(User).where(User.id == uuid.UUID(safe_user_id)))
-                u = u_result.scalar_one_or_none()
-                if u and u.nickname:
-                    join_nickname = u.nickname
-        except Exception:
-            pass
+        # ── 참가 메시지: 실제 첫 입장일 때만 발송 ──────────────────
+        # Redis 키로 "이미 공지됐는지" 체크. 뒤로가기/탭 전환으로 인한
+        # WS 재연결에서는 메시지가 중복 발송되지 않도록 한다.
+        join_announced_key = f"chat:{party_id}:join_announced:{safe_user_id}"
+        already_announced = await redis_client.get(join_announced_key)
 
-        join_content = f"{join_nickname}님이 파티에 참가했습니다."
-        join_chat_id = await save_system_message(party_id, join_content)
-        join_msg = {
-            "type": "system",
-            "chat_id": join_chat_id,
-            "content": join_content,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        await manager.broadcast(party_id, join_msg)
+        if not already_announced:
+            join_nickname = nickname
+            try:
+                async with AsyncSessionLocal() as db:
+                    u_result = await db.execute(select(User).where(User.id == uuid.UUID(safe_user_id)))
+                    u = u_result.scalar_one_or_none()
+                    if u and u.nickname:
+                        join_nickname = u.nickname
+            except Exception:
+                pass
+
+            join_content = f"{join_nickname}님이 파티에 참가했습니다."
+            join_chat_id = await save_system_message(party_id, join_content)
+            join_msg = {
+                "type": "system",
+                "chat_id": join_chat_id,
+                "content": join_content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await manager.broadcast(party_id, join_msg)
+            # 멤버 유지 기간 동안 유지 (3일). 탈퇴 시 별도로 삭제
+            await redis_client.setex(join_announced_key, REDIS_TTL, "1")
 
     if safe_user_id != "guest":
         await manager.send_personal(ws, {
@@ -344,25 +352,8 @@ async def websocket_chat(
 
     except WebSocketDisconnect:
         manager.disconnect(party_id, ws, safe_user_id)
-        if safe_user_id != "guest":
-            leave_nickname = nickname
-            try:
-                async with AsyncSessionLocal() as db:
-                    u_result = await db.execute(select(User).where(User.id == uuid.UUID(safe_user_id)))
-                    u = u_result.scalar_one_or_none()
-                    if u and u.nickname:
-                        leave_nickname = u.nickname
-            except Exception:
-                pass
-            leave_content = f"{leave_nickname}님이 파티에서 나갔습니다."
-            leave_chat_id = await save_system_message(party_id, leave_content)
-            leave_msg = {
-                "type": "system",
-                "chat_id": leave_chat_id,
-                "content": leave_content,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            await manager.broadcast(party_id, leave_msg)
+        # 탈퇴·강퇴 시 "나갔습니다" 메시지는 parties.py REST API에서 이미 발송.
+        # WS disconnect는 단순 페이지 이탈/뒤로가기도 포함되므로 여기서는 발송하지 않음.
     except Exception as e:
         print(f"[WS_FATAL_ERROR] {e}")
         manager.disconnect(party_id, ws, safe_user_id)
