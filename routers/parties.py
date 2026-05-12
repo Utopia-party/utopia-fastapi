@@ -1,12 +1,12 @@
 import uuid
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Optional, Any
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, case
+from sqlalchemy import func, select, case, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -289,6 +289,18 @@ async def list_parties(
         selectinload(Party.host),
         selectinload(Party.members),
         selectinload(Party.service),
+    )
+
+    # recruiting/completed/active/full는 항상 노출, ended/closed는 updated_at 기준 1일 이내만 노출
+    cutoff = datetime.utcnow() - timedelta(days=1)
+    q = q.where(
+        or_(
+            Party.status.in_(["recruiting", "completed", "active", "full"]),
+            and_(
+                Party.status.in_(["ended", "closed"]),
+                Party.updated_at >= cutoff,
+            ),
+        )
     )
 
     if service_id:
