@@ -114,65 +114,126 @@ def _settlement_payment_status_label(value: str | None) -> str:
     }.get((value or "").lower(), "대기")
 
 
-async def _build_settlement_participant_payments(
+async def _build_settlement_participant_payments_bulk(
     db: AsyncSession,
-    party: Party,
-    billing_month: str,
-) -> list[SettlementParticipantPaymentOut]:
-    members = (
+    party_ids: list,
+    billing_months_by_party: dict,
+) -> dict[str, list[SettlementParticipantPaymentOut]]:
+    """
+    N+1 해소: 전체 party_id 목록을 한 번에 IN 쿼리로 조회.
+    반환값: { party_id(str): [SettlementParticipantPaymentOut, ...] }
+    """
+    if not party_ids:
+        return {}
+
+    # ── 1) 파티 멤버 + 유저 일괄 조회 ─────────────────────────────
+    member_rows = (
         await db.execute(
             select(PartyMember, User)
             .join(User, PartyMember.user_id == User.id)
             .where(
-                PartyMember.party_id == party.id,
+                PartyMember.party_id.in_(party_ids),
                 PartyMember.status == "active",
             )
         )
     ).all()
 
+    # party_id → [(member, user), ...]
+    members_by_party: dict = {}
+    for member, user in member_rows:
+        members_by_party.setdefault(str(member.party_id), []).append((member, user))
+
+    # ── 2) 결제 상태 일괄 조회 ────────────────────────────────────
+    # billing_month 는 파티마다 다를 수 있으므로 (party_id, billing_month) OR 조건 사용
+    from sqlalchemy import tuple_
+    party_month_pairs = [
+        (pid, billing_months_by_party[pid]) for pid in party_ids
+        if pid in billing_months_by_party
+    ]
     payment_rows = (
         await db.execute(
-            select(Payment.user_id, Payment.status).where(
-                Payment.party_id == party.id,
-                Payment.billing_month == billing_month,
+            select(Payment.party_id, Payment.user_id, Payment.status).where(
+                tuple_(Payment.party_id, Payment.billing_month).in_(party_month_pairs)
+            )
+        )
+    ).all() if party_month_pairs else []
+
+    # (party_id, user_id) → status
+    payment_status_map: dict = {}
+    for p_party_id, p_user_id, p_status in payment_rows:
+        payment_status_map[(str(p_party_id), str(p_user_id))] = p_status
+
+    # ── 3) 리더가 멤버 테이블에 없는 케이스 보완 ─────────────────
+    # 누락된 leader_id 를 모아 한 번에 조회
+    from models.party import Party as PartyModel
+    party_leader_rows = (
+        await db.execute(
+            select(PartyModel.id, PartyModel.leader_id).where(
+                PartyModel.id.in_(party_ids)
             )
         )
     ).all()
-    payment_status_map = {user_id: status for user_id, status in payment_rows}
+    leader_id_by_party = {str(row.id): str(row.leader_id) for row in party_leader_rows if row.leader_id}
 
-    participant_rows: list[SettlementParticipantPaymentOut] = []
-    leader_in_members = False
+    missing_leader_ids = []
+    for pid in party_ids:
+        leader_id = leader_id_by_party.get(pid)
+        if not leader_id:
+            continue
+        members = members_by_party.get(pid, [])
+        member_user_ids = {str(u.id) for _, u in members}
+        if leader_id not in member_user_ids:
+            missing_leader_ids.append(leader_id)
 
-    for member, user in members:
-        if user.id == party.leader_id:
-            leader_in_members = True
-        participant_rows.append(
-            SettlementParticipantPaymentOut(
-                userId=str(user.id),
-                nickname=user.nickname,
-                role="파티장" if member.role == "leader" else "멤버",
-                paymentStatus=_settlement_payment_status_label(
-                    payment_status_map.get(user.id)
-                ),
+    missing_leader_map: dict[str, Any] = {}
+    if missing_leader_ids:
+        missing_users = (
+            await db.execute(
+                select(User).where(User.id.in_(missing_leader_ids))
             )
-        )
+        ).scalars().all()
+        missing_leader_map = {str(u.id): u for u in missing_users}
 
-    if party.leader_id and not leader_in_members:
-        leader = await db.get(User, party.leader_id)
-        if leader:
-            participant_rows.append(
+    # ── 4) 결과 조립 ─────────────────────────────────────────────
+    result: dict[str, list[SettlementParticipantPaymentOut]] = {}
+    for pid in party_ids:
+        leader_id = leader_id_by_party.get(pid)
+        members = members_by_party.get(pid, [])
+        member_user_ids = {str(u.id) for _, u in members}
+        rows_out: list[SettlementParticipantPaymentOut] = []
+
+        for member, user in members:
+            rows_out.append(
                 SettlementParticipantPaymentOut(
-                    userId=str(leader.id),
-                    nickname=leader.nickname,
-                    role="파티장",
+                    userId=str(user.id),
+                    nickname=user.nickname,
+                    role="파티장" if member.role == "leader" else "멤버",
                     paymentStatus=_settlement_payment_status_label(
-                        payment_status_map.get(leader.id)
+                        payment_status_map.get((pid, str(user.id)))
                     ),
                 )
             )
 
-    participant_rows.sort(key=lambda item: (0 if item.role == "파티장" else 1, item.nickname))
-    return participant_rows
+        # 리더가 멤버 테이블에 없는 경우 보완
+        if leader_id and leader_id not in member_user_ids:
+            leader_user = missing_leader_map.get(leader_id)
+            if leader_user:
+                rows_out.append(
+                    SettlementParticipantPaymentOut(
+                        userId=str(leader_user.id),
+                        nickname=leader_user.nickname,
+                        role="파티장",
+                        paymentStatus=_settlement_payment_status_label(
+                            payment_status_map.get((pid, str(leader_user.id)))
+                        ),
+                    )
+                )
+
+        rows_out.sort(key=lambda item: (0 if item.role == "파티장" else 1, item.nickname))
+        result[pid] = rows_out
+
+    return result
+
 
 @router.get("/settlements", response_model=list[SettlementRecordOut])
 async def get_admin_settlements(
@@ -183,6 +244,7 @@ async def get_admin_settlements(
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
 ):
+    from sqlalchemy import or_
     leader_user = aliased(User)
     stmt = (
         select(Settlement, Party, leader_user)
@@ -190,47 +252,59 @@ async def get_admin_settlements(
         .join(leader_user, Settlement.leader_id == leader_user.id)
         .order_by(Settlement.created_at.desc())
     )
+
+    # ── 날짜 필터: DB에서 처리 ────────────────────────────────────
     dt_from, dt_to = _date_range_bounds(date_from, date_to)
     if dt_from:
         stmt = stmt.where(Settlement.created_at >= dt_from)
     if dt_to:
         stmt = stmt.where(Settlement.created_at < dt_to)
 
+    # ── status 필터: DB에서 처리 ──────────────────────────────────
+    if status_filter:
+        status_code = _settlement_status_code(status_filter)
+        if status_code:
+            stmt = stmt.where(Settlement.status == status_code)
+
+    # ── keyword 필터: DB에서 처리 ─────────────────────────────────
+    q = keyword.strip()
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(
+            or_(
+                Party.title.ilike(like),
+                leader_user.nickname.ilike(like),
+                Settlement.billing_month.ilike(like),
+            )
+        )
+
     rows = (await db.execute(stmt)).all()
-    q = keyword.lower().strip()
+
+    # ── N+1 해소: 참여자 결제 상태 일괄 조회 ─────────────────────
+    party_ids = [str(stl.party_id) for stl, _, _ in rows]
+    billing_months_by_party = {
+        str(stl.party_id): stl.billing_month for stl, _, _ in rows
+    }
+    participant_map = await _build_settlement_participant_payments_bulk(
+        db, party_ids, billing_months_by_party
+    )
 
     items: list[SettlementRecordOut] = []
     for stl, party, leader in rows:
-        status_label = _settlement_status_label(stl.status)
-        party_name = party.title
-        leader_name = leader.nickname
-        if status_filter and status_label != status_filter:
-            continue
-        if q and not (
-            q in str(stl.id).lower()
-            or q in str(stl.party_id).lower()
-            or q in str(stl.leader_id).lower()
-            or q in party_name.lower()
-            or q in leader_name.lower()
-            or q in (stl.billing_month or "").lower()
-            or q in status_label.lower()
-        ):
-            continue
+        pid = str(stl.party_id)
         items.append(
             SettlementRecordOut(
                 id=str(stl.id),
-                partyId=str(stl.party_id),
-                partyName=party_name,
+                partyId=pid,
+                partyName=party.title,
                 leaderId=str(stl.leader_id),
-                leaderName=leader_name,
+                leaderName=leader.nickname,
                 totalAmount=stl.total_amount,
                 memberCount=stl.member_count,
                 billingMonth=stl.billing_month,
-                status=status_label,
+                status=_settlement_status_label(stl.status),
                 createdAt=_format_datetime(stl.created_at),
-                participantPayments=await _build_settlement_participant_payments(
-                    db, party, stl.billing_month
-                ),
+                participantPayments=participant_map.get(pid, []),
             )
         )
     return items
@@ -305,7 +379,13 @@ async def update_admin_settlement_status(
         status=_settlement_status_label(stl.status),
         createdAt=_format_datetime(stl.created_at),
         participantPayments=(
-            await _build_settlement_participant_payments(db, party, stl.billing_month)
+            (
+                await _build_settlement_participant_payments_bulk(
+                    db,
+                    [str(stl.party_id)],
+                    {str(stl.party_id): stl.billing_month},
+                )
+            ).get(str(stl.party_id), [])
             if party
             else []
         ),
