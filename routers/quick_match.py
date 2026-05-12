@@ -1,59 +1,57 @@
+from __future__ import annotations
+
 import uuid
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
 from core.security import require_user
-from models.quick_match.request import QuickMatchRequest, QuickMatchRequestStatus
+from models.quick_match.candidate import QuickMatchCandidate
+from models.quick_match.request import QuickMatchRequest
+from models.quick_match.result import QuickMatchResult
 from models.user import User
 from schemas.quick_match.request import (
-    QuickMatchCancelRequest,
     QuickMatchCreateRequest,
     QuickMatchRetryRequest,
 )
 from schemas.quick_match.response import (
-    QuickMatchCandidateResponse,
     QuickMatchCreateResponse,
     QuickMatchDetailResponse,
-    QuickMatchRequestResponse,
-    QuickMatchResultResponse,
 )
 from services.quick_match.quick_match_service import QuickMatchService
 
-
-router = APIRouter(
-    prefix="/quick-match",
-    tags=["Quick Match"],
-)
+router = APIRouter(prefix="/quick-match", tags=["quick-match"])
 
 quick_match_service = QuickMatchService()
 
 
-def map_error(error_code: str) -> tuple[int, str]:
-    error_map = {
-        "USER_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "사용자를 찾을 수 없습니다."),
-        "USER_INACTIVE": (status.HTTP_403_FORBIDDEN, "비활성 사용자입니다."),
-        "USER_BANNED": (status.HTTP_403_FORBIDDEN, "정지된 사용자입니다."),
-        "ALREADY_REQUESTED": (status.HTTP_409_CONFLICT, "이미 진행 중인 빠른매칭 요청이 있습니다."),
-        "ALREADY_IN_ACTIVE_PARTY": (status.HTTP_409_CONFLICT, "이미 참여 중인 활성 파티가 있습니다."),
-        "REQUEST_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "빠른매칭 요청을 찾을 수 없습니다."),
-        "INVALID_REQUEST_STATUS": (status.HTTP_400_BAD_REQUEST, "요청 상태가 올바르지 않습니다."),
-        "NO_RECRUITING_PARTY": (status.HTTP_404_NOT_FOUND, "모집 중인 파티가 없습니다."),
-        "EMBEDDING_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "사용자 임베딩이 존재하지 않습니다."),
-        "NO_CANDIDATE": (status.HTTP_404_NOT_FOUND, "선택 가능한 후보가 없습니다."),
-        "REQUEST_NOT_MATCHED": (status.HTTP_400_BAD_REQUEST, "아직 매칭 완료 상태가 아닙니다."),
-        "MATCHED_PARTY_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "매칭된 파티가 없습니다."),
-        "PARTY_NOT_FOUND": (status.HTTP_404_NOT_FOUND, "파티를 찾을 수 없습니다."),
-        "PARTY_STATUS_CHANGED": (status.HTTP_409_CONFLICT, "파티 상태가 변경되었습니다."),
-        "PARTY_FULL": (status.HTTP_409_CONFLICT, "파티 정원이 마감되었습니다."),
-        "ALREADY_JOINED": (status.HTTP_409_CONFLICT, "이미 참여 중인 파티입니다."),
-        "GPU_EMBEDDING_CONNECT_TIMEOUT": (status.HTTP_504_GATEWAY_TIMEOUT, "임베딩 서버 연결 시간이 초과되었습니다."),
-        "GPU_EMBEDDING_CONNECT_ERROR": (status.HTTP_502_BAD_GATEWAY, "임베딩 서버에 연결할 수 없습니다."),
-        "GPU_EMBEDDING_HTTP_ERROR": (status.HTTP_502_BAD_GATEWAY, "임베딩 서버가 오류 응답을 반환했습니다."),
+def _map_quick_match_exception(exc: Exception) -> HTTPException:
+    code = str(exc)
+
+    error_map: dict[str, tuple[int, str]] = {
+        "USER_NOT_FOUND": (404, "사용자를 찾을 수 없습니다."),
+        "USER_INACTIVE": (403, "비활성화된 사용자입니다."),
+        "USER_BANNED": (403, "이용이 제한된 사용자입니다."),
+        "ALREADY_REQUESTED": (400, "이미 진행 중인 빠른매칭 요청이 있습니다."),
+        "ALREADY_IN_ACTIVE_PARTY": (400, "이미 해당 서비스의 활성 파티에 참여 중입니다."),
+        "REQUEST_NOT_FOUND": (404, "빠른매칭 요청을 찾을 수 없습니다."),
+        "INVALID_REQUEST_STATUS": (400, "현재 상태에서는 후보 탐색을 진행할 수 없습니다."),
+        "NO_RECRUITING_PARTY": (404, "현재 모집 중인 파티가 없습니다."),
+        "NO_CANDIDATE": (404, "조건에 맞는 후보 파티를 찾지 못했습니다."),
+        "PARTY_NOT_FOUND": (404, "파티를 찾을 수 없습니다."),
+        "PARTY_STATUS_CHANGED": (409, "파티 상태가 변경되었습니다."),
+        "PARTY_FULL": (409, "파티 정원이 가득 찼습니다."),
+        "REQUEST_NOT_MATCHED": (400, "매칭 완료 상태의 요청이 아닙니다."),
+        "MATCHED_PARTY_NOT_FOUND": (404, "매칭된 파티 정보를 찾을 수 없습니다."),
     }
-    return error_map.get(error_code, (status.HTTP_400_BAD_REQUEST, error_code))
+
+    status_code, detail = error_map.get(
+        code,
+        (500, "빠른매칭 처리 중 오류가 발생했습니다."),
+    )
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 @router.post(
@@ -61,190 +59,38 @@ def map_error(error_code: str) -> tuple[int, str]:
     response_model=QuickMatchCreateResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_quick_match_request(
-    payload: QuickMatchCreateRequest,
-    db: AsyncSession = Depends(get_db),
+async def create_quick_match(
+    body: QuickMatchCreateRequest,
     current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
 ):
     try:
         request = await quick_match_service.create_request(
             db=db,
             user_id=current_user.id,
-            service_id=payload.service_id,
-            preferred_conditions=payload.preferred_conditions,
+            service_id=body.service_id,
+            preferred_conditions=body.preferred_conditions,
+        )
+
+        await quick_match_service.find_candidates(
+            db=db,
+            request_id=request.id,
+        )
+
+        await quick_match_service.select_party(
+            db=db,
+            request_id=request.id,
         )
 
         return QuickMatchCreateResponse(
             message="빠른매칭 요청이 생성되었습니다.",
             request_id=request.id,
-            status=request.status.value if hasattr(request.status, "value") else str(request.status),
+            status="matched",
         )
-    except Exception as error:
-        code, message = map_error(str(error))
-        raise HTTPException(status_code=code, detail=message)
-
-
-@router.post(
-    "/{request_id}/candidates",
-    response_model=list[QuickMatchCandidateResponse],
-    status_code=status.HTTP_200_OK,
-)
-async def generate_quick_match_candidates(
-    request_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
-):
-    try:
-        return await quick_match_service.find_candidates(
-            db=db,
-            request_id=request_id,
-        )
-    except Exception as error:
-        code, message = map_error(str(error))
-        raise HTTPException(status_code=code, detail=message)
-
-
-@router.post(
-    "/{request_id}/select",
-    response_model=QuickMatchResultResponse,
-    status_code=status.HTTP_200_OK,
-)
-async def select_quick_match_party(
-    request_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
-):
-    try:
-        return await quick_match_service.select_party(
-            db=db,
-            request_id=request_id,
-        )
-    except Exception as error:
-        code, message = map_error(str(error))
-        raise HTTPException(status_code=code, detail=message)
-
-
-@router.post(
-    "/{request_id}/join",
-    status_code=status.HTTP_200_OK,
-)
-async def join_quick_match_party(
-    request_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
-):
-    request = await db.get(QuickMatchRequest, request_id)
-
-    if not request:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="빠른매칭 요청을 찾을 수 없습니다.",
-        )
-
-    if request.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="본인 요청만 처리할 수 있습니다.",
-        )
-
-    try:
-        return await quick_match_service.join_party(
-            db=db,
-            request_id=request_id,
-        )
-    except RuntimeError as error:
-        if str(error) == "LOCK_NOT_ACQUIRED":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="동시 처리 중입니다. 잠시 후 다시 시도해주세요.",
-            )
+    except HTTPException:
         raise
-    except Exception as error:
-        code, message = map_error(str(error))
-        raise HTTPException(status_code=code, detail=message)
-
-
-@router.post(
-    "/{request_id}/cancel",
-    response_model=QuickMatchRequestResponse,
-    status_code=status.HTTP_200_OK,
-)
-async def cancel_quick_match_request(
-    request_id: uuid.UUID,
-    payload: QuickMatchCancelRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
-):
-    request = await db.get(QuickMatchRequest, request_id)
-
-    if not request:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="빠른매칭 요청을 찾을 수 없습니다.",
-        )
-
-    if request.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="본인 요청만 취소할 수 있습니다.",
-        )
-
-    if request.status in {
-        QuickMatchRequestStatus.MATCHED,
-        QuickMatchRequestStatus.FAILED,
-        QuickMatchRequestStatus.EXPIRED,
-        QuickMatchRequestStatus.CANCELLED,
-    }:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="이미 종료된 요청입니다.",
-        )
-
-    request.status = QuickMatchRequestStatus.CANCELLED
-    request.fail_reason = payload.reason
-    request.cancelled_at = datetime.utcnow()
-    request.is_active = False
-
-    await db.commit()
-    await db.refresh(request)
-
-    return request
-
-
-@router.post(
-    "/{request_id}/retry",
-    response_model=QuickMatchRequestResponse,
-    status_code=status.HTTP_200_OK,
-)
-async def retry_quick_match_request(
-    request_id: uuid.UUID,
-    payload: QuickMatchRetryRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
-):
-    request = await db.get(QuickMatchRequest, request_id)
-
-    if not request:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="빠른매칭 요청을 찾을 수 없습니다.",
-        )
-
-    if request.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="본인 요청만 재시도할 수 있습니다.",
-        )
-
-    try:
-        return await quick_match_service.fail_request(
-            db=db,
-            request_id=request_id,
-            reason=payload.reason or "manual_retry",
-        )
-    except Exception as error:
-        code, message = map_error(str(error))
-        raise HTTPException(status_code=code, detail=message)
+    except Exception as exc:
+        raise _map_quick_match_exception(exc)
 
 
 @router.get(
@@ -254,28 +100,85 @@ async def retry_quick_match_request(
 )
 async def get_quick_match_detail(
     request_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
 ):
     request = await db.get(QuickMatchRequest, request_id)
-
     if not request:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="빠른매칭 요청을 찾을 수 없습니다.",
-        )
+        raise HTTPException(status_code=404, detail="빠른매칭 요청을 찾을 수 없습니다.")
 
     if request.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="본인 요청만 조회할 수 있습니다.",
-        )
+        raise HTTPException(status_code=403, detail="해당 요청에 접근할 수 없습니다.")
 
-    candidates = list(request.candidates) if request.candidates else []
-    result = request.result
+    candidate_result = await db.execute(
+        select(QuickMatchCandidate)
+        .where(QuickMatchCandidate.request_id == request_id)
+        .order_by(QuickMatchCandidate.rank.asc().nullslast(), QuickMatchCandidate.created_at.asc())
+    )
+    candidates = candidate_result.scalars().all()
+
+    result_result = await db.execute(
+        select(QuickMatchResult).where(QuickMatchResult.request_id == request_id)
+    )
+    result = result_result.scalar_one_or_none()
 
     return QuickMatchDetailResponse(
         request=request,
-        candidates=candidates,
+        candidates=list(candidates),
         result=result,
     )
+
+
+@router.post(
+    "/{request_id}/join",
+    status_code=status.HTTP_200_OK,
+)
+async def join_quick_matched_party(
+    request_id: uuid.UUID,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await db.get(QuickMatchRequest, request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="빠른매칭 요청을 찾을 수 없습니다.")
+
+    if request.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="해당 요청에 접근할 수 없습니다.")
+
+    try:
+        return await quick_match_service.join_party(
+            db=db,
+            request_id=request_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _map_quick_match_exception(exc)
+
+
+@router.post(
+    "/{request_id}/retry",
+    status_code=status.HTTP_200_OK,
+)
+async def retry_quick_match(
+    request_id: uuid.UUID,
+    body: QuickMatchRetryRequest,
+    current_user: User = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await db.get(QuickMatchRequest, request_id)
+    if not request:
+        raise HTTPException(status_code=404, detail="빠른매칭 요청을 찾을 수 없습니다.")
+
+    if request.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="해당 요청에 접근할 수 없습니다.")
+
+    try:
+        return await quick_match_service.retry_match(
+            db=db,
+            request_id=request_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _map_quick_match_exception(exc)

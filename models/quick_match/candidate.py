@@ -4,16 +4,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import (
-    DateTime,
-    Enum,
-    ForeignKey,
-    Integer,
-    JSON,
-    Numeric,
-    func,
-    text,
-)
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, Numeric, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,31 +43,27 @@ class QuickMatchCandidate(Base):
     )
 
     rule_score: Mapped[float] = mapped_column(
-        Numeric(5, 2),
+        Numeric(5, 4),
         nullable=False,
         default=0,
         server_default="0",
+        comment="규칙 기반 점수",
     )
 
-    vector_score: Mapped[float] = mapped_column(
-        Numeric(5, 2),
+    probability_score: Mapped[float] = mapped_column(
+        Numeric(5, 4),
         nullable=False,
         default=0,
         server_default="0",
+        comment="과거 데이터 기반 성공 확률 점수",
     )
 
-    llm_score: Mapped[float] = mapped_column(
-        Numeric(5, 2),
+    final_score: Mapped[float] = mapped_column(
+        Numeric(5, 4),
         nullable=False,
         default=0,
         server_default="0",
-    )
-
-    ai_score: Mapped[float] = mapped_column(
-        Numeric(5, 2),
-        nullable=False,
-        default=0,
-        server_default="0",
+        comment="최종 랭킹 점수",
     )
 
     rank: Mapped[int | None] = mapped_column(
@@ -88,7 +75,7 @@ class QuickMatchCandidate(Base):
     filter_reasons: Mapped[dict | None] = mapped_column(
         JSON,
         nullable=True,
-        comment="필터링/점수 계산 근거",
+        comment="필터링 및 점수 계산 근거",
     )
 
     status: Mapped[QuickMatchCandidateStatus] = mapped_column(

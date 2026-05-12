@@ -56,7 +56,7 @@ class QuickMatchResult(Base):
     final_scores: Mapped[dict | None] = mapped_column(
         JSON,
         nullable=True,
-        comment="rule/vector/llm/final 최종 점수 스냅샷",
+        comment="rule/probability/final 최종 점수 스냅샷",
     )
 
     decision_reason: Mapped[str | None] = mapped_column(

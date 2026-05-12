@@ -15,6 +15,8 @@ celery_app = Celery(
         "tasks.email_tasks",
         "tasks.party_trust_bonus",
         "tasks.payment_deadline",
+        "tasks.quick_match_training_label",
+        "tasks.quick_match_training_stats",
     ],
 )
 
@@ -36,6 +38,11 @@ celery_app.conf.update(
         "payment-deadline-check": {
             "task": "tasks.payment_deadline.check_payment_deadline",
             "schedule": 600,  # 10분
+        },
+        # 매일 1회 빠른매칭 pending 학습 이벤트 라벨 확정 및 통계분석
+        "quick-match-training-label": {
+            "task": "tasks.quick_match_training_label.label_quick_match_training_events",
+            "schedule": 86400,  # 24시간
         },
     },
 )

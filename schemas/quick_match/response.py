@@ -16,11 +16,10 @@ class QuickMatchRequestResponse(BaseModel):
     preferred_conditions: dict[str, Any] | None = None
     matched_party_id: uuid.UUID | None = None
     fail_reason: str | None = None
-    ai_profile_snapshot: dict[str, Any] | None = None
+    request_profile_snapshot: dict[str, Any] | None = None
     requested_at: datetime
     matched_at: datetime | None = None
     expired_at: datetime | None = None
-    cancelled_at: datetime | None = None
     is_active: bool
     created_at: datetime
     updated_at: datetime
@@ -33,9 +32,8 @@ class QuickMatchCandidateResponse(BaseModel):
     request_id: uuid.UUID
     party_id: uuid.UUID
     rule_score: float
-    vector_score: float
-    llm_score: float
-    ai_score: float
+    probability_score: float
+    final_score: float
     rank: int | None = None
     filter_reasons: dict[str, Any] | None = None
     status: str
@@ -55,20 +53,6 @@ class QuickMatchResultResponse(BaseModel):
     final_scores: dict[str, Any] | None = None
     decision_reason: str | None = None
     created_at: datetime
-
-
-class QuickMatchEmbeddingResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    user_id: uuid.UUID
-    service_id: uuid.UUID
-    embedding_vector: list[float] | None = None
-    embedding_version: str
-    source_snapshot: dict[str, Any] | None = None
-    last_generated_at: datetime | None = None
-    created_at: datetime
-    updated_at: datetime
 
 
 class QuickMatchCreateResponse(BaseModel):

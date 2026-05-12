@@ -1,33 +1,38 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from core.redis_lock import redis_lock
-from models.party import Party, PartyEmbedding, PartyMember
+from models.report import Report
+from models.party import Party, PartyMember
 from models.quick_match.candidate import QuickMatchCandidate, QuickMatchCandidateStatus
-from models.quick_match.embedding import PartyMatchEmbedding
 from models.quick_match.request import QuickMatchRequest, QuickMatchRequestStatus
 from models.quick_match.result import QuickMatchResult
+from models.quick_match.training_events import (
+    QuickMatchTrainingEvent,
+    QuickMatchTrainingLabelStatus,
+)
+
 from models.user import User
-from services.quick_match.embedding_service import EmbeddingService
 from services.notifications.party_notification_service import (
     notify_quick_match_completed,
     notify_quick_match_member_joined_to_leader,
 )
+from services.quick_match.training_event_service import (
+    mark_training_event_excluded,
+    mark_unselected_candidates_excluded,
+)
+from services.quick_match.training_stats_service import load_training_stats
 
 logger = logging.getLogger(__name__)
-
-# 룰점수 상위 후보만 벡터 유사도 계산 대상으로 사용한다.
-TOP_VECTOR_CANDIDATES = 30
 
 DURATION_UNDER_1_MONTH = "under_1_month"
 DURATION_1_3_MONTHS = "1_3_months"
@@ -85,53 +90,19 @@ class QuickMatchService:
             raise Exception("ALREADY_IN_ACTIVE_PARTY")
 
         normalized_conditions = self._normalize_preferred_conditions(preferred_conditions)
-        ai_profile = await self._build_user_ai_profile(
+        request_profile = await self._build_request_profile_snapshot(
             db=db,
             user=user,
             service_id=service_id,
             preferred_conditions=normalized_conditions,
         )
 
-        # 사용자 임베딩은 기존 것이 있으면 재사용한다.
-        existing_embedding_result = await db.execute(
-            select(PartyMatchEmbedding).where(
-                PartyMatchEmbedding.user_id == user_id,
-                PartyMatchEmbedding.service_id == service_id,
-            )
-        )
-        embedding = existing_embedding_result.scalar_one_or_none()
-
-        if embedding and embedding.embedding_vector:
-            embedding_vector = embedding.embedding_vector
-            if hasattr(embedding, "source_snapshot"):
-                embedding.source_snapshot = ai_profile
-        else:
-            # LLM 요약 없이 ai_profile 자체를 임베딩한다.
-            embedding_text = EmbeddingService.serialize_user_profile_text(ai_profile)
-            embedding_vector = await EmbeddingService.generate_embedding({"text": embedding_text})
-
-            if embedding:
-                embedding.embedding_vector = embedding_vector
-                if hasattr(embedding, "source_snapshot"):
-                    embedding.source_snapshot = ai_profile
-                if hasattr(embedding, "last_generated_at"):
-                    embedding.last_generated_at = datetime.now(timezone.utc)
-            else:
-                embedding = PartyMatchEmbedding(
-                    user_id=user_id,
-                    service_id=service_id,
-                    embedding_vector=embedding_vector,
-                    source_snapshot=ai_profile,
-                    last_generated_at=datetime.now(timezone.utc),
-                )
-                db.add(embedding)
-
         request = QuickMatchRequest(
             user_id=user_id,
             service_id=service_id,
             status=QuickMatchRequestStatus.REQUESTED,
             preferred_conditions=normalized_conditions,
-            ai_profile_snapshot=ai_profile,
+            request_profile_snapshot=request_profile,
             requested_at=datetime.now(timezone.utc),
             expired_at=datetime.now(timezone.utc) + timedelta(minutes=5),
             is_active=True,
@@ -143,12 +114,11 @@ class QuickMatchService:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            "[QuickMatch] create_request done request_id=%s user_id=%s service_id=%s elapsed=%.3fs embedding_reused=%s",
+            "[QuickMatch] create_request done request_id=%s user_id=%s service_id=%s elapsed=%.3fs",
             request.id,
             user_id,
             service_id,
             elapsed,
-            bool(embedding and embedding.embedding_vector),
         )
 
         return request
@@ -164,27 +134,12 @@ class QuickMatchService:
         if not request:
             raise Exception("REQUEST_NOT_FOUND")
 
-        logger.info(
-            "[QuickMatch] find_candidates start request_id=%s user_id=%s service_id=%s",
-            request_id,
-            request.user_id,
-            request.service_id,
-        )
-
         if request.status != QuickMatchRequestStatus.REQUESTED:
             raise Exception("INVALID_REQUEST_STATUS")
 
         user = await db.get(User, request.user_id)
         if not user:
             raise Exception("USER_NOT_FOUND")
-
-        embedding_result = await db.execute(
-            select(PartyMatchEmbedding).where(
-                PartyMatchEmbedding.user_id == request.user_id,
-                PartyMatchEmbedding.service_id == request.service_id,
-            )
-        )
-        user_embedding = embedding_result.scalar_one_or_none()
 
         existing_candidates = await db.execute(
             select(QuickMatchCandidate).where(
@@ -195,23 +150,31 @@ class QuickMatchService:
             await db.delete(row)
         await db.flush()
 
+        user_trust_score = float(getattr(user, "trust_score", 0) or 0)
+        remaining_seat_expr = (
+            func.coalesce(Party.max_members, 0)
+            - func.coalesce(Party.current_members, 0)
+        )
+
         party_result = await db.execute(
             select(Party)
-            .options(selectinload(Party.service))
+            .options(selectinload(Party.service), selectinload(Party.host))
             .where(
                 Party.status == "recruiting",
                 Party.service_id == request.service_id,
+                func.coalesce(Party.current_members, 0) < func.coalesce(Party.max_members, 0),
+                func.coalesce(Party.min_trust_score, 0) <= user_trust_score,
             )
+            .order_by(
+                remaining_seat_expr.desc(),
+                Party.created_at.desc(),
+            )
+            .limit(100)
         )
         parties = party_result.scalars().all()
 
+
         if not parties:
-            elapsed = time.perf_counter() - start_time
-            logger.warning(
-                "[QuickMatch] no recruiting party request_id=%s elapsed=%.3fs",
-                request.id,
-                elapsed,
-            )
             await self.fail_request(
                 db=db,
                 request_id=request.id,
@@ -227,10 +190,10 @@ class QuickMatchService:
         joined_party_ids = set(existing_members_result.scalars().all())
 
         preferred_conditions = self._normalize_preferred_conditions(request.preferred_conditions)
-        user_trust_score = float(getattr(user, "trust_score", 0) or 0)
-        # 1단계: 하드필터 + 룰점수만 먼저 계산한다.
-        # 여기서는 파티 임베딩 조회/벡터 유사도 계산을 하지 않는다.
-        rule_scored_candidates: list[dict[str, Any]] = []
+
+        probability_stats = await self._build_probability_stats(db)
+
+        scored_candidates: list[dict[str, Any]] = []
 
         for party in parties:
             filter_reasons: dict[str, Any] = {
@@ -238,7 +201,8 @@ class QuickMatchService:
                 "recruiting_status": party.status == "recruiting",
             }
 
-            hard_filter_ok, hard_filter_detail = self._passes_hard_filters(
+            hard_filter_ok, hard_filter_detail = await self._passes_hard_filters(
+                db=db,
                 user=user,
                 party=party,
                 joined_party_ids=joined_party_ids,
@@ -247,6 +211,7 @@ class QuickMatchService:
             )
             filter_reasons["hard_filter"] = hard_filter_detail
 
+            # 하드필터 통과하지 못했을 경우
             if not hard_filter_ok:
                 self._reject_candidate(
                     db=db,
@@ -262,148 +227,32 @@ class QuickMatchService:
                 user_trust_score=user_trust_score,
                 preferred_conditions=preferred_conditions,
             )
-            filter_reasons["rule_reason"] = rule_reason
+            probability_score, probability_reason = self._calculate_probability_score(
+                user=user,
+                party=party,
+                preferred_conditions=preferred_conditions,
+                probability_stats=probability_stats,
+            )
+            final_score = self._calculate_final_score(
+                rule_score=rule_score,
+                probability_score=probability_score,
+            )
 
-            rule_scored_candidates.append(
+            filter_reasons["rule_reason"] = rule_reason
+            filter_reasons["probability_reason"] = probability_reason
+            filter_reasons["score_basis"] = "rule_probability"
+
+            scored_candidates.append(
                 {
                     "party": party,
                     "rule_score": float(rule_score),
-                    "party_profile": self._build_party_profile(party),
-                    "filter_reasons": dict(filter_reasons),
-                }
-            )
-
-        if not rule_scored_candidates:
-            rejected_result = await db.execute(
-                select(QuickMatchCandidate).where(
-                    QuickMatchCandidate.request_id == request.id,
-                    QuickMatchCandidate.status == QuickMatchCandidateStatus.REJECTED,
-                )
-            )
-            rejected_candidates = rejected_result.scalars().all()
-
-            reason_counts: dict[str, int] = {}
-            for candidate in rejected_candidates:
-                excluded_reason = (candidate.filter_reasons or {}).get("excluded_reason", "unknown")
-                reason_counts[excluded_reason] = reason_counts.get(excluded_reason, 0) + 1
-
-            elapsed = time.perf_counter() - start_time
-            logger.warning(
-                "[QuickMatch] no candidate after hard/rule request_id=%s checked_parties=%s rejected=%s reason_counts=%s elapsed=%.3fs",
-                request.id,
-                len(parties),
-                len(rejected_candidates),
-                reason_counts,
-                elapsed,
-            )
-
-            await self.fail_request(
-                db=db,
-                request_id=request.id,
-                reason="NO_CANDIDATE",
-            )
-            raise Exception("NO_CANDIDATE")
-
-        # 2단계: 룰점수 기준으로 먼저 정렬하고, 상위 N개만 벡터 유사도 대상으로 사용한다.
-        rule_scored_candidates.sort(
-            key=lambda item: item["rule_score"],
-            reverse=True,
-        )
-        vector_targets = rule_scored_candidates[:TOP_VECTOR_CANDIDATES]
-
-        if not user_embedding or not user_embedding.embedding_vector:
-            for item in vector_targets:
-                filter_reasons = dict(item["filter_reasons"])
-                filter_reasons["normal_match_unavailable_reason"] = "user_embedding_not_found"
-                self._reject_candidate(
-                    db=db,
-                    request_id=request.id,
-                    party_id=item["party"].id,
-                    filter_reasons=filter_reasons,
-                    reason="user_embedding_not_found",
-                )
-
-            await self.fail_request(
-                db=db,
-                request_id=request.id,
-                reason="USER_EMBEDDING_NOT_FOUND",
-            )
-            raise Exception("USER_EMBEDDING_NOT_FOUND")
-
-        scored_candidates_base: list[dict[str, Any]] = []
-
-        for item in vector_targets:
-            party = item["party"]
-            filter_reasons = dict(item["filter_reasons"])
-
-            # 파티 임베딩은 빠른매칭 시 생성하지 않고 조회만 한다.
-            party_embedding = await self._get_party_embedding(
-                db=db,
-                party_id=party.id,
-            )
-            if not party_embedding or not party_embedding.embedding_vector:
-                filter_reasons["normal_match_unavailable_reason"] = "party_embedding_not_found"
-                self._reject_candidate(
-                    db=db,
-                    request_id=request.id,
-                    party_id=party.id,
-                    filter_reasons=filter_reasons,
-                    reason="party_embedding_not_found",
-                )
-                continue
-
-            vector_score = self._calculate_vector_score(
-                user_embedding.embedding_vector,
-                party_embedding.embedding_vector,
-            )
-
-            ai_score = self._calculate_ai_score(
-                rule_score=float(item["rule_score"]),
-                vector_score=float(vector_score),
-            )
-
-            filter_reasons["vector_target"] = True
-            filter_reasons["vector_target_limit"] = TOP_VECTOR_CANDIDATES
-            filter_reasons["match_mode"] = "normal"
-            filter_reasons["score_basis"] = "rule_vector_only"
-
-            scored_candidates_base.append(
-                {
-                    "party": party,
-                    "rule_score": float(item["rule_score"]),
-                    "vector_score": float(vector_score),
-                    "llm_score": 0.0,
-                    "ai_score": ai_score,
+                    "probability_score": float(probability_score),
+                    "final_score": float(final_score),
                     "filter_reasons": filter_reasons,
                 }
             )
 
-        if not scored_candidates_base:
-            rejected_result = await db.execute(
-                select(QuickMatchCandidate).where(
-                    QuickMatchCandidate.request_id == request.id,
-                    QuickMatchCandidate.status == QuickMatchCandidateStatus.REJECTED,
-                )
-            )
-            rejected_candidates = rejected_result.scalars().all()
-
-            reason_counts: dict[str, int] = {}
-            for candidate in rejected_candidates:
-                excluded_reason = (candidate.filter_reasons or {}).get("excluded_reason", "unknown")
-                reason_counts[excluded_reason] = reason_counts.get(excluded_reason, 0) + 1
-
-            elapsed = time.perf_counter() - start_time
-            logger.warning(
-                "[QuickMatch] no candidate after vector request_id=%s checked_parties=%s rule_candidates=%s vector_targets=%s rejected=%s reason_counts=%s elapsed=%.3fs",
-                request.id,
-                len(parties),
-                len(rule_scored_candidates),
-                len(vector_targets),
-                len(rejected_candidates),
-                reason_counts,
-                elapsed,
-            )
-
+        if not scored_candidates:
             await self.fail_request(
                 db=db,
                 request_id=request.id,
@@ -411,12 +260,10 @@ class QuickMatchService:
             )
             raise Exception("NO_CANDIDATE")
 
-        # 3단계: LLM 재판단 없이 rule + vector 최종 점수만으로 정렬한다.
-        scored_candidates = scored_candidates_base
         scored_candidates.sort(
             key=lambda item: (
-                item["ai_score"],
-                item["vector_score"],
+                item["final_score"],
+                item["probability_score"],
                 item["rule_score"],
             ),
             reverse=True,
@@ -424,21 +271,70 @@ class QuickMatchService:
 
         created_candidates: list[QuickMatchCandidate] = []
         for idx, item in enumerate(scored_candidates, start=1):
-            status = QuickMatchCandidateStatus.SELECTED if idx == 1 else QuickMatchCandidateStatus.PENDING
+            status = (
+                QuickMatchCandidateStatus.SELECTED
+                if idx == 1
+                else QuickMatchCandidateStatus.PENDING
+            )
 
             candidate = QuickMatchCandidate(
                 request_id=request.id,
                 party_id=item["party"].id,
                 rule_score=item["rule_score"],
-                vector_score=item["vector_score"],
-                llm_score=item["llm_score"],
-                ai_score=item["ai_score"],
+                probability_score=item["probability_score"],
+                final_score=item["final_score"],
                 rank=idx,
                 status=status,
                 filter_reasons=item["filter_reasons"],
             )
             db.add(candidate)
+            await db.flush()
             created_candidates.append(candidate)
+
+            training_event = QuickMatchTrainingEvent(
+                request_id=request.id,
+                candidate_id=candidate.id,
+                user_id=request.user_id,
+                service_id=request.service_id,
+                party_id=item["party"].id,
+                is_selected=status == QuickMatchCandidateStatus.SELECTED,
+                is_joined=False,
+                label_status=QuickMatchTrainingLabelStatus.PENDING.value,
+                features_snapshot={
+                    "rule_score": item["rule_score"],
+                    "probability_score": item["probability_score"],
+                    "final_score": item["final_score"],
+                    "rank": idx,
+                    "candidate_status": status.value,
+                    "filter_reasons": item["filter_reasons"],
+                    "party": {
+                        "id": str(item["party"].id),
+                        "service_id": str(item["party"].service_id),
+                        "max_members": item["party"].max_members,
+                        "current_members": item["party"].current_members,
+                        "min_trust_score": item["party"].min_trust_score,
+                        "start_date": item["party"].start_date.isoformat()
+                        if item["party"].start_date
+                        else None,
+                        "end_date": item["party"].end_date.isoformat()
+                        if item["party"].end_date
+                        else None,
+                    },
+                    "user": {
+                        "id": str(request.user_id),
+                        "trust_score": user_trust_score,
+                    },
+                    "preferred_conditions": preferred_conditions,
+                },
+            )
+            db.add(training_event)
+
+        # 빠른매칭 학습데이터 - 보류/제외
+        await mark_unselected_candidates_excluded(
+            db,
+            request_id=request.id,
+            reason="not_selected",
+        )
 
         await db.commit()
 
@@ -447,11 +343,9 @@ class QuickMatchService:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            "[QuickMatch] find_candidates done request_id=%s selected_candidates=%s hard_rule_candidates=%s vector_targets=%s elapsed=%.3fs",
+            "[QuickMatch] find_candidates done request_id=%s selected_candidates=%s elapsed=%.3fs",
             request.id,
             len(created_candidates),
-            len(rule_scored_candidates),
-            len(vector_targets),
             elapsed,
         )
 
@@ -465,7 +359,9 @@ class QuickMatchService:
         start_time = time.perf_counter()
 
         result = await db.execute(
-            select(QuickMatchCandidate).where(QuickMatchCandidate.request_id == request_id)
+            select(QuickMatchCandidate).where(
+                QuickMatchCandidate.request_id == request_id
+            )
         )
         candidates = result.scalars().all()
 
@@ -474,9 +370,8 @@ class QuickMatchService:
 
         candidates.sort(
             key=lambda candidate: (
-                self._get_match_mode_priority(candidate.filter_reasons),
-                float(candidate.ai_score),
-                float(candidate.vector_score),
+                float(candidate.final_score),
+                float(candidate.probability_score),
                 float(candidate.rule_score),
             ),
             reverse=True,
@@ -503,19 +398,14 @@ class QuickMatchService:
         request.status = QuickMatchRequestStatus.MATCHED
         request.matched_party_id = candidate.party_id
         request.matched_at = datetime.now(timezone.utc)
-
-        requested_at = request.requested_at
-        elapsed_from_request = None
-        if requested_at is not None:
-            now_utc = datetime.now(timezone.utc)
-            requested_at_utc = requested_at if requested_at.tzinfo is not None else requested_at.replace(tzinfo=timezone.utc)
-            elapsed_from_request = (now_utc - requested_at_utc).total_seconds()
-
         request.is_active = False
+
         candidate.status = QuickMatchCandidateStatus.SELECTED
 
         existing_result = await db.execute(
-            select(QuickMatchResult).where(QuickMatchResult.request_id == request.id)
+            select(QuickMatchResult).where(
+                QuickMatchResult.request_id == request.id
+            )
         )
         result_row = existing_result.scalar_one_or_none()
 
@@ -529,19 +419,19 @@ class QuickMatchService:
             "user_id": str(request.user_id),
             "service_id": str(request.service_id),
             "preferred_conditions": request.preferred_conditions,
-            "ai_profile_snapshot": request.ai_profile_snapshot,
+            "request_profile_snapshot": request.request_profile_snapshot,
         }
         result_row.candidate_snapshot = {
             "party_id": str(candidate.party_id),
             "rank": candidate.rank,
-            "status": candidate.status.value if hasattr(candidate.status, "value") else str(candidate.status),
+            "status": candidate.status.value,
             "filter_reasons": candidate.filter_reasons,
         }
         result_row.final_scores = {
             "rule_score": float(candidate.rule_score),
-            "vector_score": float(candidate.vector_score),
-            "final_score": float(candidate.ai_score),
-            "score_basis": "rule_vector_only",
+            "probability_score": float(candidate.probability_score),
+            "final_score": float(candidate.final_score),
+            "score_basis": "rule_probability",
         }
         result_row.decision_reason = self._build_decision_reason(candidate)
 
@@ -550,13 +440,12 @@ class QuickMatchService:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            "[QuickMatch] select_party done request_id=%s party_id=%s candidate_id=%s final_score=%.4f elapsed=%.3fs elapsed_from_request=%.3fs",
+            "[QuickMatch] select_party done request_id=%s party_id=%s candidate_id=%s final_score=%.4f elapsed=%.3fs",
             request.id,
             candidate.party_id,
             candidate.id,
-            float(candidate.ai_score),
+            float(candidate.final_score),
             elapsed,
-            elapsed_from_request if elapsed_from_request is not None else -1.0,
         )
 
         return result_row
@@ -572,10 +461,7 @@ class QuickMatchService:
         if not request:
             raise Exception("REQUEST_NOT_FOUND")
 
-        if request.status not in [
-            QuickMatchRequestStatus.MATCHED,
-            QuickMatchRequestStatus.REMATCHING,
-        ]:
+        if request.status != QuickMatchRequestStatus.MATCHED:
             raise Exception("REQUEST_NOT_MATCHED")
 
         if not request.matched_party_id:
@@ -587,33 +473,26 @@ class QuickMatchService:
             .where(Party.id == request.matched_party_id)
         )
         party = party_result.scalar_one_or_none()
-
         if not party:
             raise Exception("PARTY_NOT_FOUND")
 
         lock_key = f"quick_match_lock:{party.id}"
 
-        async with redis_lock(lock_key=lock_key, lock_value=str(request.id), expire_seconds=30):
+        async with redis_lock(
+            lock_key=lock_key,
+            lock_value=str(request.id),
+            expire_seconds=30,
+        ):
             await db.refresh(party)
 
             party_current_members = int(getattr(party, "current_members", 0) or 0)
             party_max_members = int(getattr(party, "max_members", 0) or 0)
 
             if party.status != "recruiting":
-                logger.warning(
-                    "[QuickMatch] join failed status changed request_id=%s party_id=%s",
-                    request.id,
-                    party.id,
-                )
                 await self.fail_request(db, request.id, "PARTY_STATUS_CHANGED")
                 return await self.retry_match(db, request.id)
 
             if party_current_members >= party_max_members:
-                logger.warning(
-                    "[QuickMatch] join failed full party request_id=%s party_id=%s",
-                    request.id,
-                    party.id,
-                )
                 await self.fail_request(db, request.id, "PARTY_FULL")
                 return await self.retry_match(db, request.id)
 
@@ -625,22 +504,10 @@ class QuickMatchService:
             )
             existing_member = existing_member_result.scalar_one_or_none()
             if existing_member:
-                logger.warning(
-                    "[QuickMatch] join failed already joined request_id=%s party_id=%s user_id=%s",
-                    request.id,
-                    party.id,
-                    request.user_id,
-                )
                 await self.fail_request(db, request.id, "ALREADY_JOINED")
                 return await self.retry_match(db, request.id)
 
             now = datetime.utcnow()
-
-            requested_at = request.requested_at
-            total_match_elapsed = None
-            if requested_at is not None:
-                requested_at_naive = requested_at.replace(tzinfo=None) if requested_at.tzinfo is not None else requested_at
-                total_match_elapsed = (now - requested_at_naive).total_seconds()
 
             matched_at = request.matched_at
             if matched_at is None:
@@ -662,6 +529,25 @@ class QuickMatchService:
             )
             db.add(new_member)
 
+            training_result = await db.execute(
+                select(QuickMatchTrainingEvent).where(
+                    QuickMatchTrainingEvent.request_id == request.id,
+                    QuickMatchTrainingEvent.party_id == party.id,
+                )
+            )
+            training_event = training_result.scalar_one_or_none()
+
+            if training_event:
+                training_event.is_joined = True
+                training_event.joined_at = now
+                training_event.result_snapshot = {
+                    "party_member_id": str(new_member.id) if new_member.id else None,
+                    "party_id": str(party.id),
+                    "user_id": str(request.user_id),
+                    "join_type": "quick_match",
+                    "joined_at": now.isoformat(),
+                }
+
             party.current_members = party_current_members + 1
             request.status = QuickMatchRequestStatus.MATCHED
             request.is_active = False
@@ -671,8 +557,6 @@ class QuickMatchService:
 
             user = await db.get(User, request.user_id)
 
-
-            # 빠른매칭 알림
             await notify_quick_match_completed(
                 db=db,
                 party=party,
@@ -690,24 +574,26 @@ class QuickMatchService:
 
             elapsed = time.perf_counter() - start_time
             logger.info(
-                "[QuickMatch] join_party done request_id=%s party_id=%s user_id=%s current_members=%s elapsed=%.3fs total_match_elapsed=%.3fs",
+                "[QuickMatch] join_party done request_id=%s party_id=%s user_id=%s current_members=%s elapsed=%.3fs",
                 request.id,
                 party.id,
                 request.user_id,
                 party.current_members,
                 elapsed,
-                total_match_elapsed if total_match_elapsed is not None else -1.0,
             )
 
             try:
                 from routers.chat import manager
-                from datetime import timezone
-                await manager.broadcast(str(party.id), {
-                    "type": "party_updated",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
+
+                await manager.broadcast(
+                    str(party.id),
+                    {
+                        "type": "party_updated",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             except Exception as e:
-                logger.warning(f"[party_updated broadcast failed] {e}")
+                logger.warning("[party_updated broadcast failed] %s", e)
 
             return {
                 "party_member_id": new_member.id,
@@ -732,6 +618,27 @@ class QuickMatchService:
         request.fail_reason = reason
         request.retry_count += 1
         request.is_active = False
+
+        # 빠른매칭 학습데이터 - 보류/제외
+        if reason in {
+            "NO_CANDIDATE",
+            "NO_RECRUITING_PARTY",
+            "PARTY_STATUS_CHANGED",
+            "PARTY_FULL",
+            "ALREADY_JOINED",
+        }:
+            await mark_training_event_excluded(
+                db,
+                request_id=request.id,
+                party_id=request.matched_party_id,
+                reason=reason.lower(),
+                result_snapshot={
+                    "request": {
+                        "status": QuickMatchRequestStatus.FAILED.value,
+                        "fail_reason": reason,
+                    }
+                },
+            )
 
         await db.commit()
         await db.refresh(request)
@@ -761,13 +668,6 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
-
-            logger.warning(
-                "[QuickMatch] retry expired request_id=%s reason=%s",
-                request.id,
-                request.fail_reason,
-            )
-
             return request
 
         result = await db.execute(
@@ -781,8 +681,8 @@ class QuickMatchService:
                 ),
             )
         )
-
         candidates = result.scalars().all()
+
         if not candidates:
             request.status = QuickMatchRequestStatus.FAILED
             request.is_active = False
@@ -790,19 +690,12 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
-
-            logger.warning(
-                "[QuickMatch] retry failed no more candidates request_id=%s",
-                request.id,
-            )
-
             return request
 
         candidates.sort(
             key=lambda candidate: (
-                self._get_match_mode_priority(candidate.filter_reasons),
-                float(candidate.ai_score),
-                float(candidate.vector_score),
+                float(candidate.final_score),
+                float(candidate.probability_score),
                 float(candidate.rule_score),
             ),
             reverse=True,
@@ -840,30 +733,16 @@ class QuickMatchService:
 
             await db.commit()
             await db.refresh(request)
-
-            logger.warning(
-                "[QuickMatch] retry failed no selectable candidate request_id=%s",
-                request.id,
-            )
-
             return request
 
         next_candidate.status = QuickMatchCandidateStatus.SELECTED
-
         request.matched_party_id = next_candidate.party_id
-        request.status = QuickMatchRequestStatus.REMATCHING
-        request.retry_count += 1
+        request.matched_at = datetime.now(timezone.utc)
+        request.status = QuickMatchRequestStatus.MATCHED
         request.is_active = True
         request.fail_reason = None
 
         await db.commit()
-
-        logger.info(
-            "[QuickMatch] retry_match next candidate request_id=%s next_party_id=%s retry_count=%s",
-            request.id,
-            next_candidate.party_id,
-            request.retry_count,
-        )
 
         return {
             "request_id": request.id,
@@ -872,7 +751,7 @@ class QuickMatchService:
             "status": request.status.value,
         }
 
-    async def _build_user_ai_profile(
+    async def _build_request_profile_snapshot(
         self,
         db: AsyncSession,
         user: User,
@@ -884,30 +763,24 @@ class QuickMatchService:
             .join(Party, PartyMember.party_id == Party.id)
             .where(PartyMember.user_id == user.id)
         )
-
         memberships = member_result.all()
 
+        # 특정 서비스의 파티에 참여한 수
         service_membership_count = sum(
             1
-            for membership, party in memberships
+            for _, party in memberships
             if str(party.service_id) == str(service_id)
         )
 
+        # 총 참여한 파티 수
         total_membership_count = len(memberships)
+
+        # 활성화 중인 파티 수
         active_membership_count = sum(
             1
             for membership, _ in memberships
             if getattr(membership, "status", None) == "active"
         )
-
-        average_payment_amount = float(
-            getattr(user, "average_payment_amount", 0)
-            or getattr(user, "avg_payment_amount", 0)
-            or 0
-        )
-        settlement_success_count = int(getattr(user, "settlement_success_count", 0) or 0)
-        report_count = int(getattr(user, "report_count", 0) or 0)
-        leave_count = int(getattr(user, "leave_count", 0) or 0)
 
         return {
             "user_id": str(user.id),
@@ -918,45 +791,16 @@ class QuickMatchService:
                 "total_party_join_count": total_membership_count,
                 "service_party_join_count": service_membership_count,
                 "active_party_count": active_membership_count,
-                "preferred_service_id": str(service_id),
-            },
-            "payment_summary": {
-                "average_payment_amount": average_payment_amount,
-                "settlement_success_count": settlement_success_count,
             },
             "risk_summary": {
-                "report_count": report_count,
-                "leave_count": leave_count,
-                "is_currently_banned": bool(user.banned_until and user.banned_until > datetime.now(timezone.utc)),
+                
+                "is_currently_banned": bool(
+                    user.banned_until
+                    and user.banned_until > datetime.now(timezone.utc)
+                ),
             },
         }
 
-    def _build_party_profile(self, party: Party) -> dict[str, Any]:
-        service = getattr(party, "service", None)
-        return {
-            "party_id": str(party.id),
-            "service_id": str(getattr(party, "service_id", "") or ""),
-            "service_name": getattr(service, "name", None),
-            "category": self._extract_party_category(party),
-            "platform": self._extract_party_platform(party),
-            "min_trust_score": float(getattr(party, "min_trust_score", 0) or 0),
-            "max_members": int(getattr(party, "max_members", 0) or 0),
-            "current_members": int(getattr(party, "current_members", 0) or 0),
-            "description": getattr(party, "description", "") or getattr(party, "intro", ""),
-            "duration_preference": self._normalize_duration_preference(getattr(party, "duration_preference", None)),
-            "duration_label": self._format_duration_label(getattr(party, "duration_preference", None)),
-            "status": getattr(party, "status", None),
-        }
-
-    async def _get_party_embedding(
-        self,
-        db: AsyncSession,
-        party_id: uuid.UUID,
-    ):
-        result = await db.execute(
-            select(PartyEmbedding).where(PartyEmbedding.party_id == party_id)
-        )
-        return result.scalar_one_or_none()
 
     def _reject_candidate(
         self,
@@ -969,81 +813,46 @@ class QuickMatchService:
         rejected_reasons = dict(filter_reasons)
         rejected_reasons["excluded_reason"] = reason
 
-        logger.info(
-            "[QuickMatch] candidate rejected request_id=%s party_id=%s reason=%s details=%s",
-            request_id,
-            party_id,
-            reason,
-            rejected_reasons,
-        )
-
         candidate = QuickMatchCandidate(
             request_id=request_id,
             party_id=party_id,
             rule_score=0,
-            vector_score=0,
-            llm_score=0,
-            ai_score=0,
+            probability_score=0,
+            final_score=0,
             rank=None,
             status=QuickMatchCandidateStatus.REJECTED,
             filter_reasons=rejected_reasons,
         )
         db.add(candidate)
 
-    def _normalize_preferred_conditions(self, preferred_conditions: dict[str, Any] | None) -> dict[str, Any]:
+    def _normalize_preferred_conditions(
+        self,
+        preferred_conditions: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         normalized = dict(preferred_conditions or {})
 
-        if "category" in normalized and normalized.get("category") is not None:
-            normalized["category"] = str(normalized.get("category")).strip().lower()
-
-        if "platform" in normalized and normalized.get("platform") is not None:
-            normalized["platform"] = str(normalized.get("platform")).strip().lower()
-
-        # 프론트에서는 duration_preference로 전송한다.
-        # 혹시 duration_range라는 이름으로 들어와도 동일하게 처리한다.
         duration_value = normalized.get("duration_preference")
-        if duration_value in (None, "") and normalized.get("duration_range") not in (None, ""):
-            duration_value = normalized.get("duration_range")
-
         normalized_duration = self._normalize_duration_preference(duration_value)
+
         if normalized_duration:
             normalized["duration_preference"] = normalized_duration
         else:
             normalized.pop("duration_preference", None)
-        normalized.pop("duration_range", None)
 
         return normalized
 
+
     def _normalize_duration_preference(self, value: Any) -> str | None:
-        """
-        프론트의 이용 기간 값을 백엔드 표준값으로 정규화한다.
-
-        현재 표준값:
-        - under_1_month: 1개월 이하
-        - 1_3_months: 1~3개월
-        - over_3_months: 3개월 이상
-
-        기존 값(short_term / long_term / flexible)도 호환 처리한다.
-        """
         if value in (None, ""):
             return None
 
-        normalized = str(value).strip().lower()
-        normalized = normalized.replace(" ", "")
+        normalized = str(value).strip().lower().replace(" ", "")
 
         aliases = {
-            "any": None,
-            "all": None,
-            "상관없음": None,
-            "무관": None,
-            "none": None,
             DURATION_UNDER_1_MONTH: DURATION_UNDER_1_MONTH,
             "under1month": DURATION_UNDER_1_MONTH,
             "under_1_months": DURATION_UNDER_1_MONTH,
-            "less_than_1_month": DURATION_UNDER_1_MONTH,
             "1개월이하": DURATION_UNDER_1_MONTH,
-            "short_term": DURATION_UNDER_1_MONTH,
-            "short": DURATION_UNDER_1_MONTH,
             DURATION_1_3_MONTHS: DURATION_1_3_MONTHS,
             "1-3_months": DURATION_1_3_MONTHS,
             "1~3개월": DURATION_1_3_MONTHS,
@@ -1052,16 +861,11 @@ class QuickMatchService:
             "1개월-3개월": DURATION_1_3_MONTHS,
             DURATION_OVER_3_MONTHS: DURATION_OVER_3_MONTHS,
             "over3months": DURATION_OVER_3_MONTHS,
-            "more_than_3_months": DURATION_OVER_3_MONTHS,
             "3개월이상": DURATION_OVER_3_MONTHS,
-            "long_term": DURATION_OVER_3_MONTHS,
-            "long": DURATION_OVER_3_MONTHS,
-            DURATION_FLEXIBLE: DURATION_FLEXIBLE,
-            "flex": DURATION_FLEXIBLE,
-            "유연하게가능": DURATION_FLEXIBLE,
         }
 
         return aliases.get(normalized, normalized)
+
 
     def _duration_preference_to_range(self, value: Any) -> tuple[float, float] | None:
         normalized = self._normalize_duration_preference(value)
@@ -1075,12 +879,6 @@ class QuickMatchService:
             return (3.0, float("inf"))
         return None
 
-    def _format_duration_label(self, value: Any) -> str | None:
-        normalized = self._normalize_duration_preference(value)
-        if normalized is None:
-            return None
-        return DURATION_LABELS.get(normalized, str(value))
-
     def _duration_ranges_overlap(self, user_value: Any, party_value: Any) -> bool:
         normalized_user = self._normalize_duration_preference(user_value)
         normalized_party = self._normalize_duration_preference(party_value)
@@ -1088,7 +886,7 @@ class QuickMatchService:
         if normalized_user is None:
             return True
         if normalized_party is None:
-            return False
+            return True
         if normalized_user == DURATION_FLEXIBLE or normalized_party == DURATION_FLEXIBLE:
             return True
         if normalized_user == normalized_party:
@@ -1101,12 +899,27 @@ class QuickMatchService:
 
         user_low, user_high = user_range
         party_low, party_high = party_range
-
-        # 1개월 이하와 1~3개월처럼 경계만 닿는 경우는 별도 구간으로 보고 불일치 처리한다.
         return max(user_low, party_low) < min(user_high, party_high)
 
-    def _passes_hard_filters(
+    def _get_party_duration_preference(self, party: Party) -> str | None:
+        party_start_date = getattr(party, "start_date", None)
+        party_end_date = getattr(party, "end_date", None)
+
+        if not party_start_date or not party_end_date:
+            return None
+
+        duration_days = (party_end_date - party_start_date).days + 1
+        if duration_days <= 0:
+            return None
+        if duration_days <= 31:
+            return DURATION_UNDER_1_MONTH
+        if duration_days <= 93:
+            return DURATION_1_3_MONTHS
+        return DURATION_OVER_3_MONTHS
+
+    async def _passes_hard_filters(
         self,
+        db: AsyncSession,
         user: User,
         party: Party,
         joined_party_ids: set[uuid.UUID],
@@ -1115,32 +928,20 @@ class QuickMatchService:
     ) -> tuple[bool, dict[str, Any]]:
         detail: dict[str, Any] = {}
 
-        requested_category = preferred_conditions.get("category")
-        party_category = self._extract_party_category(party)
-        detail["requested_category"] = requested_category
-        detail["party_category"] = party_category
-        detail["category_match"] = self._matches_optional_string_filter(requested_category, party_category)
-        if not detail["category_match"]:
-            detail["excluded_reason"] = "category_mismatch"
-            return False, detail
-
-        requested_platform = preferred_conditions.get("platform")
-        party_platform = self._extract_party_platform(party)
-        detail["requested_platform"] = requested_platform
-        detail["party_platform"] = party_platform
-        detail["platform_match"] = self._matches_optional_string_filter(requested_platform, party_platform)
-        if not detail["platform_match"]:
-            detail["excluded_reason"] = "platform_mismatch"
-            return False, detail
-
         user_duration_preference = preferred_conditions.get("duration_preference")
-        party_duration_preference = getattr(party, "duration_preference", None)
+        party_start_date = getattr(party, "start_date", None)
+        party_end_date = getattr(party, "end_date", None)
+        party_duration_bucket = self._get_party_duration_preference(party)
+
         detail["user_duration_preference"] = user_duration_preference
-        detail["party_duration_preference"] = party_duration_preference
-        detail["duration_match"] = self._is_duration_core_match(
-            party_duration_preference=party_duration_preference,
-            user_duration_preference=user_duration_preference,
+        detail["party_start_date"] = party_start_date.isoformat() if party_start_date else None
+        detail["party_end_date"] = party_end_date.isoformat() if party_end_date else None
+        detail["party_duration_bucket"] = party_duration_bucket
+        detail["duration_match"] = self._duration_ranges_overlap(
+            user_duration_preference,
+            party_duration_bucket,
         )
+
         if not detail["duration_match"]:
             detail["excluded_reason"] = "duration_mismatch"
             return False, detail
@@ -1148,6 +949,7 @@ class QuickMatchService:
         party_max_members = int(getattr(party, "max_members", 0) or 0)
         party_current_members = int(getattr(party, "current_members", 0) or 0)
         detail["remaining_seat"] = max((party_max_members - party_current_members), 0)
+
         if party_current_members >= party_max_members:
             detail["excluded_reason"] = "party_full"
             return False, detail
@@ -1156,8 +958,13 @@ class QuickMatchService:
             detail["excluded_reason"] = "already_member"
             return False, detail
 
-        policy_excluded, policy_detail = self._get_policy_exclusion_detail(user=user, party=party)
+        policy_excluded, policy_detail = await self._get_policy_exclusion_detail(
+            db=db,
+            user=user,
+            party=party,
+        )
         detail["policy"] = policy_detail
+
         if policy_excluded:
             detail["excluded_reason"] = "policy_excluded"
             return False, detail
@@ -1166,28 +973,66 @@ class QuickMatchService:
         detail["party_min_trust_score"] = min_trust_score
         detail["user_trust_score"] = user_trust_score
         detail["trust_threshold_pass"] = user_trust_score >= min_trust_score
+
         if user_trust_score < min_trust_score:
             detail["excluded_reason"] = "trust_score_too_low"
             return False, detail
 
         return True, detail
 
-    def _get_policy_exclusion_detail(self, user: User, party: Party) -> tuple[bool, dict[str, Any]]:
-        user_report_count = int(getattr(user, "report_count", 0) or 0)
-        user_blocked = bool(getattr(user, "is_blocked_for_matching", False))
-        party_blocked = bool(getattr(party, "is_blocked_for_matching", False))
-        party_report_limit = int(getattr(party, "max_reported_user_count", 9999) or 9999)
+
+    async def _get_policy_exclusion_detail(
+        self,
+        db: AsyncSession,
+        user: User,
+        party: Party,
+    ) -> tuple[bool, dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+
+        user_inactive = not bool(getattr(user, "is_active", True))
+        user_banned = bool(
+            user.banned_until and user.banned_until > now
+        )
+
+        approved_user_report_count = await db.scalar(
+            select(func.count(Report.id)).where(
+                func.lower(Report.target_type) == "user",
+                Report.target_id == user.id,
+                Report.status == "APPROVED",
+            )
+        ) or 0
+
+        approved_party_report_count = await db.scalar(
+            select(func.count(Report.id)).where(
+                func.lower(Report.target_type) == "party",
+                Report.target_id == party.id,
+                Report.status == "APPROVED",
+            )
+        ) or 0
+
+        user_report_limit = 3
+        party_report_limit = 3
 
         detail = {
-            "user_blocked": user_blocked,
-            "party_blocked": party_blocked,
-            "user_report_count": user_report_count,
+            "user_inactive": user_inactive,
+            "user_banned": user_banned,
+            "approved_user_report_count": int(approved_user_report_count),
+            "approved_party_report_count": int(approved_party_report_count),
+            "user_report_limit": user_report_limit,
             "party_report_limit": party_report_limit,
-            "report_limit_exceeded": user_report_count > party_report_limit,
+            "user_report_limit_exceeded": approved_user_report_count >= user_report_limit,
+            "party_report_limit_exceeded": approved_party_report_count >= party_report_limit,
         }
 
-        excluded = user_blocked or party_blocked or detail["report_limit_exceeded"]
+        excluded = (
+            user_inactive
+            or user_banned
+            or detail["user_report_limit_exceeded"]
+            or detail["party_report_limit_exceeded"]
+        )
+
         return excluded, detail
+
 
     def _matches_optional_string_filter(self, requested_value: Any, actual_value: Any) -> bool:
         if requested_value in (None, "", "any", "all"):
@@ -1220,16 +1065,6 @@ class QuickMatchService:
                 return str(value).strip().lower()
         return None
 
-    def _build_decision_reason(self, candidate: QuickMatchCandidate) -> str:
-        filter_reasons = candidate.filter_reasons or {}
-        return (
-            f"최종 점수 {float(candidate.ai_score):.4f}로 1순위 선정 "
-            f"(rule={float(candidate.rule_score):.4f}, "
-            f"vector={float(candidate.vector_score):.4f}, "
-            f"basis={filter_reasons.get('score_basis', 'rule_vector_only')}, "
-            f"mode={filter_reasons.get('match_mode', 'normal')})"
-        )
-
     def _calculate_rule_score(
         self,
         party: Party,
@@ -1239,19 +1074,30 @@ class QuickMatchService:
         score = 0.0
         detail: dict[str, Any] = {}
 
+        baseline_trust_score = 36.5
         min_trust_score = float(getattr(party, "min_trust_score", 0) or 0)
-        if min_trust_score <= 0:
-            trust_fit_score = 1.0
+
+        if min_trust_score > 0:
+            if user_trust_score < min_trust_score:
+                trust_fit_score = 0.0
+            else:
+                margin = min(user_trust_score - min_trust_score, 20.0)
+                trust_fit_score = min(1.0, 0.7 + (margin / 20.0) * 0.3)
         else:
-            margin = min(max(user_trust_score - min_trust_score, 0.0), 20.0)
-            trust_fit_score = min(1.0, 0.7 + (margin / 20.0) * 0.3)
+            if user_trust_score < baseline_trust_score:
+                trust_fit_score = max(0.0, user_trust_score / baseline_trust_score) * 0.7
+            else:
+                margin = min(user_trust_score - baseline_trust_score, 20.0)
+                trust_fit_score = min(1.0, 0.7 + (margin / 20.0) * 0.3)
 
         score += trust_fit_score * 0.45
         detail["trust_fit_score"] = round(trust_fit_score, 4)
-        detail["trust_margin"] = round(max(user_trust_score - min_trust_score, 0.0), 4)
+        detail["baseline_trust_score"] = baseline_trust_score
+        detail["party_min_trust_score"] = min_trust_score
 
         party_max_members = float(getattr(party, "max_members", 0) or 0)
         party_current_members = float(getattr(party, "current_members", 0) or 0)
+
         if party_max_members <= 0:
             capacity_score = 0.0
         else:
@@ -1262,15 +1108,224 @@ class QuickMatchService:
         detail["capacity_score"] = round(capacity_score, 4)
 
         duration_score = self._calculate_duration_score(
-            party_duration_preference=getattr(party, "duration_preference", None),
+            party_duration_preference=self._get_party_duration_preference(party),
             user_duration_preference=preferred_conditions.get("duration_preference"),
         )
+
         score += duration_score * 0.25
         detail["duration_score"] = round(duration_score, 4)
-        detail["user_duration_preference"] = preferred_conditions.get("duration_preference")
-        detail["party_duration_preference"] = getattr(party, "duration_preference", None)
 
         return round(min(score, 1.0), 4), detail
+
+
+    async def _build_probability_stats(self, db: AsyncSession) -> dict[str, Any]:
+        return await load_training_stats(db)
+
+    def _success_rate(
+        self,
+        bucket: dict[str, int] | None,
+        *,
+        prior_rate: float,
+        prior_weight: int = 20,
+    ) -> tuple[float, int, int]:
+        if not bucket:
+            return round(prior_rate, 4), 0, 0
+
+        success = int(bucket.get("success", 0) or 0)
+        total = int(bucket.get("total", 0) or 0)
+        if total <= 0:
+            return round(prior_rate, 4), 0, 0
+
+        rate = (success + (prior_rate * prior_weight)) / (total + prior_weight)
+        return round(min(max(rate, 0.0), 1.0), 4), success, total
+
+    def _trust_score_to_bucket(self, value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if score < 30:
+            return "under_30"
+        if score < 40:
+            return "30_40"
+        if score < 50:
+            return "40_50"
+        if score < 60:
+            return "50_60"
+        return "over_60"
+
+    def _capacity_to_bucket(
+        self,
+        *,
+        max_members: Any,
+        current_members: Any,
+    ) -> str | None:
+        try:
+            max_value = float(max_members or 0)
+            current_value = float(current_members or 0)
+        except (TypeError, ValueError):
+            return None
+
+        if max_value <= 0:
+            return "unknown"
+
+        ratio = max(max_value - current_value, 0) / max_value
+        if ratio <= 0:
+            return "full"
+        if ratio <= 0.25:
+            return "low"
+        if ratio <= 0.50:
+            return "medium"
+        return "high"
+
+    def _duration_match_key(self, user_value: Any, party_value: Any) -> str:
+        normalized_user = self._normalize_duration_preference(user_value)
+        normalized_party = self._normalize_duration_preference(party_value)
+
+        if normalized_user is None:
+            return "no_preference"
+        if normalized_party is None:
+            return "party_unknown"
+        if normalized_user == DURATION_FLEXIBLE or normalized_party == DURATION_FLEXIBLE:
+            return "flexible"
+        if normalized_user == normalized_party:
+            return "exact"
+
+        user_range = self._duration_preference_to_range(normalized_user)
+        party_range = self._duration_preference_to_range(normalized_party)
+        if not user_range or not party_range:
+            return "unknown"
+
+        user_low, user_high = user_range
+        party_low, party_high = party_range
+        overlap = max(0.0, min(user_high, party_high) - max(user_low, party_low))
+        if overlap > 0:
+            return "overlap"
+        if user_high == party_low or party_high == user_low:
+            return "boundary"
+        return "mismatch"
+
+    def _extract_training_duration_match_key(
+        self,
+        features_snapshot: dict[str, Any],
+    ) -> str | None:
+        request_snapshot = features_snapshot.get("request") or {}
+        preferred_conditions = (
+            request_snapshot.get("preferred_conditions")
+            or features_snapshot.get("preferred_conditions")
+            or {}
+        )
+        party_snapshot = features_snapshot.get("party") or {}
+        party_duration = party_snapshot.get("duration_bucket")
+
+        if party_duration is None:
+            filter_reasons = features_snapshot.get("filter_reasons") or {}
+            hard_filter = filter_reasons.get("hard_filter") or {}
+            party_duration = hard_filter.get("party_duration_bucket")
+
+        return self._duration_match_key(
+            preferred_conditions.get("duration_preference"),
+            party_duration,
+        )
+
+    def _calculate_probability_score(
+        self,
+        user: User,
+        party: Party,
+        preferred_conditions: dict[str, Any],
+        probability_stats: dict[str, Any],
+    ) -> tuple[float, dict[str, Any]]:
+        detail: dict[str, Any] = {}
+
+        global_bucket = probability_stats.get("global") or {}
+        global_rate, global_success, global_total = self._success_rate(
+            global_bucket,
+            prior_rate=0.5,
+            prior_weight=0,
+        )
+        if global_total <= 0:
+            global_rate = 0.5
+
+        service_key = str(party.service_id)
+        trust_key = self._trust_score_to_bucket(getattr(user, "trust_score", None))
+        duration_key = self._duration_match_key(
+            preferred_conditions.get("duration_preference"),
+            self._get_party_duration_preference(party),
+        )
+        capacity_key = self._capacity_to_bucket(
+            max_members=getattr(party, "max_members", None),
+            current_members=getattr(party, "current_members", None),
+        )
+
+        service_rate, service_success, service_total = self._success_rate(
+            (probability_stats.get("service") or {}).get(service_key),
+            prior_rate=global_rate,
+        )
+        trust_rate, trust_success, trust_total = self._success_rate(
+            (probability_stats.get("trust_bucket") or {}).get(trust_key),
+            prior_rate=global_rate,
+        )
+        duration_rate, duration_success, duration_total = self._success_rate(
+            (probability_stats.get("duration_match") or {}).get(duration_key),
+            prior_rate=global_rate,
+        )
+        capacity_rate, capacity_success, capacity_total = self._success_rate(
+            (probability_stats.get("capacity_bucket") or {}).get(capacity_key),
+            prior_rate=global_rate,
+        )
+
+        probability_score = (
+            service_rate * 0.35
+            + trust_rate * 0.35
+            + duration_rate * 0.20
+            + capacity_rate * 0.10
+        )
+
+        detail["score_basis"] = "training_success_rate"
+        detail["global_success_rate"] = global_rate
+        detail["global_sample_count"] = global_total
+        detail["service"] = {
+            "key": service_key,
+            "success_rate": service_rate,
+            "success_count": service_success,
+            "sample_count": service_total,
+            "weight": 0.35,
+        }
+        detail["trust_bucket"] = {
+            "key": trust_key,
+            "success_rate": trust_rate,
+            "success_count": trust_success,
+            "sample_count": trust_total,
+            "weight": 0.35,
+        }
+        detail["duration_match"] = {
+            "key": duration_key,
+            "success_rate": duration_rate,
+            "success_count": duration_success,
+            "sample_count": duration_total,
+            "weight": 0.20,
+        }
+        detail["capacity_bucket"] = {
+            "key": capacity_key,
+            "success_rate": capacity_rate,
+            "success_count": capacity_success,
+            "sample_count": capacity_total,
+            "weight": 0.10,
+        }
+
+        return round(min(max(probability_score, 0.0), 1.0), 4), detail
+
+    def _calculate_final_score(
+        self,
+        rule_score: float,
+        probability_score: float,
+    ) -> float:
+        final_score = (rule_score * 0.55) + (probability_score * 0.45)
+        return round(min(final_score, 1.0), 4)
 
     def _calculate_duration_score(
         self,
@@ -1296,65 +1351,18 @@ class QuickMatchService:
 
         user_low, user_high = user_range
         party_low, party_high = party_range
-
         overlap = max(0.0, min(user_high, party_high) - max(user_low, party_low))
         if overlap > 0:
             return 0.7
-
-        # 인접 구간은 완전 불일치보다는 낮은 근접 점수를 준다.
         if user_high == party_low or party_high == user_low:
             return 0.5
-
         return 0.3
 
-    def _calculate_vector_score(
-        self,
-        user_embedding: list[float],
-        party_embedding: list[float],
-    ) -> float:
-        if not user_embedding or not party_embedding:
-            return 0.0
-
-        dim = min(len(user_embedding), len(party_embedding))
-        if dim == 0:
-            return 0.0
-
-        a = [float(x) for x in user_embedding[:dim]]
-        b = [float(x) for x in party_embedding[:dim]]
-
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(y * y for y in b))
-
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-
-        cosine = dot / (norm_a * norm_b)
-        normalized = (cosine + 1) / 2
-        return round(max(0.0, min(1.0, normalized)), 4)
-
-    def _calculate_ai_score(
-        self,
-        rule_score: float,
-        vector_score: float,
-    ) -> float:
-        """
-        LLM 재판단 없이 룰 점수와 임베딩 유사도만으로 최종 매칭 점수를 계산한다.
-        rule_score는 조건/정책 적합도, vector_score는 사용자-파티 프로필 유사도를 의미한다.
-        """
-        final_score = (rule_score * 0.5) + (vector_score * 0.5)
-        return round(min(final_score, 1.0), 4)
-
-    def _is_duration_core_match(
-        self,
-        party_duration_preference: str | None,
-        user_duration_preference: str | None,
-    ) -> bool:
-        return self._duration_ranges_overlap(
-            user_value=user_duration_preference,
-            party_value=party_duration_preference,
+    def _build_decision_reason(self, candidate: QuickMatchCandidate) -> str:
+        filter_reasons = candidate.filter_reasons or {}
+        return (
+            f"최종 점수 {float(candidate.final_score):.4f}로 1순위 선정 "
+            f"(rule={float(candidate.rule_score):.4f}, "
+            f"probability={float(candidate.probability_score):.4f}, "
+            f"basis={filter_reasons.get('score_basis', 'rule_probability')})"
         )
-
-    def _get_match_mode_priority(self, filter_reasons: dict[str, Any] | None) -> int:
-        match_mode = str((filter_reasons or {}).get("match_mode", "normal")).lower()
-        return 1 if match_mode == "normal" else 0

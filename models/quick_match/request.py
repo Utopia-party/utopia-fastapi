@@ -4,17 +4,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import (
-    Boolean,
-    DateTime,
-    Enum,
-    ForeignKey,
-    Integer,
-    JSON,
-    String,
-    func,
-    text,
-)
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,10 +14,8 @@ from core.database import Base
 class QuickMatchRequestStatus(str, enum.Enum):
     REQUESTED = "requested"
     MATCHED = "matched"
-    REMATCHING = "rematching"
     FAILED = "failed"
     EXPIRED = "expired"
-    CANCELLED = "cancelled"
 
 
 class QuickMatchRequest(Base):
@@ -66,6 +54,7 @@ class QuickMatchRequest(Base):
         nullable=False,
         default=0,
         server_default="0",
+        comment="후보 재시도 횟수",
     )
 
     preferred_conditions: Mapped[dict | None] = mapped_column(
@@ -84,12 +73,13 @@ class QuickMatchRequest(Base):
     fail_reason: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
+        comment="최종 실패 사유",
     )
 
-    ai_profile_snapshot: Mapped[dict | None] = mapped_column(
+    request_profile_snapshot: Mapped[dict | None] = mapped_column(
         JSON,
         nullable=True,
-        comment="요청 시점 사용자 분석/집계 스냅샷",
+        comment="요청 시점 사용자 프로필/집계 스냅샷",
     )
 
     requested_at: Mapped[datetime] = mapped_column(
@@ -108,17 +98,12 @@ class QuickMatchRequest(Base):
         nullable=True,
     )
 
-    cancelled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
-
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=True,
         server_default="true",
-        comment="현재 진행 중 요청 여부 관리용",
+        comment="현재 진행 중인 요청 여부",
     )
 
     created_at: Mapped[datetime] = mapped_column(
