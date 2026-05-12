@@ -291,13 +291,13 @@ async def list_parties(
         selectinload(Party.service),
     )
 
-    # recruiting/completed/active/full는 항상 노출, ended/closed는 updated_at 기준 1일 이내만 노출
+    # recruiting/completed/active/full는 항상 노출, ended는 updated_at 기준 1일 이내만 노출
     cutoff = datetime.utcnow() - timedelta(days=1)
     q = q.where(
         or_(
             Party.status.in_(["recruiting", "completed", "active", "full"]),
             and_(
-                Party.status.in_(["ended", "closed"]),
+                Party.status == "ended",
                 Party.updated_at >= cutoff,
             ),
         )
