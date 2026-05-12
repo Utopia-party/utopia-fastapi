@@ -109,8 +109,8 @@ class PartyChat(Base):
     party_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parties.id"), nullable=False
     )
-    sender_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    sender_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     message: Mapped[str] = mapped_column(Text, nullable=False)
     message_type: Mapped[str] = mapped_column(String(20), nullable=False, server_default="text")
