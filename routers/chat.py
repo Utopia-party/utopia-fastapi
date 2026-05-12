@@ -27,6 +27,7 @@ from services.chat.serializers import (
     _serialize_message,
     blocked_key,
     redis_msg_key,
+    save_system_message,
 )
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -234,6 +235,28 @@ async def websocket_chat(
     await manager.connect(party_id, ws, safe_user_id)
 
     if safe_user_id != "guest":
+        # 닉네임 조회
+        join_nickname = nickname
+        try:
+            async with AsyncSessionLocal() as db:
+                u_result = await db.execute(select(User).where(User.id == uuid.UUID(safe_user_id)))
+                u = u_result.scalar_one_or_none()
+                if u and u.nickname:
+                    join_nickname = u.nickname
+        except Exception:
+            pass
+
+        join_content = f"{join_nickname}님이 파티에 참가했습니다."
+        join_chat_id = await save_system_message(party_id, join_content)
+        join_msg = {
+            "type": "system",
+            "chat_id": join_chat_id,
+            "content": join_content,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await manager.broadcast(party_id, join_msg)
+
+    if safe_user_id != "guest":
         await manager.send_personal(ws, {
             "type": "system_info",
             "content": "욕설·비방 시 경고 누적 후 자동 퇴장 및 신뢰도 감점이 적용됩니다. 건전한 파티 문화를 함께 만들어요.",
@@ -321,6 +344,25 @@ async def websocket_chat(
 
     except WebSocketDisconnect:
         manager.disconnect(party_id, ws, safe_user_id)
+        if safe_user_id != "guest":
+            leave_nickname = nickname
+            try:
+                async with AsyncSessionLocal() as db:
+                    u_result = await db.execute(select(User).where(User.id == uuid.UUID(safe_user_id)))
+                    u = u_result.scalar_one_or_none()
+                    if u and u.nickname:
+                        leave_nickname = u.nickname
+            except Exception:
+                pass
+            leave_content = f"{leave_nickname}님이 파티에서 나갔습니다."
+            leave_chat_id = await save_system_message(party_id, leave_content)
+            leave_msg = {
+                "type": "system",
+                "chat_id": leave_chat_id,
+                "content": leave_content,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await manager.broadcast(party_id, leave_msg)
     except Exception as e:
         print(f"[WS_FATAL_ERROR] {e}")
         manager.disconnect(party_id, ws, safe_user_id)
