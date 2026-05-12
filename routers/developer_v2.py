@@ -208,6 +208,8 @@ async def create_my_key(
 
     api_key, secret_key = _gen_key(payload.service_type)
 
+    free_limit = 500 if payload.service_type == "captcha_l2" else 5000
+
     result = await db.execute(
         text("""
             INSERT INTO saas_api_keys
@@ -216,7 +218,7 @@ async def create_my_key(
                  current_month_usage, created_by)
             VALUES
                 (:service_type, :client_name, :api_key, :secret_key,
-                 :allowed_domains, 1000, 'free', true, 0, :created_by)
+                 :allowed_domains, :monthly_limit, 'free', true, 0, :created_by)
             RETURNING id, service_type, client_name, api_key, secret_key,
                       allowed_domains, monthly_limit, current_month_usage,
                       plan, is_active, created_at
@@ -227,6 +229,7 @@ async def create_my_key(
             "api_key": api_key,
             "secret_key": secret_key,
             "allowed_domains": payload.allowed_domains,
+            "monthly_limit": free_limit,
             "created_by": str(current_user.id),
         },
     )

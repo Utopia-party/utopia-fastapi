@@ -302,6 +302,8 @@ async def review_appeal(
             path=f"/api/admin/appeals/{appeal_id}",
             target_id=target_user.id,
         )
+
+        # ── 6. 이의제기 승인 재입장 시스템 메시지 (commit 후 처리) ──
     else:
         await _append_activity_log(
             db,
@@ -316,6 +318,32 @@ async def review_appeal(
     await db.refresh(appeal)
 
     await notify_appeal_result(db=db, appeal=appeal)
+
+    # 이의제기 승인 시 재입장 시스템 메시지 브로드캐스트
+    if status_upper == "APPROVED" and target_user:
+        try:
+            from services.chat.serializers import save_system_message
+            from services.chat.connection_manager import manager as chat_manager
+
+            rejoined_parties = await db.execute(
+                select(PartyMember.party_id)
+                .where(
+                    PartyMember.user_id == target_user.id,
+                    PartyMember.status == "active",
+                )
+            )
+            party_ids = [str(row[0]) for row in rejoined_parties.all()]
+            for pid in party_ids:
+                rejoin_content = f"{target_user.nickname}님이 이의제기 승인으로 파티에 다시 참가할 수 있게 되었습니다."
+                rejoin_chat_id = await save_system_message(pid, rejoin_content)
+                await chat_manager.broadcast(pid, {
+                    "type": "system",
+                    "chat_id": rejoin_chat_id,
+                    "content": rejoin_content,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+        except Exception as e:
+            print(f"[APPEAL REJOIN MSG ERROR] {e}")
 
     return await _get_single_admin_appeal(aid, db)
 

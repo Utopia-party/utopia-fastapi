@@ -12,7 +12,7 @@ from models.party import Party, PartyMember, PartyChat
 from models.user import User
 from models.refresh_token import RefreshToken
 from services.chat.connection_manager import manager
-from services.chat.serializers import warn_key, redis_msg_key, blocked_key
+from services.chat.serializers import warn_key, redis_msg_key, blocked_key, save_system_message
 
 from services.chat.redis_client import redis_client, REDIS_TTL
 
@@ -459,9 +459,12 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
             "content": content,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
+        kick_content = f"{nickname}님이 심각한 욕설로 인해 파티에서 퇴장되었습니다."
+        kick_chat_id = await save_system_message(party_id, kick_content)
         await manager.broadcast(party_id, {
             "type": "system",
-            "content": f"{nickname}님이 심각한 욕설로 인해 파티에서 퇴장되었습니다.",
+            "chat_id": kick_chat_id,
+            "content": kick_content,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -493,9 +496,12 @@ async def moderate_in_background(party_id: str, user_id: str, content: str, ws: 
                 "content": "경고 누적으로 계정이 정지되었습니다.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
+            warn_kick_content = f"{nickname}님이 경고 누적({party_warn}회)으로 파티에서 퇴장되었습니다."
+            warn_kick_chat_id = await save_system_message(party_id, warn_kick_content)
             await manager.broadcast(party_id, {
                 "type": "system",
-                "content": f"{nickname}님이 경고 누적({party_warn}회)으로 파티에서 퇴장되었습니다.",
+                "chat_id": warn_kick_chat_id,
+                "content": warn_kick_content,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         else:
