@@ -419,3 +419,115 @@ async def get_stats(
         total_usage_this_month=total_usage,
         top_clients=top_clients,
     )
+
+
+# ── Plan Inquiry ──────────────────────────────────────────────────────────────
+
+class PlanInquiryOut(BaseModel):
+    id: str
+    user_id: str
+    user_email: Optional[str]
+    service_type: str
+    desired_plan: str
+    message: Optional[str]
+    status: str
+    created_at: Optional[str]
+
+
+class PlanInquiryListOut(BaseModel):
+    total: int
+    items: list[PlanInquiryOut]
+
+
+class PlanInquiryUpdateRequest(BaseModel):
+    status: str
+
+
+@router.get("/plan-inquiries", response_model=PlanInquiryListOut)
+async def list_v2_plan_inquiries(
+    service_type: Optional[ServiceType] = Query(None),
+    status: Optional[str] = Query(None),
+    size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _: AdminContext = Depends(require_admin_context),
+):
+    conditions = []
+    params: dict = {}
+
+    if service_type:
+        conditions.append("i.service_type = :service_type")
+        params["service_type"] = service_type
+    if status:
+        conditions.append("i.status = :status")
+        params["status"] = status
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    count_result = await db.execute(
+        text(f"SELECT COUNT(*) FROM saas_plan_inquiries i {where}"), params
+    )
+    total = count_result.scalar() or 0
+
+    params["size"] = size
+    rows = (await db.execute(
+        text(f"""
+            SELECT i.id, i.user_id, u.email as user_email,
+                   i.service_type, i.desired_plan, i.message,
+                   i.status, i.created_at::text
+            FROM saas_plan_inquiries i
+            LEFT JOIN users u ON u.id = i.user_id
+            {where}
+            ORDER BY i.created_at DESC
+            LIMIT :size
+        """), params
+    )).mappings().all()
+
+    return PlanInquiryListOut(
+        total=total,
+        items=[
+            PlanInquiryOut(
+                id=str(r["id"]),
+                user_id=str(r["user_id"]),
+                user_email=r["user_email"],
+                service_type=r["service_type"],
+                desired_plan=r["desired_plan"],
+                message=r["message"],
+                status=r["status"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+@router.put("/plan-inquiries/{inquiry_id}", response_model=PlanInquiryOut)
+async def update_v2_plan_inquiry_status(
+    inquiry_id: str,
+    body: PlanInquiryUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: AdminContext = Depends(require_admin_context),
+):
+    result = await db.execute(
+        text("""
+            UPDATE saas_plan_inquiries
+            SET status = :status
+            WHERE id = :id
+            RETURNING id, user_id, service_type, desired_plan, message, status, created_at::text
+        """),
+        {"id": inquiry_id, "status": body.status},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="문의를 찾을 수 없습니다.")
+    await db.commit()
+
+    return PlanInquiryOut(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        user_email=None,
+        service_type=row["service_type"],
+        desired_plan=row["desired_plan"],
+        message=row["message"],
+        status=row["status"],
+        created_at=row["created_at"],
+    )
