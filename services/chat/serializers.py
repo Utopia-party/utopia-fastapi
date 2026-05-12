@@ -30,6 +30,15 @@ def _safe_profile_image_url(profile_image_key: str | None) -> str | None:
 
 
 def _serialize_message(chat: PartyChat, sender: User | None, unread_count: int = 0) -> dict:
+    msg_type = chat.message_type if chat.message_type else "text"
+    if msg_type == "system":
+        return {
+            "type": "system",
+            "chat_id": str(chat.id),
+            "party_id": str(chat.party_id),
+            "content": chat.message,
+            "created_at": chat.created_at.isoformat(),
+        }
     return {
         "type": "message",
         "chat_id": str(chat.id),
@@ -84,6 +93,30 @@ def _party_total_price(party: Party, service: Service | None) -> int | None:
     if party.monthly_per_person is not None and max_members:
         return party.monthly_per_person * max_members
     return None
+
+
+async def save_system_message(party_id: str, content: str) -> str | None:
+    """시스템 메시지를 DB에 저장하고 chat_id를 반환합니다."""
+    import uuid as _uuid
+    from core.database import AsyncSessionLocal
+    from models.party import PartyChat
+    try:
+        party_uuid = _uuid.UUID(party_id)
+        async with AsyncSessionLocal() as db:
+            new_chat = PartyChat(
+                party_id=party_uuid,
+                sender_id=None,
+                message=content,
+                message_type="system",
+            )
+            db.add(new_chat)
+            await db.flush()
+            chat_id = str(new_chat.id)
+            await db.commit()
+            return chat_id
+    except Exception as e:
+        print(f"[SYSTEM MSG SAVE ERROR] {e}")
+        return None
 
 
 def _get_user_id_from_ws_cookie(ws: WebSocket) -> str | None:
