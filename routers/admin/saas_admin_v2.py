@@ -321,6 +321,33 @@ async def reset_usage(
     return {"status": "ok"}
 
 
+# ── 6-1. API 키 삭제 (관리자 전용) ────────────────────────────────────────────
+
+@router.delete("/keys/{key_id}", status_code=204)
+async def delete_key(
+    key_id: str,
+    admin: AdminContext = Depends(require_admin_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자 전용 API 키 삭제 — 관련 사용 로그도 함께 삭제"""
+    result = await db.execute(
+        text("SELECT id FROM saas_api_keys WHERE id = :id"),
+        {"id": key_id},
+    )
+    if not result.mappings().first():
+        raise HTTPException(status_code=404, detail="API 키를 찾을 수 없습니다.")
+
+    await db.execute(
+        text("DELETE FROM saas_api_usage_logs WHERE api_key_id = :id"),
+        {"id": key_id},
+    )
+    await db.execute(
+        text("DELETE FROM saas_api_keys WHERE id = :id"),
+        {"id": key_id},
+    )
+    await db.commit()
+
+
 # ── 7. 사용 로그 ──────────────────────────────────────────────────────────────
 
 @router.get("/keys/{key_id}/logs", response_model=UsageLogListResponse)
