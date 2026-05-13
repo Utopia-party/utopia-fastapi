@@ -329,25 +329,8 @@ async def rotate_my_secret(
     return _to_out(dict(result.mappings().first()), mask_secret=False)
 
 
-# ── 6. 삭제 ───────────────────────────────────────────────────────────────────
-
-@router.delete("/keys/{key_id}", status_code=204)
-async def delete_my_key(
-    key_id: str,
-    current_user: User = Depends(require_user),
-    db: AsyncSession = Depends(get_db),
-):
-    await _assert_owner(db, key_id, str(current_user.id))
-
-    await db.execute(
-        text("DELETE FROM saas_api_usage_logs WHERE api_key_id = :id"),
-        {"id": key_id},
-    )
-    await db.execute(
-        text("DELETE FROM saas_api_keys WHERE id = :id"),
-        {"id": key_id},
-    )
-    await db.commit()
+# ── 6. 삭제 — 관리자 전용으로 이관 (saas_admin_v2.py)
+#    사용자가 삭제→재발급으로 사용량을 초기화하는 것을 방지
 
 
 # ── 7. 사용 로그 ──────────────────────────────────────────────────────────────

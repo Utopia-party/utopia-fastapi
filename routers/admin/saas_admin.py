@@ -405,6 +405,38 @@ async def reset_monthly_usage(
 
 
 # ══════════════════════════════════════════════════════════════
+# 6-1. API 키 삭제 (관리자 전용)
+# ══════════════════════════════════════════════════════════════
+
+@router.delete("/keys/{key_id}", status_code=204)
+async def delete_api_key(
+    key_id: str,
+    admin: AdminContext = Depends(require_admin_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """관리자 전용 API 키 삭제 — 관련 사용 로그도 함께 삭제"""
+    # 키 존재 확인
+    result = await db.execute(
+        text("SELECT id FROM api_keys WHERE id = :id"),
+        {"id": key_id},
+    )
+    if not result.mappings().first():
+        raise HTTPException(status_code=404, detail="API 키를 찾을 수 없습니다.")
+
+    # 관련 사용 로그 먼저 삭제
+    await db.execute(
+        text("DELETE FROM api_usage_logs WHERE api_key_id = :key_id"),
+        {"key_id": key_id},
+    )
+    # API 키 삭제
+    await db.execute(
+        text("DELETE FROM api_keys WHERE id = :id"),
+        {"id": key_id},
+    )
+    await db.commit()
+
+
+# ══════════════════════════════════════════════════════════════
 # 7. 사용 로그 조회
 # ══════════════════════════════════════════════════════════════
 
