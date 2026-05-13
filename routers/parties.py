@@ -438,15 +438,9 @@ async def create_party(
         await db.commit()
 
 
-        from services.quick_match.party_embedding_service import PartyEmbeddingService
+        
 
-        party_embedding_service = PartyEmbeddingService()
-
-        await party_embedding_service.sync_party_embedding(
-            db=db,
-            party_id=party.id,
-        )
-        await db.commit()
+        
     
     except Exception as e:
         await db.rollback()
